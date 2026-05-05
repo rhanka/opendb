@@ -593,6 +593,7 @@ git commit -m "chore: add rust crate skeletons"
 - Create: `crates/opendb-storage/src/commit_stream.rs`
 - Create: `crates/opendb-storage/src/wal.rs`
 - Modify: `crates/opendb-storage/src/lib.rs`
+- Modify: `Cargo.toml`, `crates/opendb-storage/Cargo.toml`, `Cargo.lock` if a checksum crate is used
 
 - [ ] **Step 1: Write commit stream tests**
 
@@ -679,7 +680,15 @@ Expected: PASS.
 
 - [ ] **Step 3: Add WAL tests and implementation**
 
-Create `crates/opendb-storage/src/wal.rs`:
+Implementation notes:
+- `Wal` must serialize appends across cloned instances with a shared async mutex.
+- WAL frames must be robust against a torn final record. Use length-prefixed frames with a checksum and replay complete valid records; `read_all()` must stop at an incomplete final frame without failing the whole WAL.
+- `read_all()` must reject records whose `version != CommitRecord::VERSION` with an error that includes the WAL path and record index.
+- On the first append that creates the WAL file, sync the file and then sync the containing directory. On Linux, directory sync errors must be surfaced as storage errors.
+- Keep WAL error messages contextual: include the path and operation or record index where practical.
+- Pin the WAL frame/serialization shape with a golden test so accidental format drift is visible.
+
+Create `crates/opendb-storage/src/wal.rs`. The WAL implementation must follow the robustness notes above; any older JSONL sketch is non-normative.
 
 ```rust
 use crate::commit_stream::CommitRecord;

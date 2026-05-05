@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 opendb-common = { path = "../opendb-common" }
+crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
