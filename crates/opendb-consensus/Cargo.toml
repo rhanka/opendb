@@ -10,3 +10,6 @@ opendb-storage = { path = "../opendb-storage" }
 openraft.workspace = true
 serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1348,6 +1348,7 @@ dependencies = [
  "opendb-storage",
  "openraft",
  "serde",
+ "tempfile",
  "tokio",
 ]
 
