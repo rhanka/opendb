@@ -1,4 +1,5 @@
 .opendb-git/
+.worktrees/
 .superpowers/
 .playwright-mcp/
 target/
