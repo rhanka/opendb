@@ -1373,6 +1373,7 @@ name = "opendb-operator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "k8s-openapi",
  "kube",
  "schemars 0.8.22",

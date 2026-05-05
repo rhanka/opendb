@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 schemars.workspace = true
