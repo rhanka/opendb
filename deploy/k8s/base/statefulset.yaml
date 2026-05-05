@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opendb
+  namespace: opendb-system
+spec:
+  serviceName: opendb-peer
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opendb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opendb
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: opendb-node
+          image: opendb-node:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--node-id=$(OPENDB_ORDINAL)"
+          env:
+            - name: OPENDB_ORDINAL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPENDB_DATA_DIR
+              value: /var/lib/opendb
+          ports:
+            - name: pgwire
+              containerPort: 5432
+            - name: health
+              containerPort: 8080
+            - name: internal
+              containerPort: 7000
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/opendb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi
