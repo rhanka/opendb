@@ -1,0 +1,8 @@
+.opendb-git/
+.superpowers/
+.playwright-mcp/
+target/
+node_modules/
+dist/
+.env
+.env.*
