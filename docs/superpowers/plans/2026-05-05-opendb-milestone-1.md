@@ -47,6 +47,13 @@ git --git-dir=.opendb-git --work-tree=. add <files>
 git --git-dir=.opendb-git --work-tree=. commit -m "<message>"
 ```
 
+When executing from a real Git worktree such as `.worktrees/feat-milestone-1`, use normal Git commands instead:
+
+```bash
+git add <files>
+git commit -m "<message>"
+```
+
 ## File Structure
 
 Create this structure:
