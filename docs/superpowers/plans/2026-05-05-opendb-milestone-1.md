@@ -331,6 +331,7 @@ git --git-dir=.opendb-git --work-tree=. commit -m "chore: scaffold workspace too
 - Create: crate manifests and `src/lib.rs` files for `opendb-storage`, `opendb-sql`, `opendb-consensus`
 - Create: `crates/opendb-node/Cargo.toml`
 - Create: `crates/opendb-operator/Cargo.toml`
+- Create: minimal placeholder module files referenced by crate roots
 - Modify: `Cargo.toml`
 
 - [ ] **Step 1: Add crate members to the root workspace**
@@ -545,7 +546,27 @@ Create `crates/opendb-consensus/src/lib.rs`:
 pub mod root_range;
 ```
 
-- [ ] **Step 5: Verify the workspace compiles to the expected missing-module errors**
+- [ ] **Step 5: Add minimal placeholder modules so the workspace is valid**
+
+Create these files with a one-line module marker. Later tasks replace the marker with real implementation:
+
+```rust
+// Implemented by a later milestone task.
+```
+
+Files:
+
+```text
+crates/opendb-storage/src/commit_stream.rs
+crates/opendb-storage/src/row_projection.rs
+crates/opendb-storage/src/wal.rs
+crates/opendb-sql/src/ast.rs
+crates/opendb-sql/src/executor.rs
+crates/opendb-sql/src/parser.rs
+crates/opendb-consensus/src/root_range.rs
+```
+
+- [ ] **Step 6: Verify the workspace compiles**
 
 Run:
 
@@ -553,15 +574,15 @@ Run:
 cargo check
 ```
 
-Expected: failure only for missing files referenced by the new `lib.rs` files, such as `file not found for module commit_stream`.
+Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 Run:
 
 ```bash
-git --git-dir=.opendb-git --work-tree=. add crates Cargo.toml
-git --git-dir=.opendb-git --work-tree=. commit -m "chore: add rust crate skeletons"
+git add crates Cargo.toml docs/superpowers/plans/2026-05-05-opendb-milestone-1.md
+git commit -m "chore: add rust crate skeletons"
 ```
 
 ---

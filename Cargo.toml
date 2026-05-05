@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+  "crates/opendb-common",
+  "crates/opendb-storage",
+  "crates/opendb-sql",
+  "crates/opendb-consensus",
+  "crates/opendb-node",
+  "crates/opendb-operator",
+]
 
 [workspace.package]
 edition = "2024"
