@@ -134,6 +134,7 @@ mod tests {
     use opendb_common::{LogicalTimestamp, OpenDbError, TransactionId};
     use opendb_storage::commit_stream::Mutation;
     use opendb_storage::wal::Wal;
+    use std::time::Duration;
 
     #[test]
     fn open_db_raft_node_id_satisfies_openraft_adapter_bounds() {
@@ -375,5 +376,56 @@ mod tests {
                 .expect("replay after rejected follower submit"),
             Vec::new()
         );
+    }
+
+    #[tokio::test]
+    async fn openraft_single_node_client_write_applies_root_range_command_to_wal() {
+        use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let harness = RootRangeRaftHarness::new_single_node(0, temp_dir.path())
+            .await
+            .expect("start single-node root range raft");
+        harness
+            .initialize_single_node()
+            .await
+            .expect("initialize single-node root range raft");
+        harness
+            .raft()
+            .wait(Some(Duration::from_secs(3)))
+            .current_leader(0, "single-node leader")
+            .await
+            .expect("single node elects itself");
+
+        let record = CommitRecord::new(
+            TransactionId(14),
+            LogicalTimestamp(18),
+            vec![Mutation::CreateTable {
+                table: "raft_events".to_string(),
+                columns: vec!["id".to_string()],
+            }],
+        );
+
+        let response = harness
+            .raft()
+            .client_write(RootRangeCommand {
+                record: record.clone(),
+            })
+            .await
+            .expect("client_write root range command");
+
+        assert_eq!(response.data, RootRangeResponse::Applied);
+        assert_eq!(
+            RootRange::new(temp_dir.path())
+                .replay()
+                .await
+                .expect("replay root-range WAL after client_write"),
+            vec![record]
+        );
+
+        harness
+            .shutdown()
+            .await
+            .expect("shutdown single-node root range raft");
     }
 }
