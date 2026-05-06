@@ -1,14 +1,15 @@
 mod config;
+mod database;
 mod health;
 mod pgwire;
 
 use anyhow::Context;
 use clap::Parser;
-use opendb_sql::executor::SqlEngine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::NodeConfig;
+use crate::database::Database;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,7 +20,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-    let engine = Arc::new(Mutex::new(SqlEngine::default()));
+    let database = Arc::new(Mutex::new(
+        Database::open(&config.data_dir)
+            .await
+            .with_context(|| format!("open database at {}", config.data_dir.display()))?,
+    ));
     tracing::info!(
         node_id = config.node_id,
         pgwire_addr = %config.pgwire_addr,
@@ -29,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(
         health::serve(config.health_addr),
-        pgwire::serve(config.pgwire_addr, engine),
+        pgwire::serve(config.pgwire_addr, database),
     )?;
 
     Ok(())

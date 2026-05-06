@@ -1,5 +1,6 @@
+use crate::database::Database;
 use anyhow::{Context, bail};
-use opendb_sql::{ast::QueryResult, executor::SqlEngine, parser::parse};
+use opendb_sql::{ast::QueryResult, parser::parse};
 use opendb_storage::commit_stream::Value;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -12,7 +13,7 @@ const SSL_REQUEST_CODE: i32 = 80877103;
 const PROTOCOL_VERSION_3: i32 = 196608;
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 
-pub async fn serve(addr: SocketAddr, engine: Arc<Mutex<SqlEngine>>) -> anyhow::Result<()> {
+pub async fn serve(addr: SocketAddr, database: Arc<Mutex<Database>>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind pgwire listener on {addr}"))?;
@@ -20,9 +21,9 @@ pub async fn serve(addr: SocketAddr, engine: Arc<Mutex<SqlEngine>>) -> anyhow::R
 
     loop {
         let (stream, peer) = listener.accept().await.context("accept pgwire client")?;
-        let engine = Arc::clone(&engine);
+        let database = Arc::clone(&database);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, engine).await {
+            if let Err(error) = handle_connection(stream, database).await {
                 tracing::debug!(%peer, %error, "pgwire connection closed");
             }
         });
@@ -31,7 +32,7 @@ pub async fn serve(addr: SocketAddr, engine: Arc<Mutex<SqlEngine>>) -> anyhow::R
 
 async fn handle_connection(
     mut stream: TcpStream,
-    engine: Arc<Mutex<SqlEngine>>,
+    database: Arc<Mutex<Database>>,
 ) -> anyhow::Result<()> {
     loop {
         let startup = read_untagged_frame(&mut stream).await?;
@@ -56,7 +57,7 @@ async fn handle_connection(
         match tag {
             b'Q' => {
                 let sql = cstring_payload(&payload)?;
-                execute_simple_query(&mut stream, &engine, sql).await?;
+                execute_simple_query(&mut stream, &database, sql).await?;
             }
             b'X' => return Ok(()),
             _ => {
@@ -70,13 +71,16 @@ async fn handle_connection(
 
 async fn execute_simple_query(
     stream: &mut TcpStream,
-    engine: &Arc<Mutex<SqlEngine>>,
+    database: &Arc<Mutex<Database>>,
     sql: &str,
 ) -> anyhow::Result<()> {
     let result = match parse(sql) {
         Ok(statement) => {
-            let mut engine = engine.lock().await;
-            engine.execute(statement).map_err(|error| error.to_string())
+            let mut database = database.lock().await;
+            database
+                .execute(statement)
+                .await
+                .map_err(|error| error.to_string())
         }
         Err(error) => Err(error.to_string()),
     };
