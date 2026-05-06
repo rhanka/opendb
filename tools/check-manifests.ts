@@ -186,8 +186,22 @@ function assertAppSelector(selector: Record<string, unknown>, context: string): 
   expectEqual(selector["app.kubernetes.io/name"], "opendb", `${context}.app.kubernetes.io/name`);
 }
 
-function assertLeaderPodSelector(selector: Record<string, unknown>, context: string): void {
-  expectEqual(selector["statefulset.kubernetes.io/pod-name"], "opendb-0", `${context}.statefulset.kubernetes.io/pod-name`);
+function assertNoStaticPodSelector(selector: Record<string, unknown>, context: string): void {
+  if (Object.prototype.hasOwnProperty.call(selector, "statefulset.kubernetes.io/pod-name")) {
+    fail(
+      `${context} must not include a static pod selector; remove statefulset.kubernetes.io/pod-name so readiness selects the leader`
+    );
+  }
+}
+
+function assertOnlyAppSelector(selector: Record<string, unknown>, context: string): void {
+  assertAppSelector(selector, context);
+  assertNoStaticPodSelector(selector, context);
+  const keys = Object.keys(selector).sort();
+  const expectedKeys = ["app.kubernetes.io/name"];
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+    fail(`${context} must select exactly ${formatValue(expectedKeys)} so readiness can expose the elected leader`);
+  }
 }
 
 function assertServicePort(
@@ -229,7 +243,8 @@ function assertHttpProbe(
   probeName: "readinessProbe" | "livenessProbe",
   path: string,
   initialDelaySeconds: number,
-  periodSeconds: number
+  periodSeconds: number,
+  failureThreshold?: number
 ): void {
   const probe = requireRecordField(container, probeName, "StatefulSet/opendb container opendb-node");
   const httpGet = requireRecordField(probe, "httpGet", `StatefulSet/opendb container opendb-node.${probeName}`);
@@ -241,6 +256,13 @@ function assertHttpProbe(
     `StatefulSet/opendb container opendb-node.${probeName}.initialDelaySeconds`
   );
   expectEqual(probe.periodSeconds, periodSeconds, `StatefulSet/opendb container opendb-node.${probeName}.periodSeconds`);
+  if (failureThreshold !== undefined) {
+    expectEqual(
+      probe.failureThreshold,
+      failureThreshold,
+      `StatefulSet/opendb container opendb-node.${probeName}.failureThreshold`
+    );
+  }
 }
 
 function assertRoleRules(role: Manifest): void {
@@ -285,7 +307,7 @@ function assertService(
   portName: "internal" | "pgwire",
   port: number,
   targetPort: number,
-  options: { headless?: boolean; leaderOnly?: boolean } = {}
+  options: { headless?: boolean; exactAppSelector?: boolean } = {}
 ): void {
   const key = `Service/${name}`;
   const service = requireManifest("Service", name);
@@ -296,9 +318,10 @@ function assertService(
   }
 
   const selector = requireRecordField(spec, "selector", `${key}.spec`);
-  assertAppSelector(selector, `${key}.spec.selector`);
-  if (options.leaderOnly === true) {
-    assertLeaderPodSelector(selector, `${key}.spec.selector`);
+  if (options.exactAppSelector === true) {
+    assertOnlyAppSelector(selector, `${key}.spec.selector`);
+  } else {
+    assertAppSelector(selector, `${key}.spec.selector`);
   }
 
   assertServicePort(requireArrayField(spec, "ports", `${key}.spec`), portName, port, targetPort, `${key}.spec.ports`);
@@ -309,6 +332,7 @@ function assertStatefulSet(): void {
   const spec = requireSpec(statefulSet, "StatefulSet/opendb");
   expectEqual(spec.replicas, 3, "StatefulSet/opendb.spec.replicas");
   expectEqual(spec.serviceName, "opendb-peer", "StatefulSet/opendb.spec.serviceName");
+  expectEqual(spec.podManagementPolicy, "Parallel", "StatefulSet/opendb.spec.podManagementPolicy");
 
   const selector = requireRecordField(spec, "selector", "StatefulSet/opendb.spec");
   const matchLabels = requireRecordField(selector, "matchLabels", "StatefulSet/opendb.spec.selector");
@@ -349,7 +373,7 @@ function assertStatefulSet(): void {
   assertContainerPort(ports, "health", 8080, "StatefulSet/opendb container opendb-node.ports");
   assertContainerPort(ports, "internal", 7000, "StatefulSet/opendb container opendb-node.ports");
 
-  assertHttpProbe(nodeContainer, "readinessProbe", "/ready", 2, 5);
+  assertHttpProbe(nodeContainer, "readinessProbe", "/ready", 2, 1, 1);
   assertHttpProbe(nodeContainer, "livenessProbe", "/live", 10, 10);
 
   const volumeMounts = requireArrayField(nodeContainer, "volumeMounts", "StatefulSet/opendb container opendb-node");
@@ -391,7 +415,7 @@ for (const [kind, name] of requiredResources) {
 assertRoleRules(requireManifest("Role", "opendb-operator"));
 assertOpenDbCluster();
 assertService("opendb-peer", "internal", 7000, 7000, { headless: true });
-assertService("opendb-pgwire", "pgwire", 5432, 5432, { leaderOnly: true });
+assertService("opendb-pgwire", "pgwire", 5432, 5432, { exactAppSelector: true });
 assertStatefulSet();
 
 console.log("Kubernetes manifests passed static checks.");

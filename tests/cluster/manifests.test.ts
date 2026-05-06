@@ -56,16 +56,42 @@ test("manifest checker rejects a StatefulSet without initial peer addresses", as
   });
 });
 
-test("manifest checker rejects a pgwire Service that targets every pod", async () => {
+test("manifest checker rejects a pgwire Service with a static leader pod selector", async () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "opendb-manifests-"));
   tempDirs.push(fixtureRoot);
   const baseDir = join(fixtureRoot, "deploy", "k8s", "base");
   mkdirSync(baseDir, { recursive: true });
-  writeFileSync(join(baseDir, "manifests.yaml"), manifestsWithoutPgwireLeaderSelector);
+  writeFileSync(join(baseDir, "manifests.yaml"), manifestsWithStaticPgwireLeaderSelector);
 
   await expect(execFileAsync(tsxBin, [checkManifestsPath], { cwd: fixtureRoot })).rejects.toMatchObject({
     stderr: expect.stringContaining(
-      'Service/opendb-pgwire.spec.selector.statefulset.kubernetes.io/pod-name must be "opendb-0"'
+      "Service/opendb-pgwire.spec.selector must not include a static pod selector"
+    )
+  });
+});
+
+test("manifest checker rejects a StatefulSet without parallel pod management", async () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "opendb-manifests-"));
+  tempDirs.push(fixtureRoot);
+  const baseDir = join(fixtureRoot, "deploy", "k8s", "base");
+  mkdirSync(baseDir, { recursive: true });
+  writeFileSync(join(baseDir, "manifests.yaml"), manifestsWithoutParallelPodManagement);
+
+  await expect(execFileAsync(tsxBin, [checkManifestsPath], { cwd: fixtureRoot })).rejects.toMatchObject({
+    stderr: expect.stringContaining("StatefulSet/opendb.spec.podManagementPolicy must be \"Parallel\"")
+  });
+});
+
+test("manifest checker rejects extra pgwire selectors", async () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "opendb-manifests-"));
+  tempDirs.push(fixtureRoot);
+  const baseDir = join(fixtureRoot, "deploy", "k8s", "base");
+  mkdirSync(baseDir, { recursive: true });
+  writeFileSync(join(baseDir, "manifests.yaml"), manifestsWithExtraPgwireSelector);
+
+  await expect(execFileAsync(tsxBin, [checkManifestsPath], { cwd: fixtureRoot })).rejects.toMatchObject({
+    stderr: expect.stringContaining(
+      'Service/opendb-pgwire.spec.selector must select exactly ["app.kubernetes.io/name"]'
     )
   });
 });
@@ -159,6 +185,7 @@ metadata:
   namespace: opendb-system
 spec:
   serviceName: opendb-peer
+  podManagementPolicy: Parallel
   replicas: 3
   selector:
     matchLabels:
@@ -194,7 +221,8 @@ spec:
               path: /ready
               port: health
             initialDelaySeconds: 2
-            periodSeconds: 5
+            periodSeconds: 1
+            failureThreshold: 1
           livenessProbe:
             httpGet:
               path: /live
@@ -258,20 +286,6 @@ const manifestsWithoutInitialPeerAddresses = manifestsWithoutPeerPublishNotReady
   "  clusterIP: None\n  selector:",
   "  clusterIP: None\n  publishNotReadyAddresses: true\n  selector:"
 ).replace(
-  `metadata:
-  name: opendb-pgwire
-  namespace: opendb-system
-spec:
-  selector:
-    app.kubernetes.io/name: opendb`,
-  `metadata:
-  name: opendb-pgwire
-  namespace: opendb-system
-spec:
-  selector:
-    app.kubernetes.io/name: opendb
-    statefulset.kubernetes.io/pod-name: opendb-0`
-).replace(
   `          args:
             - "--node-id=$(OPENDB_ORDINAL)"
           env:
@@ -311,9 +325,23 @@ spec:
               value: /var/lib/opendb`
 );
 
-const manifestsWithoutPgwireLeaderSelector = manifestsWithoutPeerPublishNotReadyAddresses.replace(
+const manifestsWithStaticPgwireLeaderSelector = manifestsWithoutPeerPublishNotReadyAddresses.replace(
   "  clusterIP: None\n  selector:",
   "  clusterIP: None\n  publishNotReadyAddresses: true\n  selector:"
+).replace(
+  `metadata:
+  name: opendb-pgwire
+  namespace: opendb-system
+spec:
+  selector:
+    app.kubernetes.io/name: opendb`,
+  `metadata:
+  name: opendb-pgwire
+  namespace: opendb-system
+spec:
+  selector:
+    app.kubernetes.io/name: opendb
+    statefulset.kubernetes.io/pod-name: opendb-0`
 ).replace(
   `          args:
             - "--node-id=$(OPENDB_ORDINAL)"
@@ -349,4 +377,30 @@ const manifestsWithoutPgwireLeaderSelector = manifestsWithoutPeerPublishNotReady
               value: "0"
             - name: OPENDB_DATA_DIR
               value: /var/lib/opendb`
+);
+
+const manifestsWithValidOpenraftCluster = manifestsWithStaticPgwireLeaderSelector.replace(
+  "    statefulset.kubernetes.io/pod-name: opendb-0\n",
+  ""
+);
+
+const manifestsWithoutParallelPodManagement = manifestsWithValidOpenraftCluster.replace(
+  "  podManagementPolicy: Parallel\n",
+  ""
+);
+
+const manifestsWithExtraPgwireSelector = manifestsWithValidOpenraftCluster.replace(
+  `metadata:
+  name: opendb-pgwire
+  namespace: opendb-system
+spec:
+  selector:
+    app.kubernetes.io/name: opendb`,
+  `metadata:
+  name: opendb-pgwire
+  namespace: opendb-system
+spec:
+  selector:
+    app.kubernetes.io/name: opendb
+    opendb.dev/static-role: writer`
 );

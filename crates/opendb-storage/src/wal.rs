@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 const WAL_MAGIC: &[u8; 4] = b"ODW1";
@@ -39,14 +39,22 @@ impl Wal {
             Err(error) => return Err(storage_error(&self.path, "check wal existence", error)),
         };
 
+        let append_offset = durable_prefix_len(&self.path).await?;
         let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .write(true)
             .open(&self.path)
             .await
             .map_err(|error| storage_error(&self.path, "open wal for append", error))?;
         let frame = encode_frame(record)?;
 
+        file.set_len(append_offset)
+            .await
+            .map_err(|error| storage_error(&self.path, "truncate torn wal tail", error))?;
+        file.seek(std::io::SeekFrom::Start(append_offset))
+            .await
+            .map_err(|error| storage_error(&self.path, "seek wal for append", error))?;
         file.write_all(&frame)
             .await
             .map_err(|error| storage_error(&self.path, "write wal frame", error))?;
@@ -68,8 +76,14 @@ impl Wal {
             Err(error) => return Err(storage_error(&self.path, "read wal file", error)),
         };
 
-        decode_records(&self.path, &bytes)
+        Ok(decode_records(&self.path, &bytes)?.records)
     }
+}
+
+#[derive(Debug)]
+struct DecodedWal {
+    records: Vec<CommitRecord>,
+    durable_prefix_len: u64,
 }
 
 fn encode_frame(record: &CommitRecord) -> OpenDbResult<Vec<u8>> {
@@ -95,7 +109,7 @@ fn encode_frame(record: &CommitRecord) -> OpenDbResult<Vec<u8>> {
     Ok(frame)
 }
 
-fn decode_records(path: &std::path::Path, bytes: &[u8]) -> OpenDbResult<Vec<CommitRecord>> {
+fn decode_records(path: &std::path::Path, bytes: &[u8]) -> OpenDbResult<DecodedWal> {
     let mut records = Vec::new();
     let mut offset = 0;
     let mut record_index = 0;
@@ -103,7 +117,10 @@ fn decode_records(path: &std::path::Path, bytes: &[u8]) -> OpenDbResult<Vec<Comm
     while offset < bytes.len() {
         let remaining = bytes.len() - offset;
         if remaining < FRAME_HEADER_LEN {
-            break;
+            return Ok(DecodedWal {
+                records,
+                durable_prefix_len: offset as u64,
+            });
         }
 
         let header = &bytes[offset..offset + FRAME_HEADER_LEN];
@@ -149,7 +166,10 @@ fn decode_records(path: &std::path::Path, bytes: &[u8]) -> OpenDbResult<Vec<Comm
                     path.display()
                 )));
             }
-            break;
+            return Ok(DecodedWal {
+                records,
+                durable_prefix_len: offset as u64,
+            });
         }
 
         let payload_start = offset + FRAME_HEADER_LEN;
@@ -168,7 +188,20 @@ fn decode_records(path: &std::path::Path, bytes: &[u8]) -> OpenDbResult<Vec<Comm
         record_index += 1;
     }
 
-    Ok(records)
+    Ok(DecodedWal {
+        records,
+        durable_prefix_len: offset as u64,
+    })
+}
+
+async fn durable_prefix_len(path: &std::path::Path) -> OpenDbResult<u64> {
+    let bytes = match fs::read(path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(storage_error(path, "read wal before append", error)),
+    };
+
+    Ok(decode_records(path, &bytes)?.durable_prefix_len)
 }
 
 fn frame_checksum(version_reserved: &[u8], payload_len: &[u8], payload: &[u8]) -> u32 {
@@ -340,6 +373,39 @@ mod tests {
         assert_eq!(
             wal.read_all().await.expect("read with torn tail"),
             vec![first]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_truncates_torn_final_frame_before_writing_new_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let first = insert_record(1, 10, "1", "Ada");
+        let torn_record = insert_record(2, 11, "2", "Grace");
+        let replacement = insert_record(3, 12, "3", "Katherine");
+
+        wal.append(&first).await.expect("append first");
+        let mut torn = encode_frame(&torn_record).expect("encode torn");
+        torn.truncate(torn.len() - 5);
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .await
+            .expect("open wal for torn append");
+        file.write_all(&torn).await.expect("append torn frame");
+        file.sync_data().await.expect("sync torn frame");
+
+        wal.append(&replacement)
+            .await
+            .expect("append replacement after torn tail");
+
+        assert_eq!(
+            wal.read_all()
+                .await
+                .expect("read after truncating torn tail"),
+            vec![first, replacement]
         );
     }
 

@@ -1,7 +1,9 @@
 use clap::Parser;
 use opendb_common::{OpenDbError, OpenDbResult};
-use opendb_consensus::root_range::{OpenDbRaftNodeId, RootRangeAuthority};
+use opendb_consensus::root_range::{OpenDbRaftNodeId, RootRangeAuthority, RootRangePeer};
 use std::{collections::HashSet, net::SocketAddr, path::PathBuf};
+
+const DEFAULT_ADVERTISE_ADDR: &str = "127.0.0.1:7000";
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "opendb-node", about = "OpenDB node")]
@@ -21,7 +23,7 @@ pub struct NodeConfig {
     #[arg(long, env = "OPENDB_INTERNAL_ADDR", default_value = "0.0.0.0:7000")]
     pub internal_addr: SocketAddr,
 
-    #[arg(long, env = "OPENDB_ADVERTISE_ADDR", default_value = "127.0.0.1:7000")]
+    #[arg(long, env = "OPENDB_ADVERTISE_ADDR", default_value = DEFAULT_ADVERTISE_ADDR)]
     pub advertise_addr: String,
 
     #[arg(long, env = "OPENDB_INITIAL_PEERS", value_parser = parse_initial_peers_value, default_value = "")]
@@ -32,6 +34,59 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    pub fn uses_openraft(&self) -> bool {
+        !self.initial_peers.0.is_empty()
+    }
+
+    pub fn root_range_peers(&self) -> Vec<RootRangePeer> {
+        self.initial_peers
+            .0
+            .iter()
+            .map(|peer| RootRangePeer {
+                node_id: peer.node_id,
+                addr: if peer.node_id == self.node_id
+                    && self.advertise_addr != DEFAULT_ADVERTISE_ADDR
+                {
+                    self.advertise_addr.clone()
+                } else {
+                    peer.addr.clone()
+                },
+            })
+            .collect()
+    }
+
+    pub fn validate_openraft_runtime(&self) -> OpenDbResult<()> {
+        if !self.uses_openraft() {
+            return Ok(());
+        }
+
+        if !self
+            .initial_peers
+            .0
+            .iter()
+            .any(|peer| peer.node_id == self.node_id)
+        {
+            return Err(OpenDbError::InvalidInput(format!(
+                "node id {} is missing from OPENDB_INITIAL_PEERS",
+                self.node_id
+            )));
+        }
+
+        if !self
+            .initial_peers
+            .0
+            .iter()
+            .any(|peer| peer.node_id == self.bootstrap_node_id)
+        {
+            return Err(OpenDbError::InvalidInput(format!(
+                "bootstrap node id {} is missing from OPENDB_INITIAL_PEERS",
+                self.bootstrap_node_id
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn root_range_authority(&self) -> OpenDbResult<RootRangeAuthority> {
         if self.initial_peers.0.is_empty() {
             return Ok(RootRangeAuthority::Standalone);
@@ -350,6 +405,79 @@ mod tests {
                 Some("opendb-0.opendb-peer.opendb-system.svc.cluster.local:7000".to_string())
             )
         );
+    }
+
+    #[test]
+    fn exposes_root_range_peers_for_openraft_runtime() {
+        let config = NodeConfig::try_parse_from([
+            "opendb-node",
+            "--node-id=opendb-1",
+            "--initial-peers",
+            "0=opendb-0.opendb-peer.opendb-system.svc.cluster.local:7000,1=opendb-1.opendb-peer.opendb-system.svc.cluster.local:7000",
+        ])
+        .unwrap();
+
+        assert!(config.uses_openraft());
+        assert_eq!(
+            config.root_range_peers(),
+            vec![
+                RootRangePeer {
+                    node_id: 0,
+                    addr: "opendb-0.opendb-peer.opendb-system.svc.cluster.local:7000".to_string(),
+                },
+                RootRangePeer {
+                    node_id: 1,
+                    addr: "opendb-1.opendb-peer.opendb-system.svc.cluster.local:7000".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn root_range_peers_use_advertise_addr_for_self() {
+        let config = NodeConfig::try_parse_from([
+            "opendb-node",
+            "--node-id=opendb-1",
+            "--advertise-addr=opendb-1.custom-peer:7000",
+            "--initial-peers",
+            "0=opendb-0.opendb-peer:7000,1=placeholder-self:7000",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.root_range_peers(),
+            vec![
+                RootRangePeer {
+                    node_id: 0,
+                    addr: "opendb-0.opendb-peer:7000".to_string(),
+                },
+                RootRangePeer {
+                    node_id: 1,
+                    addr: "opendb-1.custom-peer:7000".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validates_bootstrap_node_id_for_openraft_runtime() {
+        let config = NodeConfig::try_parse_from([
+            "opendb-node",
+            "--node-id=0",
+            "--initial-peers",
+            "0=opendb-0.opendb-peer:7000,1=opendb-1.opendb-peer:7000",
+            "--bootstrap-node-id=9",
+        ])
+        .unwrap();
+
+        let result = config.validate_openraft_runtime();
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::InvalidInput(message))
+                if message.contains("bootstrap node id 9")
+                    && message.contains("OPENDB_INITIAL_PEERS")
+        ));
     }
 
     fn with_env_var<R>(key: &'static str, value: &str, test: impl FnOnce() -> R) -> R {

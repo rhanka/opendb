@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 
 use crate::config::NodeConfig;
 use crate::database::Database;
-use opendb_consensus::root_range::RootRange;
+use crate::health::HealthState;
+use opendb_consensus::root_range::{RootRange, RootRangePeerServer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,12 +22,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-    let root_range = RootRange::new_with_authority(
-        &config.data_dir,
-        config
-            .root_range_authority()
-            .context("derive root range authority")?,
-    );
+    let health_state = HealthState::new(!config.uses_openraft());
+    let (root_range, peer_server) = open_root_range(&config).await?;
     let database = Arc::new(Mutex::new(
         Database::open_with_root_range(root_range)
             .await
@@ -42,10 +39,69 @@ async fn main() -> anyhow::Result<()> {
         "starting opendb node"
     );
 
-    tokio::try_join!(
-        health::serve(config.health_addr),
-        pgwire::serve(config.pgwire_addr, database),
-    )?;
+    if let Some(peer_server) = peer_server {
+        let readiness = maintain_root_range_readiness(
+            peer_server.clone(),
+            config.node_id,
+            health_state.clone(),
+        );
+        tokio::try_join!(
+            health::serve(config.health_addr, health_state),
+            pgwire::serve(config.pgwire_addr, database),
+            readiness,
+            async move {
+                peer_server
+                    .serve(config.internal_addr)
+                    .await
+                    .context("serve root range raft peer RPC")
+            },
+        )?;
+    } else {
+        tokio::try_join!(
+            health::serve(config.health_addr, health_state),
+            pgwire::serve(config.pgwire_addr, database),
+        )?;
+    }
 
     Ok(())
+}
+
+async fn open_root_range(
+    config: &NodeConfig,
+) -> anyhow::Result<(RootRange, Option<RootRangePeerServer>)> {
+    if config.uses_openraft() {
+        config
+            .validate_openraft_runtime()
+            .context("validate root range openraft runtime config")?;
+        let (root_range, peer_server) =
+            RootRange::new_raft_backed(&config.data_dir, config.node_id, config.root_range_peers())
+                .await
+                .context("open raft-backed root range")?;
+        peer_server
+            .initialize_cluster()
+            .await
+            .context("initialize root range raft cluster")?;
+        return Ok((root_range, Some(peer_server)));
+    }
+
+    Ok((
+        RootRange::new_with_authority(
+            &config.data_dir,
+            config
+                .root_range_authority()
+                .context("derive root range authority")?,
+        ),
+        None,
+    ))
+}
+
+async fn maintain_root_range_readiness(
+    peer_server: RootRangePeerServer,
+    node_id: u64,
+    health_state: HealthState,
+) -> anyhow::Result<()> {
+    loop {
+        health_state.set_ready(peer_server.is_leader(node_id).await);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
