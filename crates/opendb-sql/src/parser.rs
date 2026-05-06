@@ -46,13 +46,7 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
     let table = rest[..open].trim().to_owned();
     let columns = rest[open + 1..close]
         .split(',')
-        .map(|part| {
-            part.trim()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_owned()
-        })
+        .map(|part| part.split_whitespace().next().unwrap_or("").to_owned())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
     if table.is_empty() || columns.is_empty() {
