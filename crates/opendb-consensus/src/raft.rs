@@ -1,8 +1,8 @@
 use crate::root_range::{OpenDbRaftNodeId, RootRange, RootRangeCommand};
 use opendb_common::{OpenDbError, OpenDbResult};
 use openraft::error::{
-    ClientWriteError, InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError,
-    RemoteError,
+    CheckIsLeaderError, ClientWriteError, InstallSnapshotError, NetworkError, PayloadTooLarge,
+    RPCError, RaftError, RemoteError,
 };
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -122,6 +122,13 @@ impl RootRangeRaftHarness {
 
     pub(crate) async fn is_leader(&self, node_id: OpenDbRaftNodeId) -> bool {
         self.raft.current_leader().await == Some(node_id)
+    }
+
+    pub(crate) async fn ensure_linearizable_leader(
+        &self,
+    ) -> Result<(), RaftError<OpenDbRaftNodeId, CheckIsLeaderError<OpenDbRaftNodeId, BasicNode>>>
+    {
+        self.raft.ensure_linearizable().await.map(|_| ())
     }
 
     #[cfg(test)]

@@ -24,10 +24,9 @@ async fn main() -> anyhow::Result<()> {
 
     let health_state = HealthState::new(!config.uses_openraft());
     let (root_range, peer_server) = open_root_range(&config).await?;
+    let peer_server = peer_server.map(Arc::new);
     let database = Arc::new(Mutex::new(
-        Database::open_with_root_range(root_range)
-            .await
-            .with_context(|| format!("open database at {}", config.data_dir.display()))?,
+        open_database(root_range, peer_server.clone(), &config).await?,
     ));
     tracing::info!(
         node_id = config.node_id,
@@ -41,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(peer_server) = peer_server {
         let readiness = maintain_root_range_readiness(
-            peer_server.clone(),
+            Arc::clone(&peer_server),
             config.node_id,
             health_state.clone(),
         );
@@ -96,12 +95,27 @@ async fn open_root_range(
 }
 
 async fn maintain_root_range_readiness(
-    peer_server: RootRangePeerServer,
+    peer_server: Arc<RootRangePeerServer>,
     node_id: u64,
     health_state: HealthState,
 ) -> anyhow::Result<()> {
     loop {
         health_state.set_ready(peer_server.is_leader(node_id).await);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+async fn open_database(
+    root_range: RootRange,
+    peer_server: Option<Arc<RootRangePeerServer>>,
+    config: &NodeConfig,
+) -> anyhow::Result<Database> {
+    match peer_server {
+        Some(peer_server) => Database::open_with_root_range_peer_server(root_range, peer_server)
+            .await
+            .with_context(|| format!("open database at {}", config.data_dir.display())),
+        None => Database::open_with_root_range(root_range)
+            .await
+            .with_context(|| format!("open database at {}", config.data_dir.display())),
     }
 }

@@ -22,7 +22,18 @@ async fn main() -> Result<()> {
             println!("{}", serde_yaml::to_string(&crd::OpenDbCluster::crd())?);
         }
         Command::Run => {
-            tracing::info!("opendb operator-lite started");
+            let initial_status =
+                crd::compute_open_db_cluster_status(crd::OpenDbClusterStatusSnapshot {
+                    desired_replicas: crd::MIN_REPLICAS,
+                    ready_pods: 0,
+                    leader_pod: None,
+                });
+
+            tracing::info!(
+                phase = %initial_status.phase,
+                ready_replicas = initial_status.ready_replicas,
+                "opendb operator-lite started"
+            );
             tokio::signal::ctrl_c().await?;
         }
     }

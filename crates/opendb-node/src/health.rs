@@ -27,7 +27,7 @@ impl HealthState {
         self.ready.store(ready, Ordering::Release);
     }
 
-    fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 }

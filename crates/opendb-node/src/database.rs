@@ -1,13 +1,16 @@
 use opendb_common::OpenDbResult;
-use opendb_consensus::root_range::{RootRange, RootRangeCommand};
+use opendb_consensus::root_range::{RootRange, RootRangeCommand, RootRangePeerServer};
 use opendb_sql::{
     ast::{QueryResult, Statement},
     executor::{PreparedQuery, SqlEngine},
 };
+use std::sync::Arc;
+
 #[derive(Debug)]
 pub struct Database {
     root_range: RootRange,
     engine: SqlEngine,
+    peer_server: Option<Arc<RootRangePeerServer>>,
 }
 
 impl Database {
@@ -15,10 +18,25 @@ impl Database {
         let records = root_range.replay().await?;
         let engine = SqlEngine::from_commits(records)?;
 
-        Ok(Self { root_range, engine })
+        Ok(Self {
+            root_range,
+            engine,
+            peer_server: None,
+        })
+    }
+
+    pub async fn open_with_root_range_peer_server(
+        root_range: RootRange,
+        peer_server: Arc<RootRangePeerServer>,
+    ) -> OpenDbResult<Self> {
+        let mut database = Self::open_with_root_range(root_range).await?;
+        database.peer_server = Some(peer_server);
+        Ok(database)
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
+        self.ensure_leader_for_client_query().await?;
+
         match self.engine.prepare(statement)? {
             PreparedQuery::Read(result) => Ok(result),
             PreparedQuery::Write { record, tag } => {
@@ -30,6 +48,13 @@ impl Database {
                 self.engine.apply_committed(record)?;
                 Ok(QueryResult::Command { tag })
             }
+        }
+    }
+
+    async fn ensure_leader_for_client_query(&self) -> OpenDbResult<()> {
+        match &self.peer_server {
+            Some(peer_server) => peer_server.ensure_leader().await,
+            None => Ok(()),
         }
     }
 }

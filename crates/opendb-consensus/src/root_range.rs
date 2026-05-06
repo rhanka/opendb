@@ -220,6 +220,19 @@ impl RootRangePeerServer {
         self.raft.is_leader(node_id).await
     }
 
+    pub async fn ensure_leader(&self) -> OpenDbResult<()> {
+        self.raft.ensure_linearizable_leader().await.map_err(|err| {
+            if let Some(forward) = err.forward_to_leader() {
+                OpenDbError::NotLeader {
+                    leader_id: forward.leader_id,
+                    leader_addr: forward.leader_node.as_ref().map(|node| node.addr.clone()),
+                }
+            } else {
+                OpenDbError::Storage(format!("root range leadership check failed: {err}"))
+            }
+        })
+    }
+
     #[cfg(test)]
     async fn wait_for_leader(
         &self,

@@ -1,5 +1,6 @@
 use crate::database::Database;
 use anyhow::{Context, bail};
+use opendb_common::OpenDbError;
 use opendb_sql::{ast::QueryResult, parser::parse};
 use opendb_storage::commit_stream::Value;
 use std::{net::SocketAddr, sync::Arc};
@@ -77,12 +78,9 @@ async fn execute_simple_query(
     let result = match parse(sql) {
         Ok(statement) => {
             let mut database = database.lock().await;
-            database
-                .execute(statement)
-                .await
-                .map_err(|error| error.to_string())
+            database.execute(statement).await
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -95,7 +93,7 @@ async fn execute_simple_query(
             }
             write_command_complete(stream, &format!("SELECT {row_count}")).await?;
         }
-        Err(error) => write_error_response(stream, &error).await?,
+        Err(error) => write_open_db_error_response(stream, &error).await?,
     }
 
     write_ready_for_query(stream).await
@@ -236,9 +234,37 @@ fn value_to_text(value: &Value) -> String {
 }
 
 async fn write_error_response(stream: &mut TcpStream, message: &str) -> anyhow::Result<()> {
+    write_error_response_with_sqlstate(stream, "XX000", message).await
+}
+
+async fn write_open_db_error_response(
+    stream: &mut TcpStream,
+    error: &OpenDbError,
+) -> anyhow::Result<()> {
+    write_error_response_with_sqlstate(stream, sqlstate(error), &error.to_string()).await
+}
+
+fn sqlstate(error: &OpenDbError) -> &'static str {
+    match error {
+        OpenDbError::NotLeader { .. } => "57P03",
+        OpenDbError::Sql(_) => "42601",
+        OpenDbError::NotFound(_) => "42P01",
+        OpenDbError::InvalidInput(_) => "22023",
+        OpenDbError::Storage(_) => "XX000",
+    }
+}
+
+async fn write_error_response_with_sqlstate(
+    stream: &mut TcpStream,
+    sqlstate: &str,
+    message: &str,
+) -> anyhow::Result<()> {
     let mut payload = Vec::new();
     payload.push(b'S');
     payload.extend_from_slice(b"ERROR");
+    payload.push(0);
+    payload.push(b'C');
+    payload.extend_from_slice(sqlstate.as_bytes());
     payload.push(0);
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
@@ -277,5 +303,23 @@ mod tests {
             "SELECT * FROM accounts"
         );
         assert!(cstring_payload(b"SELECT * FROM accounts").is_err());
+    }
+
+    #[test]
+    fn not_leader_errors_use_retryable_sqlstate() {
+        let error = OpenDbError::NotLeader {
+            leader_id: Some(1),
+            leader_addr: Some("opendb-1.opendb-peer:7000".to_string()),
+        };
+
+        assert_eq!(sqlstate(&error), "57P03");
+    }
+
+    #[test]
+    fn sql_errors_use_syntax_error_sqlstate() {
+        assert_eq!(
+            sqlstate(&OpenDbError::Sql("bad query".to_string())),
+            "42601"
+        );
     }
 }
