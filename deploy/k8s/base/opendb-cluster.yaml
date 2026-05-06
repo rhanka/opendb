@@ -3,6 +3,9 @@ kind: OpenDbCluster
 metadata:
   name: opendb
   namespace: opendb-system
+  labels:
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
 spec:
   replicas: 3
   image: opendb-node:dev

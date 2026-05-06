@@ -5,6 +5,7 @@ import { parseAllDocuments } from "yaml";
 type Manifest = Record<string, unknown>;
 
 const expectedNamespace = "opendb-system";
+const expectedClusterName = "opendb";
 const baseDir = join(process.cwd(), "deploy/k8s/base");
 const expectedAdvertiseAddr = "$(OPENDB_POD_NAME).opendb-peer.$(OPENDB_POD_NAMESPACE).svc.cluster.local:7000";
 const expectedInitialPeers = [
@@ -184,6 +185,11 @@ function requireSpec(manifest: Manifest, key: string): Record<string, unknown> {
 
 function assertAppSelector(selector: Record<string, unknown>, context: string): void {
   expectEqual(selector["app.kubernetes.io/name"], "opendb", `${context}.app.kubernetes.io/name`);
+  expectEqual(
+    selector["app.kubernetes.io/instance"],
+    expectedClusterName,
+    `${context}.app.kubernetes.io/instance`
+  );
 }
 
 function assertNoStaticPodSelector(selector: Record<string, unknown>, context: string): void {
@@ -198,7 +204,7 @@ function assertOnlyAppSelector(selector: Record<string, unknown>, context: strin
   assertAppSelector(selector, context);
   assertNoStaticPodSelector(selector, context);
   const keys = Object.keys(selector).sort();
-  const expectedKeys = ["app.kubernetes.io/name"];
+  const expectedKeys = ["app.kubernetes.io/instance", "app.kubernetes.io/name"];
   if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
     fail(`${context} must select exactly ${formatValue(expectedKeys)} so readiness can expose the elected leader`);
   }
@@ -267,6 +273,8 @@ function assertHttpProbe(
 
 function assertRoleRules(role: Manifest): void {
   const rules = requireArray(role.rules, "Role/opendb-operator.rules");
+  let hasOpenDbClusterStatusRule = false;
+  let hasPodObservationRule = false;
 
   for (const [index, ruleValue] of rules.entries()) {
     const rule = requireRecord(ruleValue, `Role/opendb-operator.rules[${index}]`);
@@ -284,11 +292,22 @@ function assertRoleRules(role: Manifest): void {
         ["get", "list", "watch", "update", "patch"],
         `Role/opendb-operator.rules[${index}].verbs`
       );
-      return;
+      hasOpenDbClusterStatusRule = true;
+    }
+
+    if (apiGroups.includes("") && resources.includes("pods")) {
+      expectIncludesAll(verbs, ["get", "list", "watch"], `Role/opendb-operator.rules[${index}].verbs`);
+      hasPodObservationRule = true;
     }
   }
 
-  fail("Role/opendb-operator.rules must include db.opendb.dev resources opendbclusters and opendbclusters/status");
+  if (!hasOpenDbClusterStatusRule) {
+    fail("Role/opendb-operator.rules must include db.opendb.dev resources opendbclusters and opendbclusters/status");
+  }
+
+  if (!hasPodObservationRule) {
+    fail("Role/opendb-operator.rules must include core pods with get/list/watch for status reconciliation");
+  }
 }
 
 function assertOpenDbCluster(): void {
@@ -300,6 +319,37 @@ function assertOpenDbCluster(): void {
   expectEqual(spec.storageSize, "1Gi", "OpenDbCluster/opendb.spec.storageSize");
   expectEqual(spec.pgwirePort, 5432, "OpenDbCluster/opendb.spec.pgwirePort");
   expectEqual(spec.healthPort, 8080, "OpenDbCluster/opendb.spec.healthPort");
+}
+
+function assertOperatorDeployment(): void {
+  const deployment = requireManifest("Deployment", "opendb-operator");
+  const spec = requireSpec(deployment, "Deployment/opendb-operator");
+  expectEqual(spec.replicas, 1, "Deployment/opendb-operator.spec.replicas");
+
+  const selector = requireRecordField(spec, "selector", "Deployment/opendb-operator.spec");
+  const matchLabels = requireRecordField(selector, "matchLabels", "Deployment/opendb-operator.spec.selector");
+  expectEqual(matchLabels["app.kubernetes.io/name"], "opendb-operator", "Deployment/opendb-operator.spec.selector.matchLabels.app.kubernetes.io/name");
+
+  const template = requireRecordField(spec, "template", "Deployment/opendb-operator.spec");
+  const templateMetadata = requireRecordField(template, "metadata", "Deployment/opendb-operator.spec.template");
+  const templateLabels = requireRecordField(templateMetadata, "labels", "Deployment/opendb-operator.spec.template.metadata");
+  expectEqual(templateLabels["app.kubernetes.io/name"], "opendb-operator", "Deployment/opendb-operator.spec.template.metadata.labels.app.kubernetes.io/name");
+
+  const templateSpec = requireRecordField(template, "spec", "Deployment/opendb-operator.spec.template");
+  expectEqual(templateSpec.serviceAccountName, "opendb-operator", "Deployment/opendb-operator.spec.template.spec.serviceAccountName");
+
+  const containers = requireArrayField(templateSpec, "containers", "Deployment/opendb-operator.spec.template.spec");
+  const operatorContainer = requireNamedRecord(containers, "opendb-operator", "Deployment/opendb-operator.spec.template.spec.containers");
+  expectEqual(operatorContainer.image, "opendb-operator:dev", "Deployment/opendb-operator container opendb-operator.image");
+  expectEqual(operatorContainer.imagePullPolicy, "IfNotPresent", "Deployment/opendb-operator container opendb-operator.imagePullPolicy");
+  expectIncludes(
+    requireStringArrayField(operatorContainer, "args", "Deployment/opendb-operator container opendb-operator"),
+    "run",
+    "Deployment/opendb-operator container opendb-operator.args"
+  );
+
+  const env = requireArrayField(operatorContainer, "env", "Deployment/opendb-operator container opendb-operator");
+  assertFieldRefEnv(env, "OPENDB_NAMESPACE", "metadata.namespace", "Deployment/opendb-operator container opendb-operator.env");
 }
 
 function assertService(
@@ -405,7 +455,8 @@ const requiredResources: Array<[kind: string, name: string]> = [
   ["StatefulSet", "opendb"],
   ["ServiceAccount", "opendb-operator"],
   ["Role", "opendb-operator"],
-  ["RoleBinding", "opendb-operator"]
+  ["RoleBinding", "opendb-operator"],
+  ["Deployment", "opendb-operator"]
 ];
 
 for (const [kind, name] of requiredResources) {
@@ -414,6 +465,7 @@ for (const [kind, name] of requiredResources) {
 
 assertRoleRules(requireManifest("Role", "opendb-operator"));
 assertOpenDbCluster();
+assertOperatorDeployment();
 assertService("opendb-peer", "internal", 7000, 7000, { headless: true });
 assertService("opendb-pgwire", "pgwire", 5432, 5432, { exactAppSelector: true });
 assertStatefulSet();

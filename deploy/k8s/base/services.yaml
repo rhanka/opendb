@@ -8,6 +8,7 @@ spec:
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
   ports:
     - name: internal
       port: 7000
@@ -21,6 +22,7 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
   ports:
     - name: pgwire
       port: 5432

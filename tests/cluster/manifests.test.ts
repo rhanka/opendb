@@ -91,7 +91,7 @@ test("manifest checker rejects extra pgwire selectors", async () => {
 
   await expect(execFileAsync(tsxBin, [checkManifestsPath], { cwd: fixtureRoot })).rejects.toMatchObject({
     stderr: expect.stringContaining(
-      'Service/opendb-pgwire.spec.selector must select exactly ["app.kubernetes.io/name"]'
+      'Service/opendb-pgwire.spec.selector must select exactly ["app.kubernetes.io/instance","app.kubernetes.io/name"]'
     )
   });
 });
@@ -138,6 +138,35 @@ spec:
         storageClassName: local-path
 `;
 
+const operatorDeploymentManifest = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opendb-operator
+  namespace: opendb-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opendb-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opendb-operator
+    spec:
+      serviceAccountName: opendb-operator
+      containers:
+        - name: opendb-operator
+          image: opendb-operator:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+          env:
+            - name: OPENDB_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+`;
+
 const manifestsWithoutPeerPublishNotReadyAddresses = `apiVersion: db.opendb.dev/v1alpha1
 kind: OpenDbCluster
 metadata:
@@ -160,6 +189,7 @@ spec:
   clusterIP: None
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
   ports:
     - name: internal
       port: 7000
@@ -173,6 +203,7 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
   ports:
     - name: pgwire
       port: 5432
@@ -190,10 +221,12 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: opendb
+      app.kubernetes.io/instance: opendb
   template:
     metadata:
       labels:
         app.kubernetes.io/name: opendb
+        app.kubernetes.io/instance: opendb
     spec:
       terminationGracePeriodSeconds: 30
       containers:
@@ -256,6 +289,14 @@ metadata:
   namespace: opendb-system
 rules:
   - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - db.opendb.dev
     resources:
       - opendbclusters
@@ -280,6 +321,8 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: opendb-operator
+---
+${operatorDeploymentManifest}
 `;
 
 const manifestsWithoutInitialPeerAddresses = manifestsWithoutPeerPublishNotReadyAddresses.replace(
@@ -334,13 +377,15 @@ const manifestsWithStaticPgwireLeaderSelector = manifestsWithoutPeerPublishNotRe
   namespace: opendb-system
 spec:
   selector:
-    app.kubernetes.io/name: opendb`,
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb`,
   `metadata:
   name: opendb-pgwire
   namespace: opendb-system
 spec:
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
     statefulset.kubernetes.io/pod-name: opendb-0`
 ).replace(
   `          args:
@@ -395,12 +440,14 @@ const manifestsWithExtraPgwireSelector = manifestsWithValidOpenraftCluster.repla
   namespace: opendb-system
 spec:
   selector:
-    app.kubernetes.io/name: opendb`,
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb`,
   `metadata:
   name: opendb-pgwire
   namespace: opendb-system
 spec:
   selector:
     app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
     opendb.dev/static-role: writer`
 );

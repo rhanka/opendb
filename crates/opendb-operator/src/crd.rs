@@ -6,6 +6,10 @@ pub const PHASE_PENDING: &str = "Pending";
 pub const PHASE_DEGRADED: &str = "Degraded";
 pub const PHASE_READY: &str = "Ready";
 pub const MIN_REPLICAS: i32 = 1;
+pub const APP_LABEL_KEY: &str = "app.kubernetes.io/name";
+pub const APP_LABEL_VALUE: &str = "opendb";
+pub const INSTANCE_LABEL_KEY: &str = "app.kubernetes.io/instance";
+pub const NODE_CONTAINER_NAME: &str = "opendb-node";
 
 const CONDITION_TRUE: &str = "True";
 const CONDITION_FALSE: &str = "False";
@@ -37,7 +41,6 @@ pub struct OpenDbClusterSpec {
 pub struct OpenDbClusterStatus {
     pub ready_replicas: i32,
     pub phase: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub leader_pod: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<OpenDbClusterCondition>,
@@ -58,6 +61,31 @@ pub struct OpenDbClusterStatusSnapshot {
     pub desired_replicas: i32,
     pub ready_pods: i32,
     pub leader_pod: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedOpenDbPod {
+    pub name: String,
+    pub node_running: bool,
+    pub leader_ready: bool,
+}
+
+pub fn open_db_pod_label_selector(cluster_name: &str) -> String {
+    format!("{APP_LABEL_KEY}={APP_LABEL_VALUE},{INSTANCE_LABEL_KEY}={cluster_name}")
+}
+
+pub fn snapshot_from_observed_pods(
+    desired_replicas: i32,
+    pods: &[ObservedOpenDbPod],
+) -> OpenDbClusterStatusSnapshot {
+    OpenDbClusterStatusSnapshot {
+        desired_replicas,
+        ready_pods: pods.iter().filter(|pod| pod.node_running).count() as i32,
+        leader_pod: pods
+            .iter()
+            .find(|pod| pod.leader_ready)
+            .map(|pod| pod.name.clone()),
+    }
 }
 
 pub fn compute_open_db_cluster_status(
@@ -136,8 +164,8 @@ pub fn compute_open_db_cluster_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenDbClusterStatusSnapshot, PHASE_DEGRADED, PHASE_PENDING, PHASE_READY,
-        compute_open_db_cluster_status,
+        ObservedOpenDbPod, OpenDbClusterStatusSnapshot, PHASE_DEGRADED, PHASE_PENDING, PHASE_READY,
+        compute_open_db_cluster_status, snapshot_from_observed_pods,
     };
 
     #[test]
@@ -255,5 +283,74 @@ mod tests {
         assert_eq!(json["readyReplicas"], 1);
         assert_eq!(json["leaderPod"], "opendb-0");
         assert_eq!(json["conditions"][0]["type"], "Ready");
+    }
+
+    #[test]
+    fn snapshot_counts_running_db_processes_without_requiring_leader_readiness() {
+        let snapshot = snapshot_from_observed_pods(
+            3,
+            &[
+                ObservedOpenDbPod {
+                    name: "opendb-0".to_string(),
+                    node_running: true,
+                    leader_ready: true,
+                },
+                ObservedOpenDbPod {
+                    name: "opendb-1".to_string(),
+                    node_running: true,
+                    leader_ready: false,
+                },
+                ObservedOpenDbPod {
+                    name: "opendb-2".to_string(),
+                    node_running: true,
+                    leader_ready: false,
+                },
+            ],
+        );
+
+        assert_eq!(
+            snapshot,
+            OpenDbClusterStatusSnapshot {
+                desired_replicas: 3,
+                ready_pods: 3,
+                leader_pod: Some("opendb-0".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_missing_leader_when_no_pod_is_leader_ready() {
+        let snapshot = snapshot_from_observed_pods(
+            2,
+            &[
+                ObservedOpenDbPod {
+                    name: "opendb-0".to_string(),
+                    node_running: true,
+                    leader_ready: false,
+                },
+                ObservedOpenDbPod {
+                    name: "opendb-1".to_string(),
+                    node_running: false,
+                    leader_ready: false,
+                },
+            ],
+        );
+
+        assert_eq!(
+            snapshot,
+            OpenDbClusterStatusSnapshot {
+                desired_replicas: 2,
+                ready_pods: 1,
+                leader_pod: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pod_label_selector_scopes_observation_to_cluster_instance() {
+        assert_eq!(
+            super::open_db_pod_label_selector("opendb"),
+            "app.kubernetes.io/name=opendb,app.kubernetes.io/instance=opendb"
+        );
     }
 }
