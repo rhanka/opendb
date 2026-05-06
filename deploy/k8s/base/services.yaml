@@ -5,6 +5,7 @@ metadata:
   namespace: opendb-system
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: opendb
   ports:
@@ -20,6 +21,7 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: opendb
+    statefulset.kubernetes.io/pod-name: opendb-0
   ports:
     - name: pgwire
       port: 5432

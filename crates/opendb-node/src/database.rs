@@ -1,11 +1,9 @@
 use opendb_common::OpenDbResult;
-use opendb_consensus::root_range::RootRange;
+use opendb_consensus::root_range::{RootRange, RootRangeCommand};
 use opendb_sql::{
     ast::{QueryResult, Statement},
     executor::{PreparedQuery, SqlEngine},
 };
-use std::path::Path;
-
 #[derive(Debug)]
 pub struct Database {
     root_range: RootRange,
@@ -13,8 +11,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn open(data_dir: impl AsRef<Path>) -> OpenDbResult<Self> {
-        let root_range = RootRange::new(data_dir.as_ref());
+    pub async fn open_with_root_range(root_range: RootRange) -> OpenDbResult<Self> {
         let records = root_range.replay().await?;
         let engine = SqlEngine::from_commits(records)?;
 
@@ -25,7 +22,11 @@ impl Database {
         match self.engine.prepare(statement)? {
             PreparedQuery::Read(result) => Ok(result),
             PreparedQuery::Write { record, tag } => {
-                self.root_range.apply_committed(&record).await?;
+                self.root_range
+                    .submit(RootRangeCommand {
+                        record: record.clone(),
+                    })
+                    .await?;
                 self.engine.apply_committed(record)?;
                 Ok(QueryResult::Command { tag })
             }
@@ -36,13 +37,15 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::Database;
+    use opendb_common::OpenDbError;
+    use opendb_consensus::root_range::{RootRange, RootRangeAuthority};
     use opendb_sql::{ast::QueryResult, parser::parse};
     use opendb_storage::commit_stream::Value;
 
     #[tokio::test]
     async fn execute_persists_writes_through_root_range_and_replays_on_reopen() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let mut database = Database::open(temp_dir.path())
+        let mut database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
             .await
             .expect("open database");
 
@@ -66,7 +69,7 @@ mod tests {
         );
 
         drop(database);
-        let mut reopened = Database::open(temp_dir.path())
+        let mut reopened = Database::open_with_root_range(RootRange::new(temp_dir.path()))
             .await
             .expect("reopen database");
 
@@ -86,6 +89,38 @@ mod tests {
                 .join("root-range")
                 .join("commit.wal")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_database_rejects_writes_before_local_wal_append() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new_with_authority(
+            temp_dir.path(),
+            RootRangeAuthority::follower(0, Some("opendb-0.opendb-peer:7000".to_string())),
+        );
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+
+        let result = database
+            .execute(parse("CREATE TABLE accounts (id INT)").expect("parse"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::NotLeader {
+                leader_id: Some(0),
+                leader_addr: Some(addr),
+            }) if addr == "opendb-0.opendb-peer:7000"
+        ));
+        assert!(
+            !temp_dir
+                .path()
+                .join("root-range")
+                .join("commit.wal")
+                .exists(),
+            "follower write must not create a local WAL"
         );
     }
 }

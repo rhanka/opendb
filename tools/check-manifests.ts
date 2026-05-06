@@ -6,6 +6,12 @@ type Manifest = Record<string, unknown>;
 
 const expectedNamespace = "opendb-system";
 const baseDir = join(process.cwd(), "deploy/k8s/base");
+const expectedAdvertiseAddr = "$(OPENDB_POD_NAME).opendb-peer.$(OPENDB_POD_NAMESPACE).svc.cluster.local:7000";
+const expectedInitialPeers = [
+  "0=opendb-0.opendb-peer.opendb-system.svc.cluster.local:7000",
+  "1=opendb-1.opendb-peer.opendb-system.svc.cluster.local:7000",
+  "2=opendb-2.opendb-peer.opendb-system.svc.cluster.local:7000"
+].join(",");
 
 function fail(message: string): never {
   console.error(message);
@@ -180,6 +186,10 @@ function assertAppSelector(selector: Record<string, unknown>, context: string): 
   expectEqual(selector["app.kubernetes.io/name"], "opendb", `${context}.app.kubernetes.io/name`);
 }
 
+function assertLeaderPodSelector(selector: Record<string, unknown>, context: string): void {
+  expectEqual(selector["statefulset.kubernetes.io/pod-name"], "opendb-0", `${context}.statefulset.kubernetes.io/pod-name`);
+}
+
 function assertServicePort(
   ports: unknown[],
   name: string,
@@ -200,6 +210,18 @@ function assertContainerPort(
 ): void {
   const port = requireNamedRecord(ports, name, context);
   expectEqual(port.containerPort, containerPort, `${context}[name=${name}].containerPort`);
+}
+
+function assertFieldRefEnv(env: unknown[], name: string, fieldPath: string, context: string): void {
+  const envVar = requireNamedRecord(env, name, context);
+  const valueFrom = requireRecordField(envVar, "valueFrom", `${context}[name=${name}]`);
+  const fieldRef = requireRecordField(valueFrom, "fieldRef", `${context}[name=${name}].valueFrom`);
+  expectEqual(fieldRef.fieldPath, fieldPath, `${context}[name=${name}].valueFrom.fieldRef.fieldPath`);
+}
+
+function assertValueEnv(env: unknown[], name: string, value: string, context: string): void {
+  const envVar = requireNamedRecord(env, name, context);
+  expectEqual(envVar.value, value, `${context}[name=${name}].value`);
 }
 
 function assertHttpProbe(
@@ -263,17 +285,21 @@ function assertService(
   portName: "internal" | "pgwire",
   port: number,
   targetPort: number,
-  options: { headless?: boolean } = {}
+  options: { headless?: boolean; leaderOnly?: boolean } = {}
 ): void {
   const key = `Service/${name}`;
   const service = requireManifest("Service", name);
   const spec = requireSpec(service, key);
   if (options.headless === true) {
     expectEqual(spec.clusterIP, "None", `${key}.spec.clusterIP`);
+    expectEqual(spec.publishNotReadyAddresses, true, `${key}.spec.publishNotReadyAddresses`);
   }
 
   const selector = requireRecordField(spec, "selector", `${key}.spec`);
   assertAppSelector(selector, `${key}.spec.selector`);
+  if (options.leaderOnly === true) {
+    assertLeaderPodSelector(selector, `${key}.spec.selector`);
+  }
 
   assertServicePort(requireArrayField(spec, "ports", `${key}.spec`), portName, port, targetPort, `${key}.spec.ports`);
 }
@@ -302,24 +328,21 @@ function assertStatefulSet(): void {
   expectEqual(nodeContainer.imagePullPolicy, "IfNotPresent", "StatefulSet/opendb container opendb-node.imagePullPolicy");
 
   const args = requireStringArrayField(nodeContainer, "args", "StatefulSet/opendb container opendb-node");
-  expectIncludes(args, "--node-id=$(OPENDB_ORDINAL)", "StatefulSet/opendb container opendb-node.args");
+  expectIncludes(args, "--node-id=$(OPENDB_POD_NAME)", "StatefulSet/opendb container opendb-node.args");
+  expectIncludes(args, "--internal-addr=$(OPENDB_INTERNAL_ADDR)", "StatefulSet/opendb container opendb-node.args");
+  expectIncludes(args, "--advertise-addr=$(OPENDB_ADVERTISE_ADDR)", "StatefulSet/opendb container opendb-node.args");
+  expectIncludes(args, "--initial-peers=$(OPENDB_INITIAL_PEERS)", "StatefulSet/opendb container opendb-node.args");
+  expectIncludes(args, "--bootstrap-node-id=$(OPENDB_BOOTSTRAP_NODE_ID)", "StatefulSet/opendb container opendb-node.args");
 
   const env = requireArrayField(nodeContainer, "env", "StatefulSet/opendb container opendb-node");
-  const ordinalEnv = requireNamedRecord(env, "OPENDB_ORDINAL", "StatefulSet/opendb container opendb-node.env");
-  const valueFrom = requireRecordField(ordinalEnv, "valueFrom", "StatefulSet/opendb container opendb-node.env[name=OPENDB_ORDINAL]");
-  const fieldRef = requireRecordField(
-    valueFrom,
-    "fieldRef",
-    "StatefulSet/opendb container opendb-node.env[name=OPENDB_ORDINAL].valueFrom"
-  );
-  expectEqual(
-    fieldRef.fieldPath,
-    "metadata.name",
-    "StatefulSet/opendb container opendb-node.env[name=OPENDB_ORDINAL].valueFrom.fieldRef.fieldPath"
-  );
-
-  const dataDirEnv = requireNamedRecord(env, "OPENDB_DATA_DIR", "StatefulSet/opendb container opendb-node.env");
-  expectEqual(dataDirEnv.value, "/var/lib/opendb", "StatefulSet/opendb container opendb-node.env[name=OPENDB_DATA_DIR].value");
+  const envContext = "StatefulSet/opendb container opendb-node.env";
+  assertFieldRefEnv(env, "OPENDB_POD_NAME", "metadata.name", envContext);
+  assertFieldRefEnv(env, "OPENDB_POD_NAMESPACE", "metadata.namespace", envContext);
+  assertValueEnv(env, "OPENDB_INTERNAL_ADDR", "0.0.0.0:7000", envContext);
+  assertValueEnv(env, "OPENDB_ADVERTISE_ADDR", expectedAdvertiseAddr, envContext);
+  assertValueEnv(env, "OPENDB_INITIAL_PEERS", expectedInitialPeers, envContext);
+  assertValueEnv(env, "OPENDB_BOOTSTRAP_NODE_ID", "0", envContext);
+  assertValueEnv(env, "OPENDB_DATA_DIR", "/var/lib/opendb", envContext);
 
   const ports = requireArrayField(nodeContainer, "ports", "StatefulSet/opendb container opendb-node");
   assertContainerPort(ports, "pgwire", 5432, "StatefulSet/opendb container opendb-node.ports");
@@ -368,7 +391,7 @@ for (const [kind, name] of requiredResources) {
 assertRoleRules(requireManifest("Role", "opendb-operator"));
 assertOpenDbCluster();
 assertService("opendb-peer", "internal", 7000, 7000, { headless: true });
-assertService("opendb-pgwire", "pgwire", 5432, 5432);
+assertService("opendb-pgwire", "pgwire", 5432, 5432, { leaderOnly: true });
 assertStatefulSet();
 
 console.log("Kubernetes manifests passed static checks.");

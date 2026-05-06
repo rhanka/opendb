@@ -20,12 +20,28 @@ spec:
           image: opendb-node:dev
           imagePullPolicy: IfNotPresent
           args:
-            - "--node-id=$(OPENDB_ORDINAL)"
+            - "--node-id=$(OPENDB_POD_NAME)"
+            - "--internal-addr=$(OPENDB_INTERNAL_ADDR)"
+            - "--advertise-addr=$(OPENDB_ADVERTISE_ADDR)"
+            - "--initial-peers=$(OPENDB_INITIAL_PEERS)"
+            - "--bootstrap-node-id=$(OPENDB_BOOTSTRAP_NODE_ID)"
           env:
-            - name: OPENDB_ORDINAL
+            - name: OPENDB_POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: OPENDB_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPENDB_INTERNAL_ADDR
+              value: "0.0.0.0:7000"
+            - name: OPENDB_ADVERTISE_ADDR
+              value: "$(OPENDB_POD_NAME).opendb-peer.$(OPENDB_POD_NAMESPACE).svc.cluster.local:7000"
+            - name: OPENDB_INITIAL_PEERS
+              value: "0=opendb-0.opendb-peer.opendb-system.svc.cluster.local:7000,1=opendb-1.opendb-peer.opendb-system.svc.cluster.local:7000,2=opendb-2.opendb-peer.opendb-system.svc.cluster.local:7000"
+            - name: OPENDB_BOOTSTRAP_NODE_ID
+              value: "0"
             - name: OPENDB_DATA_DIR
               value: /var/lib/opendb
           ports:

@@ -12,17 +12,48 @@ pub struct RootRangeCommand {
     pub record: CommitRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootRangeAuthority {
+    Standalone,
+    Leader {
+        node_id: OpenDbRaftNodeId,
+    },
+    Follower {
+        leader_id: Option<OpenDbRaftNodeId>,
+        leader_addr: Option<String>,
+    },
+}
+
+impl RootRangeAuthority {
+    pub fn leader(node_id: OpenDbRaftNodeId) -> Self {
+        Self::Leader { node_id }
+    }
+
+    pub fn follower(leader_id: OpenDbRaftNodeId, leader_addr: Option<String>) -> Self {
+        Self::Follower {
+            leader_id: Some(leader_id),
+            leader_addr,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RootRange {
     range_id: RangeId,
     wal: Wal,
+    authority: RootRangeAuthority,
 }
 
 impl RootRange {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
+        Self::new_with_authority(data_dir, RootRangeAuthority::Standalone)
+    }
+
+    pub fn new_with_authority(data_dir: impl AsRef<Path>, authority: RootRangeAuthority) -> Self {
         Self {
             range_id: RangeId::ROOT,
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
+            authority,
         }
     }
 
@@ -47,15 +78,25 @@ impl RootRange {
         self.apply_committed(record).await
     }
 
-    /// Validates a root-range command reserved for future OpenRaft proposals.
+    /// Submits a root-range command through the consensus boundary.
     ///
-    /// Valid commands return a not-yet-wired error until the real OpenRaft
-    /// proposal path exists. Invalid non-root commands are rejected first.
+    /// Standalone and explicit leader modes can commit locally for Milestone 1.
+    /// Followers must reject before touching the local WAL; the future OpenRaft
+    /// client-write path replaces the leader arm without changing SQL/pgwire.
     pub async fn submit(&self, command: RootRangeCommand) -> OpenDbResult<()> {
         self.validate_apply_record(&command.record)?;
-        Err(OpenDbError::InvalidInput(
-            "root range OpenRaft proposal submit path is not yet wired".to_string(),
-        ))
+        match &self.authority {
+            RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => {
+                self.apply_committed(&command.record).await
+            }
+            RootRangeAuthority::Follower {
+                leader_id,
+                leader_addr,
+            } => Err(OpenDbError::NotLeader {
+                leader_id: *leader_id,
+                leader_addr: leader_addr.clone(),
+            }),
+        }
     }
 
     pub async fn replay(&self) -> OpenDbResult<Vec<CommitRecord>> {
@@ -247,9 +288,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_returns_not_yet_wired_for_valid_root_commands() {
+    async fn leader_submit_persists_root_commands_through_consensus_boundary() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let root_range = RootRange::new(temp_dir.path());
+        let root_range =
+            RootRange::new_with_authority(temp_dir.path(), RootRangeAuthority::leader(0));
         let record = CommitRecord::new(
             TransactionId(11),
             LogicalTimestamp(15),
@@ -259,12 +301,79 @@ mod tests {
             }],
         );
 
+        root_range
+            .submit(RootRangeCommand {
+                record: record.clone(),
+            })
+            .await
+            .expect("leader submit");
+
+        assert_eq!(
+            root_range
+                .replay()
+                .await
+                .expect("replay leader-submitted command"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_submit_persists_root_commands_through_consensus_boundary() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let record = CommitRecord::new(
+            TransactionId(12),
+            LogicalTimestamp(16),
+            vec![Mutation::CreateTable {
+                table: "events".to_string(),
+                columns: vec!["id".to_string()],
+            }],
+        );
+
+        root_range
+            .submit(RootRangeCommand {
+                record: record.clone(),
+            })
+            .await
+            .expect("submit root command");
+
+        assert_eq!(
+            root_range.replay().await.expect("replay submitted command"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_submit_rejects_root_commands_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new_with_authority(
+            temp_dir.path(),
+            RootRangeAuthority::follower(0, Some("opendb-0.opendb-peer:7000".to_string())),
+        );
+        let record = CommitRecord::new(
+            TransactionId(13),
+            LogicalTimestamp(17),
+            vec![Mutation::CreateTable {
+                table: "events".to_string(),
+                columns: vec!["id".to_string()],
+            }],
+        );
+
         let result = root_range.submit(RootRangeCommand { record }).await;
 
         assert!(matches!(
             result,
-            Err(OpenDbError::InvalidInput(message))
-                if message.contains("not yet wired") && message.contains("OpenRaft")
+            Err(OpenDbError::NotLeader {
+                leader_id: Some(0),
+                leader_addr: Some(addr),
+            }) if addr == "opendb-0.opendb-peer:7000"
         ));
+        assert_eq!(
+            root_range
+                .replay()
+                .await
+                .expect("replay after rejected follower submit"),
+            Vec::new()
+        );
     }
 }
