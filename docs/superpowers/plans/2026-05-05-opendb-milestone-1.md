@@ -114,9 +114,11 @@ Responsibilities:
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `package.json`
+- Create: `package-lock.json`
 - Create: `tsconfig.json`
 - Create: `vitest.config.ts`
 - Create: `tools/no-python.ts`
+- Create: `tools/check-manifests.ts`
 - Modify: `.gitignore`
 
 - [ ] **Step 1: Create the Rust workspace manifest**
@@ -126,19 +128,11 @@ Create `Cargo.toml`:
 ```toml
 [workspace]
 resolver = "2"
-members = [
-  "crates/opendb-common",
-  "crates/opendb-storage",
-  "crates/opendb-sql",
-  "crates/opendb-consensus",
-  "crates/opendb-node",
-  "crates/opendb-operator",
-]
+members = []
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://example.invalid/opendb"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -220,6 +214,8 @@ export default defineConfig({
   test: {
     globals: true,
     include: ["tests/**/*.test.ts"],
+    // Task 1 lands before test files exist; later tasks replace this with real suites.
+    passWithNoTests: true,
     pool: "forks",
     testTimeout: 30_000
   }
@@ -231,11 +227,19 @@ export default defineConfig({
 Create `tools/no-python.ts`:
 
 ```ts
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 
 const root = process.cwd();
-const ignored = new Set([".git", ".opendb-git", "target", "node_modules", ".superpowers", ".playwright-mcp"]);
+const ignored = new Set([
+  ".git",
+  ".opendb-git",
+  ".worktrees",
+  "target",
+  "node_modules",
+  ".superpowers",
+  ".playwright-mcp"
+]);
 const forbiddenExtensions = new Set([".py", ".pyi", ".pyw"]);
 const forbiddenFiles: string[] = [];
 
@@ -243,7 +247,8 @@ function walk(dir: string): void {
   for (const entry of readdirSync(dir)) {
     if (ignored.has(entry)) continue;
     const path = join(dir, entry);
-    const stat = statSync(path);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) continue;
     if (stat.isDirectory()) {
       walk(path);
       continue;
@@ -290,6 +295,10 @@ Run:
 ```bash
 npm install
 npm run check:no-python
+npm run check:manifests
+npm test
+npm run test:parity
+npm run test:cluster
 cargo metadata --no-deps
 ```
 
@@ -299,14 +308,14 @@ Expected:
 No Python files found.
 ```
 
-`cargo metadata --no-deps` may fail until crate manifests are created in Task 2. If it fails only because member manifests are missing, continue to Task 2.
+All commands should pass in the Task 1 state.
 
 - [ ] **Step 7: Commit**
 
 Run:
 
 ```bash
-git --git-dir=.opendb-git --work-tree=. add .gitignore Cargo.toml rust-toolchain.toml package.json tsconfig.json vitest.config.ts tools/no-python.ts
+git --git-dir=.opendb-git --work-tree=. add .gitignore Cargo.toml rust-toolchain.toml package.json package-lock.json tsconfig.json vitest.config.ts tools/no-python.ts tools/check-manifests.ts
 git --git-dir=.opendb-git --work-tree=. commit -m "chore: scaffold workspace tooling"
 ```
 
@@ -322,8 +331,27 @@ git --git-dir=.opendb-git --work-tree=. commit -m "chore: scaffold workspace too
 - Create: crate manifests and `src/lib.rs` files for `opendb-storage`, `opendb-sql`, `opendb-consensus`
 - Create: `crates/opendb-node/Cargo.toml`
 - Create: `crates/opendb-operator/Cargo.toml`
+- Create: minimal placeholder module files referenced by crate roots
+- Modify: `Cargo.toml`
 
-- [ ] **Step 1: Create the common crate**
+- [ ] **Step 1: Add crate members to the root workspace**
+
+Modify `Cargo.toml`:
+
+```toml
+[workspace]
+resolver = "2"
+members = [
+  "crates/opendb-common",
+  "crates/opendb-storage",
+  "crates/opendb-sql",
+  "crates/opendb-consensus",
+  "crates/opendb-node",
+  "crates/opendb-operator",
+]
+```
+
+- [ ] **Step 2: Create the common crate**
 
 Create `crates/opendb-common/Cargo.toml`:
 
@@ -389,7 +417,7 @@ impl RangeId {
 }
 ```
 
-- [ ] **Step 2: Create the remaining crate manifests**
+- [ ] **Step 3: Create the remaining crate manifests**
 
 Create `crates/opendb-storage/Cargo.toml`:
 
@@ -494,7 +522,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ```
 
-- [ ] **Step 3: Add minimal lib roots**
+- [ ] **Step 4: Add minimal lib roots**
 
 Create `crates/opendb-storage/src/lib.rs`:
 
@@ -518,7 +546,27 @@ Create `crates/opendb-consensus/src/lib.rs`:
 pub mod root_range;
 ```
 
-- [ ] **Step 4: Verify the workspace compiles to the expected missing-module errors**
+- [ ] **Step 5: Add minimal placeholder modules so the workspace is valid**
+
+Create these files with a one-line module marker. Later tasks replace the marker with real implementation:
+
+```rust
+// Implemented by a later milestone task.
+```
+
+Files:
+
+```text
+crates/opendb-storage/src/commit_stream.rs
+crates/opendb-storage/src/row_projection.rs
+crates/opendb-storage/src/wal.rs
+crates/opendb-sql/src/ast.rs
+crates/opendb-sql/src/executor.rs
+crates/opendb-sql/src/parser.rs
+crates/opendb-consensus/src/root_range.rs
+```
+
+- [ ] **Step 6: Verify the workspace compiles**
 
 Run:
 
@@ -526,15 +574,15 @@ Run:
 cargo check
 ```
 
-Expected: failure only for missing files referenced by the new `lib.rs` files, such as `file not found for module commit_stream`.
+Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 Run:
 
 ```bash
-git --git-dir=.opendb-git --work-tree=. add crates Cargo.toml
-git --git-dir=.opendb-git --work-tree=. commit -m "chore: add rust crate skeletons"
+git add crates Cargo.toml docs/superpowers/plans/2026-05-05-opendb-milestone-1.md
+git commit -m "chore: add rust crate skeletons"
 ```
 
 ---
@@ -545,6 +593,7 @@ git --git-dir=.opendb-git --work-tree=. commit -m "chore: add rust crate skeleto
 - Create: `crates/opendb-storage/src/commit_stream.rs`
 - Create: `crates/opendb-storage/src/wal.rs`
 - Modify: `crates/opendb-storage/src/lib.rs`
+- Modify: `Cargo.toml`, `crates/opendb-storage/Cargo.toml`, `Cargo.lock` if a checksum crate is used
 
 - [ ] **Step 1: Write commit stream tests**
 
@@ -631,7 +680,15 @@ Expected: PASS.
 
 - [ ] **Step 3: Add WAL tests and implementation**
 
-Create `crates/opendb-storage/src/wal.rs`:
+Implementation notes:
+- `Wal` must serialize appends across cloned instances with a shared async mutex.
+- WAL frames must be robust against a torn final record. Use length-prefixed frames with a checksum and replay complete valid records; `read_all()` must stop at an incomplete final frame without failing the whole WAL.
+- `read_all()` must reject records whose `version != CommitRecord::VERSION` with an error that includes the WAL path and record index.
+- On the first append that creates the WAL file, sync the file and then sync the containing directory. On Linux, directory sync errors must be surfaced as storage errors.
+- Keep WAL error messages contextual: include the path and operation or record index where practical.
+- Pin the WAL frame/serialization shape with a golden test so accidental format drift is visible.
+
+Create `crates/opendb-storage/src/wal.rs`. The WAL implementation must follow the robustness notes above; any older JSONL sketch is non-normative.
 
 ```rust
 use crate::commit_stream::CommitRecord;
@@ -1794,7 +1851,7 @@ git --git-dir=.opendb-git --work-tree=. commit -m "feat: add opendb cluster crd"
 - Create: `deploy/k8s/base/rbac.yaml`
 - Create: `deploy/k8s/base/services.yaml`
 - Create: `deploy/k8s/base/statefulset.yaml`
-- Create: `tools/check-manifests.ts`
+- Modify/replace: `tools/check-manifests.ts`
 - Create: `tests/cluster/manifests.test.ts`
 
 - [ ] **Step 1: Add cluster custom resource**
@@ -1965,9 +2022,9 @@ spec:
             storage: 1Gi
 ```
 
-- [ ] **Step 5: Add manifest checker**
+- [ ] **Step 5: Replace the Task 1 manifest checker placeholder**
 
-Create `tools/check-manifests.ts`:
+Modify or replace `tools/check-manifests.ts` with real static checks:
 
 ```ts
 import { readFileSync, readdirSync } from "node:fs";

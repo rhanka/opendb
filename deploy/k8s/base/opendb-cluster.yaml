@@ -1,0 +1,15 @@
+apiVersion: db.opendb.dev/v1alpha1
+kind: OpenDbCluster
+metadata:
+  name: opendb
+  namespace: opendb-system
+  labels:
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
+spec:
+  replicas: 3
+  image: opendb-node:dev
+  storageClassName: local-path
+  storageSize: 1Gi
+  pgwirePort: 5432
+  healthPort: 8080

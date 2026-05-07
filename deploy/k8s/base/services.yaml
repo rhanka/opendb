@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: opendb-peer
+  namespace: opendb-system
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
+  ports:
+    - name: internal
+      port: 7000
+      targetPort: 7000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opendb-pgwire
+  namespace: opendb-system
+spec:
+  selector:
+    app.kubernetes.io/name: opendb
+    app.kubernetes.io/instance: opendb
+  ports:
+    - name: pgwire
+      port: 5432
+      targetPort: 5432
