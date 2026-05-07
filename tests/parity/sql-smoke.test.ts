@@ -1,9 +1,10 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
@@ -250,7 +251,7 @@ function requestTcp(port: number): Promise<void> {
   });
 }
 
-function captureOutput(child: ChildProcessWithoutNullStreams): CapturedOutput {
+function captureOutput(child: OpenDbNodeProcess): CapturedOutput {
   let stdout = "";
   let stderr = "";
 
@@ -276,7 +277,7 @@ function section(name: string, value: string): string {
   return value.length > 0 ? `${name}:\n${value}` : "";
 }
 
-function trackExit(child: ChildProcessWithoutNullStreams): ExitTracker {
+function trackExit(child: OpenDbNodeProcess): ExitTracker {
   let result: ProcessExit | undefined;
   const promise = new Promise<ProcessExit>((resolve) => {
     child.once("exit", (code, signal) => {
@@ -297,7 +298,7 @@ function trackExit(child: ChildProcessWithoutNullStreams): ExitTracker {
   };
 }
 
-async function stopChild(child: ChildProcessWithoutNullStreams, exit: ExitTracker): Promise<void> {
+async function stopChild(child: OpenDbNodeProcess, exit: ExitTracker): Promise<void> {
   if (exit.result !== undefined) {
     return;
   }
@@ -367,6 +368,8 @@ function formatExit(exit: ProcessExit): string {
 type CapturedOutput = {
   text: () => string;
 };
+
+type OpenDbNodeProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 type ProcessExit = {
   code: number | null;
