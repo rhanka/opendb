@@ -1,6 +1,12 @@
 use opendb_storage::commit_stream::{ColumnDefinition, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Predicate {
+    pub column: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     CreateTable {
         table: String,
@@ -12,6 +18,7 @@ pub enum Statement {
     },
     SelectAll {
         table: String,
+        predicate: Option<Predicate>,
     },
 }
 

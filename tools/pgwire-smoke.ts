@@ -168,10 +168,20 @@ try {
   await waitForReady();
   await exec(`CREATE TABLE ${tableName} (id INT PRIMARY KEY, name TEXT)`);
   await exec(`INSERT INTO ${tableName} VALUES (1, 'Ada')`);
+  await exec(`INSERT INTO ${tableName} VALUES (2, 'Grace')`);
   const rows = await exec(`SELECT * FROM ${tableName}`);
 
   if (!rows.some((row) => rowText(row).includes("Ada"))) {
     throw new Error("Ada row was not returned");
+  }
+  const filteredRows = await exec(`SELECT * FROM ${tableName} WHERE id = 1`);
+  const filteredRow = filteredRows[0];
+  if (filteredRows.length !== 1 || filteredRow === undefined || !rowText(filteredRow).includes("Ada")) {
+    throw new Error(`primary-key filtered select returned unexpected rows: ${filteredRows.map(rowText).join(";")}`);
+  }
+  const unsupportedPredicateError = await execExpectError(`SELECT * FROM ${tableName} WHERE name = 'Ada'`);
+  if (!unsupportedPredicateError.includes("primary key equality")) {
+    throw new Error(`non-primary-key predicate was not rejected as expected: ${unsupportedPredicateError}`);
   }
   const duplicateError = await execExpectError(`INSERT INTO ${tableName} VALUES (1, 'Grace')`);
   if (!duplicateError.includes("row already exists")) {

@@ -1,4 +1,4 @@
-use crate::ast::Statement;
+use crate::ast::{Predicate, Statement};
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Value};
 
@@ -169,9 +169,17 @@ fn parse_value(value: &str) -> OpenDbResult<Value> {
 }
 
 fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
-    let table = strip_keyword_prefix(sql, "SELECT * FROM ")
+    let rest = strip_keyword_prefix(sql, "SELECT * FROM ")
         .ok_or_else(|| OpenDbError::Sql("invalid SELECT".to_owned()))?
         .trim();
+    let upper_rest = rest.to_ascii_uppercase();
+    let (table, predicate) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
+        let table = rest[..where_pos].trim();
+        let predicate = parse_predicate(rest[where_pos + " WHERE ".len()..].trim())?;
+        (table, Some(predicate))
+    } else {
+        (rest, None)
+    };
     if table.is_empty() {
         return Err(OpenDbError::Sql("SELECT requires table".to_owned()));
     }
@@ -182,7 +190,54 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     }
     Ok(Statement::SelectAll {
         table: table.to_owned(),
+        predicate,
     })
+}
+
+fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
+    let equals_positions = equality_positions_outside_quotes(raw)?;
+    let Some(equals_pos) = equals_positions.first().copied() else {
+        return Err(OpenDbError::Sql(
+            "SELECT WHERE only supports equality predicates".to_owned(),
+        ));
+    };
+    if equals_positions.len() != 1 {
+        return Err(OpenDbError::Sql(
+            "SELECT WHERE only supports one equality predicate".to_owned(),
+        ));
+    }
+    let column = raw[..equals_pos].trim();
+    let value = raw[equals_pos + 1..].trim();
+    if column.is_empty() || value.is_empty() {
+        return Err(OpenDbError::Sql(
+            "SELECT WHERE requires column and literal".to_owned(),
+        ));
+    }
+    if column.split_whitespace().count() != 1 {
+        return Err(OpenDbError::Sql(
+            "SELECT WHERE only supports a single column".to_owned(),
+        ));
+    }
+    Ok(Predicate {
+        column: column.to_owned(),
+        value: parse_value(value)?,
+    })
+}
+
+fn equality_positions_outside_quotes(raw: &str) -> OpenDbResult<Vec<usize>> {
+    let mut positions = Vec::new();
+    let mut in_quote = false;
+    for (index, ch) in raw.char_indices() {
+        match ch {
+            '\'' => in_quote = !in_quote,
+            '=' if !in_quote => positions.push(index),
+            _ => {}
+        }
+    }
+    if in_quote {
+        return Err(OpenDbError::Sql("unterminated quoted literal".to_owned()));
+    }
+    Ok(positions)
 }
 
 fn strip_keyword_prefix<'a>(sql: &'a str, prefix: &str) -> Option<&'a str> {
@@ -217,7 +272,8 @@ mod tests {
         assert_eq!(
             parse("SELECT * FROM accounts").expect("select"),
             Statement::SelectAll {
-                table: "accounts".to_owned()
+                table: "accounts".to_owned(),
+                predicate: None,
             }
         );
     }
@@ -244,7 +300,8 @@ mod tests {
         assert_eq!(
             parse("sElEcT * fRoM accounts").expect("select"),
             Statement::SelectAll {
-                table: "accounts".to_owned()
+                table: "accounts".to_owned(),
+                predicate: None,
             }
         );
     }
@@ -301,9 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_select_where_at_parse_time() {
+    fn rejects_malformed_select_where_at_parse_time() {
         assert!(matches!(
-            parse("SELECT * FROM accounts WHERE id = 1"),
+            parse("SELECT * FROM accounts WHERE id > 1"),
+            Err(OpenDbError::Sql(_))
+        ));
+        assert!(matches!(
+            parse("SELECT * FROM accounts WHERE id = "),
             Err(OpenDbError::Sql(_))
         ));
     }
@@ -328,5 +389,43 @@ mod tests {
             parse("CREATE TABLE accounts (id UUID PRIMARY KEY)"),
             Err(OpenDbError::Sql(_))
         ));
+    }
+
+    #[test]
+    fn parses_primary_key_equality_predicate() {
+        assert_eq!(
+            parse("SELECT * FROM accounts WHERE id = 1").expect("select where"),
+            Statement::SelectAll {
+                table: "accounts".to_owned(),
+                predicate: Some(Predicate {
+                    column: "id".to_owned(),
+                    value: Value::Int64(1),
+                }),
+            }
+        );
+        assert_eq!(
+            parse("select * from accounts where name = 'Ada'").expect("select where text"),
+            Statement::SelectAll {
+                table: "accounts".to_owned(),
+                predicate: Some(Predicate {
+                    column: "name".to_owned(),
+                    value: Value::Text("Ada".to_owned()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_equality_predicate_with_equals_inside_quoted_literal() {
+        assert_eq!(
+            parse("SELECT * FROM sessions WHERE token = 'a=b'").expect("select where text pk"),
+            Statement::SelectAll {
+                table: "sessions".to_owned(),
+                predicate: Some(Predicate {
+                    column: "token".to_owned(),
+                    value: Value::Text("a=b".to_owned()),
+                }),
+            }
+        );
     }
 }

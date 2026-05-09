@@ -1,4 +1,4 @@
-use crate::ast::{QueryResult, Statement};
+use crate::ast::{Predicate, QueryResult, Statement};
 use opendb_common::{LogicalTimestamp, OpenDbError, OpenDbResult, TransactionId};
 use opendb_storage::commit_stream::{ColumnType, ColumnValue, CommitRecord, Mutation, Value};
 use opendb_storage::row_projection::RowProjection;
@@ -80,7 +80,9 @@ impl SqlEngine {
                     "INSERT 0 1",
                 )
             }
-            Statement::SelectAll { table } => self.select_all(&table).map(PreparedQuery::Read),
+            Statement::SelectAll { table, predicate } => self
+                .select_all(&table, predicate.as_ref())
+                .map(PreparedQuery::Read),
         }
     }
 
@@ -118,33 +120,65 @@ impl SqlEngine {
         })
     }
 
-    fn select_all(&self, table: &str) -> OpenDbResult<QueryResult> {
+    fn select_all(&self, table: &str, predicate: Option<&Predicate>) -> OpenDbResult<QueryResult> {
         let table_state = self
             .projection
             .table(table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
         let column_names = table_state.column_names();
-        let rows = table_state
-            .rows
-            .values()
-            .map(|row| {
-                column_names
-                    .iter()
-                    .map(|column| {
-                        row.get(column).cloned().ok_or_else(|| {
-                            OpenDbError::Storage(format!(
-                                "missing projected column {column} on table {table}"
-                            ))
-                        })
-                    })
-                    .collect::<OpenDbResult<Vec<_>>>()
-            })
-            .collect::<OpenDbResult<Vec<_>>>()?;
+        let rows = match predicate {
+            Some(predicate) => {
+                let primary_key = table_state.primary_key_column().ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+                })?;
+                if predicate.column != primary_key.name {
+                    return Err(OpenDbError::Sql(format!(
+                        "SELECT WHERE only supports primary key equality on {}",
+                        primary_key.name
+                    )));
+                }
+                if !value_matches_type(&predicate.value, &primary_key.data_type) {
+                    return Err(OpenDbError::Sql(format!(
+                        "WHERE value for primary key column {} does not match {:?}",
+                        primary_key.name, primary_key.data_type
+                    )));
+                }
+                let row_key = value_to_key(&predicate.value);
+                match table_state.rows.get(&row_key) {
+                    Some(row) if row.get(&primary_key.name) == Some(&predicate.value) => {
+                        vec![project_row(table, &column_names, row)?]
+                    }
+                    Some(_) | None => Vec::new(),
+                }
+            }
+            None => table_state
+                .rows
+                .values()
+                .map(|row| project_row(table, &column_names, row))
+                .collect::<OpenDbResult<Vec<_>>>()?,
+        };
         Ok(QueryResult::Rows {
             columns: column_names,
             rows,
         })
     }
+}
+
+fn project_row(
+    table: &str,
+    column_names: &[String],
+    row: &std::collections::BTreeMap<String, Value>,
+) -> OpenDbResult<Vec<Value>> {
+    column_names
+        .iter()
+        .map(|column| {
+            row.get(column).cloned().ok_or_else(|| {
+                OpenDbError::Storage(format!(
+                    "missing projected column {column} on table {table}"
+                ))
+            })
+        })
+        .collect::<OpenDbResult<Vec<_>>>()
 }
 
 fn value_to_key(value: &Value) -> String {
@@ -197,6 +231,81 @@ mod tests {
             }
         );
         assert_eq!(engine.commits().len(), 2);
+    }
+
+    #[test]
+    fn select_where_primary_key_returns_matching_row_only() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
+            .expect("insert 1");
+        engine
+            .execute(parse("INSERT INTO accounts VALUES (2, 'Grace')").expect("parse"))
+            .expect("insert 2");
+
+        assert_eq!(
+            engine
+                .execute(parse("SELECT * FROM accounts WHERE id = 2").expect("parse"))
+                .expect("select"),
+            QueryResult::Rows {
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                rows: vec![vec![Value::Int64(2), Value::Text("Grace".to_owned())]],
+            }
+        );
+        assert_eq!(
+            engine
+                .execute(parse("SELECT * FROM accounts WHERE id = 3").expect("parse"))
+                .expect("select missing"),
+            QueryResult::Rows {
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn select_where_rejects_non_primary_key_predicates() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
+            .expect("insert");
+
+        let result =
+            engine.execute(parse("SELECT * FROM accounts WHERE name = 'Ada'").expect("parse"));
+
+        assert!(matches!(result, Err(OpenDbError::Sql(_))));
+    }
+
+    #[test]
+    fn select_where_text_primary_key_supports_equals_inside_literal() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE sessions (token TEXT PRIMARY KEY, name TEXT)").expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO sessions VALUES ('a=b', 'Ada')").expect("parse"))
+            .expect("insert");
+
+        assert_eq!(
+            engine
+                .execute(parse("SELECT * FROM sessions WHERE token = 'a=b'").expect("parse"))
+                .expect("select"),
+            QueryResult::Rows {
+                columns: vec!["token".to_owned(), "name".to_owned()],
+                rows: vec![vec![
+                    Value::Text("a=b".to_owned()),
+                    Value::Text("Ada".to_owned())
+                ]],
+            }
+        );
     }
 
     #[test]

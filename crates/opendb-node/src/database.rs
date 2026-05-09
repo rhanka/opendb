@@ -197,6 +197,7 @@ mod tests {
         let result = database
             .execute(Statement::SelectAll {
                 table: "accounts".to_string(),
+                predicate: None,
             })
             .await;
 
