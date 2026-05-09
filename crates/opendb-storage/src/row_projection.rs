@@ -151,7 +151,7 @@ impl RowProjection {
                     }
                     table_state.rows.insert(key.clone(), row);
                 }
-                Mutation::PutRangeDescriptor { .. } => {}
+                Mutation::PutRangeDescriptor { .. } | Mutation::PutArchiveObjectPointer { .. } => {}
             }
         }
         Ok(())

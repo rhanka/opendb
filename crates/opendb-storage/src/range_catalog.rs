@@ -33,7 +33,9 @@ impl RangeCatalog {
                     validate_descriptor_shape(descriptor)?;
                     candidate.insert(descriptor.range_id, descriptor.clone());
                 }
-                Mutation::CreateTable { .. } | Mutation::InsertRow { .. } => {}
+                Mutation::CreateTable { .. }
+                | Mutation::InsertRow { .. }
+                | Mutation::PutArchiveObjectPointer { .. } => {}
             }
         }
         for mutation in &record.mutations {

@@ -1,3 +1,4 @@
+pub mod archive_manifest;
 pub mod commit_stream;
 pub mod range_catalog;
 pub mod row_projection;

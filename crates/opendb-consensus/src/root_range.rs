@@ -1,8 +1,8 @@
 use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
 use opendb_storage::{
-    commit_stream::CommitRecord, range_catalog::RangeCatalog, row_projection::RowProjection,
-    wal::Wal,
+    archive_manifest::ArchiveManifest, commit_stream::CommitRecord, range_catalog::RangeCatalog,
+    row_projection::RowProjection, wal::Wal,
 };
 use openraft::BasicNode;
 use std::collections::BTreeMap;
@@ -74,6 +74,7 @@ pub struct RootRange {
     wal: Wal,
     proposal_path: RootRangeProposalPath,
     semantic_append_lock: Arc<Mutex<()>>,
+    openraft_submit_lock: Arc<Mutex<()>>,
 }
 
 impl RootRange {
@@ -87,6 +88,7 @@ impl RootRange {
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::Local(authority),
             semantic_append_lock: Arc::new(Mutex::new(())),
+            openraft_submit_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -115,6 +117,7 @@ impl RootRange {
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::OpenRaft(Arc::clone(&raft)),
             semantic_append_lock: Arc::new(Mutex::new(())),
+            openraft_submit_lock: Arc::new(Mutex::new(())),
         };
 
         Ok((root_range, RootRangePeerServer { raft }))
@@ -168,6 +171,7 @@ impl RootRange {
         self.validate_apply_record(&command.record)?;
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(raft) => {
+                let _guard = self.openraft_submit_lock.lock().await;
                 self.validate_semantic_append(&command.record).await?;
                 let response = raft.submit(command).await?;
                 if response == RootRangeResponse::Applied {
@@ -208,6 +212,11 @@ impl RootRange {
                 "root range WAL failed range catalog replay validation: {error}"
             ))
         })?;
+        ArchiveManifest::rebuild(&records).map_err(|error| {
+            OpenDbError::Storage(format!(
+                "root range WAL failed archive manifest replay validation: {error}"
+            ))
+        })?;
         Ok(records)
     }
 
@@ -233,6 +242,7 @@ impl RootRange {
         records.push(record.clone());
         RowProjection::rebuild(&records)?;
         RangeCatalog::rebuild(&records)?;
+        ArchiveManifest::rebuild(&records)?;
         Ok(())
     }
 
@@ -317,6 +327,7 @@ impl RootRangePeerServer {
 mod tests {
     use super::*;
     use opendb_common::{LogicalTimestamp, OpenDbError, TransactionId};
+    use opendb_storage::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
     use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Mutation};
     use opendb_storage::range_catalog::RangeDescriptor;
     use opendb_storage::wal::Wal;
@@ -381,6 +392,33 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay range catalog metadata"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn root_range_replays_archive_object_pointer_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let record = CommitRecord::new(
+            TransactionId(9),
+            LogicalTimestamp(13),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: archive_object_pointer(),
+            }],
+        );
+
+        let root_range = RootRange::new(temp_dir.path());
+        root_range
+            .apply_committed(&record)
+            .await
+            .expect("append archive object pointer record");
+
+        let restarted_root_range = RootRange::new(temp_dir.path());
+        assert_eq!(
+            restarted_root_range
+                .replay()
+                .await
+                .expect("replay archive manifest metadata"),
             vec![record]
         );
     }
@@ -474,6 +512,38 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay after rejected range descriptor"),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_rejects_invalid_archive_pointer_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: ArchiveObjectPointer {
+                    backend: ArchiveBackendKind::S3Compatible,
+                    bucket: "opendb-archives".to_string(),
+                    key: "root-range/00000004.wal".to_string(),
+                    content_sha256: "not-a-sha".to_string(),
+                },
+            }],
+        );
+
+        let result = root_range.apply_committed(&record).await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::InvalidInput(message)) if message.contains("content_sha256")
+        ));
+        assert_eq!(
+            root_range
+                .replay()
+                .await
+                .expect("replay after rejected archive pointer"),
             Vec::new()
         );
     }
@@ -836,6 +906,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raft_backed_concurrent_submit_serializes_validation_before_proposal() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let (root_range, peer_server) = RootRange::new_raft_backed(
+            temp_dir.path(),
+            0,
+            vec![RootRangePeer {
+                node_id: 0,
+                addr: "127.0.0.1:0".to_string(),
+            }],
+        )
+        .await
+        .expect("create raft-backed root range");
+        peer_server
+            .initialize_cluster()
+            .await
+            .expect("initialize single-node root range raft");
+        peer_server
+            .wait_for_leader(0, Duration::from_secs(3))
+            .await
+            .expect("single-node root range leader");
+
+        let first = CommitRecord::new(
+            TransactionId(18),
+            LogicalTimestamp(22),
+            vec![Mutation::CreateTable {
+                table: "serialized_events".to_string(),
+                columns: id_columns(),
+            }],
+        );
+        let second = CommitRecord::new(
+            TransactionId(19),
+            LogicalTimestamp(23),
+            vec![Mutation::CreateTable {
+                table: "serialized_events".to_string(),
+                columns: id_columns(),
+            }],
+        );
+        let left = root_range.clone();
+        let right = root_range.clone();
+
+        let (left_result, right_result) = tokio::join!(
+            left.submit(RootRangeCommand {
+                record: first.clone(),
+            }),
+            right.submit(RootRangeCommand {
+                record: second.clone(),
+            })
+        );
+
+        let results = [&left_result, &right_result];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one duplicate table create should commit through OpenRaft"
+        );
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                Err(OpenDbError::InvalidInput(message)) if message.contains("table already exists")
+            )),
+            "one concurrent duplicate table create should be rejected before proposal"
+        );
+        let records = root_range
+            .replay()
+            .await
+            .expect("replay after concurrent raft submit");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records == vec![first] || records == vec![second],
+            "unexpected committed record: {records:?}"
+        );
+
+        peer_server
+            .shutdown()
+            .await
+            .expect("shutdown raft-backed root range");
+    }
+
+    #[tokio::test]
     async fn raft_backed_root_range_recovers_raft_state_after_restart() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let peer = RootRangePeer {
@@ -1020,6 +1169,16 @@ mod tests {
             key_start: None,
             key_end: None,
             replica_node_ids: vec![0, 1, 2],
+        }
+    }
+
+    fn archive_object_pointer() -> ArchiveObjectPointer {
+        ArchiveObjectPointer {
+            backend: ArchiveBackendKind::S3Compatible,
+            bucket: "opendb-archives".to_string(),
+            key: "root-range/00000004.wal".to_string(),
+            content_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
         }
     }
 

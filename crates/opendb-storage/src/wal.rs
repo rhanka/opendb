@@ -1,8 +1,9 @@
 use crate::commit_stream::CommitRecord;
 use opendb_common::{OpenDbError, OpenDbResult};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -20,10 +21,9 @@ pub struct Wal {
 
 impl Wal {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            append_lock: Arc::new(Mutex::new(())),
-        }
+        let path = path.into();
+        let append_lock = append_lock_for_path(&path);
+        Self { path, append_lock }
     }
 
     pub async fn append(&self, record: &CommitRecord) -> OpenDbResult<()> {
@@ -78,6 +78,20 @@ impl Wal {
 
         Ok(decode_records(&self.path, &bytes)?.records)
     }
+}
+
+static WAL_APPEND_LOCKS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn append_lock_for_path(path: &PathBuf) -> Arc<Mutex<()>> {
+    let locks = WAL_APPEND_LOCKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let mut locks = locks.lock().expect("wal append lock registry poisoned");
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.clone(), Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Debug)]
@@ -294,6 +308,7 @@ fn storage_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
     use crate::commit_stream::{
         ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
     };
@@ -371,6 +386,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wal_appends_and_reads_archive_object_pointer_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(4),
+            LogicalTimestamp(13),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: ArchiveObjectPointer {
+                    backend: ArchiveBackendKind::AzureBlobCompatible,
+                    bucket: "opendb-archives".to_owned(),
+                    key: "root-range/00000003.wal".to_owned(),
+                    content_sha256:
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_owned(),
+                },
+            }],
+        );
+
+        wal.append(&record)
+            .await
+            .expect("append archive object pointer record");
+
+        assert_eq!(
+            wal.read_all()
+                .await
+                .expect("read archive object pointer record"),
+            vec![record]
+        );
+    }
+
     #[test]
     fn wal_frame_has_stable_shape_for_known_record() {
         let record = insert_record(1, 10, "1", "Ada");
@@ -394,6 +440,36 @@ mod tests {
         );
         assert_eq!(
             decode_frame(std::path::Path::new("golden.wal"), payload, 0).expect("decode payload"),
+            record
+        );
+    }
+
+    #[test]
+    fn wal_frame_has_stable_shape_for_archive_pointer_record() {
+        let record = CommitRecord::new(
+            TransactionId(4),
+            LogicalTimestamp(13),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: ArchiveObjectPointer {
+                    backend: ArchiveBackendKind::S3Compatible,
+                    bucket: "opendb-archives".to_owned(),
+                    key: "root-range/00000003.wal".to_owned(),
+                    content_sha256:
+                        "1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_owned(),
+                },
+            }],
+        );
+        let frame = encode_frame(&record).expect("encode frame");
+        let payload = &frame[FRAME_HEADER_LEN..];
+
+        assert_eq!(
+            std::str::from_utf8(payload).expect("utf8 payload"),
+            r#"{"version":2,"tx_id":4,"range_id":1,"ts":13,"actor":"system","mutations":[{"PutArchiveObjectPointer":{"pointer":{"backend":"s3_compatible","bucket":"opendb-archives","key":"root-range/00000003.wal","content_sha256":"1111111111111111111111111111111111111111111111111111111111111111"}}}]}"#
+        );
+        assert_eq!(
+            decode_frame(std::path::Path::new("archive-pointer.wal"), payload, 0)
+                .expect("decode payload"),
             record
         );
     }
@@ -586,6 +662,35 @@ mod tests {
             .expect("second append");
 
         let records = wal.read_all().await.expect("read records");
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&first));
+        assert!(records.contains(&second));
+    }
+
+    #[tokio::test]
+    async fn independent_wal_instances_serialize_appends_to_same_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let left = Wal::new(&wal_path);
+        let right = Wal::new(&wal_path);
+        let reader = Wal::new(&wal_path);
+        let first = insert_record(1, 10, "1", "Ada");
+        let second = insert_record(2, 11, "2", "Grace");
+        let first_for_task = first.clone();
+        let second_for_task = second.clone();
+
+        let first_append = tokio::spawn(async move { left.append(&first_for_task).await });
+        let second_append = tokio::spawn(async move { right.append(&second_for_task).await });
+        first_append
+            .await
+            .expect("first task")
+            .expect("first append");
+        second_append
+            .await
+            .expect("second task")
+            .expect("second append");
+
+        let records = reader.read_all().await.expect("read records");
         assert_eq!(records.len(), 2);
         assert!(records.contains(&first));
         assert!(records.contains(&second));

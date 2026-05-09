@@ -1,3 +1,4 @@
+use crate::archive_manifest::ArchiveObjectPointer;
 use crate::range_catalog::RangeDescriptor;
 use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,9 @@ pub enum Mutation {
     PutRangeDescriptor {
         descriptor: RangeDescriptor,
     },
+    PutArchiveObjectPointer {
+        pointer: ArchiveObjectPointer,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,6 +93,7 @@ impl CommitRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     #[test]
@@ -140,6 +145,36 @@ mod tests {
         assert_eq!(
             record.mutations,
             vec![Mutation::PutRangeDescriptor { descriptor }]
+        );
+    }
+
+    #[test]
+    fn commit_record_serializes_archive_object_pointer_metadata_mutation() {
+        let pointer = ArchiveObjectPointer {
+            backend: ArchiveBackendKind::GoogleCloudStorage,
+            bucket: "opendb-archives".to_owned(),
+            key: "root-range/00000002.wal".to_owned(),
+            content_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+        };
+        let record = CommitRecord::new(
+            TransactionId(49),
+            LogicalTimestamp(14),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: pointer.clone(),
+            }],
+        );
+        let encoded =
+            serde_json::to_string(&record).expect("serialize archive object pointer record");
+        let decoded: CommitRecord =
+            serde_json::from_str(&encoded).expect("deserialize archive object pointer record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(CommitRecord::VERSION, 2);
+        assert_eq!(
+            record.mutations,
+            vec![Mutation::PutArchiveObjectPointer { pointer }]
         );
     }
 }
