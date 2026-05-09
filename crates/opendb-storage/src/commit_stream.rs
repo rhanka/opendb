@@ -1,3 +1,4 @@
+use crate::range_catalog::RangeDescriptor;
 use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,9 @@ pub enum Mutation {
         key: String,
         values: Vec<ColumnValue>,
     },
+    PutRangeDescriptor {
+        descriptor: RangeDescriptor,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,5 +112,34 @@ mod tests {
         assert_eq!(record.ts, LogicalTimestamp(7));
         assert_eq!(record.actor, "system");
         assert_eq!(record.mutations.len(), 1);
+    }
+
+    #[test]
+    fn commit_record_serializes_range_descriptor_metadata_mutation() {
+        let descriptor = RangeDescriptor {
+            range_id: RangeId::ROOT,
+            parent_range_id: None,
+            key_start: None,
+            key_end: None,
+            replica_node_ids: vec![0, 1, 2],
+        };
+        let record = CommitRecord::new(
+            TransactionId(43),
+            LogicalTimestamp(8),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: descriptor.clone(),
+            }],
+        );
+        let encoded = serde_json::to_string(&record).expect("serialize range descriptor record");
+        let decoded: CommitRecord =
+            serde_json::from_str(&encoded).expect("deserialize range descriptor record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(CommitRecord::VERSION, 2);
+        assert_eq!(
+            record.mutations,
+            vec![Mutation::PutRangeDescriptor { descriptor }]
+        );
     }
 }

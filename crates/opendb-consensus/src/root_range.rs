@@ -1,12 +1,16 @@
 use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
-use opendb_storage::{commit_stream::CommitRecord, row_projection::RowProjection, wal::Wal};
+use opendb_storage::{
+    commit_stream::CommitRecord, range_catalog::RangeCatalog, row_projection::RowProjection,
+    wal::Wal,
+};
 use openraft::BasicNode;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // Milestone 1 keeps the public consensus boundary here. OpenRaft integration
 // must stay behind RootRange so SQL, storage, pgwire, and Kubernetes code do
@@ -69,6 +73,7 @@ pub struct RootRange {
     range_id: RangeId,
     wal: Wal,
     proposal_path: RootRangeProposalPath,
+    semantic_append_lock: Arc<Mutex<()>>,
 }
 
 impl RootRange {
@@ -81,6 +86,7 @@ impl RootRange {
             range_id: RangeId::ROOT,
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::Local(authority),
+            semantic_append_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -108,6 +114,7 @@ impl RootRange {
             range_id: RangeId::ROOT,
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::OpenRaft(Arc::clone(&raft)),
+            semantic_append_lock: Arc::new(Mutex::new(())),
         };
 
         Ok((root_range, RootRangePeerServer { raft }))
@@ -139,6 +146,7 @@ impl RootRange {
     /// a proposal path; use `submit` for the reserved OpenRaft-facing API.
     pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
         self.validate_apply_record(record)?;
+        let _guard = self.semantic_append_lock.lock().await;
         self.validate_semantic_append(record).await?;
         self.wal.append(record).await
     }
@@ -158,9 +166,9 @@ impl RootRange {
     /// milestones; followers reject before touching the local WAL.
     pub async fn submit(&self, command: RootRangeCommand) -> OpenDbResult<()> {
         self.validate_apply_record(&command.record)?;
-        self.validate_semantic_append(&command.record).await?;
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(raft) => {
+                self.validate_semantic_append(&command.record).await?;
                 let response = raft.submit(command).await?;
                 if response == RootRangeResponse::Applied {
                     Ok(())
@@ -195,6 +203,11 @@ impl RootRange {
                 "root range WAL failed semantic replay validation: {error}"
             ))
         })?;
+        RangeCatalog::rebuild(&records).map_err(|error| {
+            OpenDbError::Storage(format!(
+                "root range WAL failed range catalog replay validation: {error}"
+            ))
+        })?;
         Ok(records)
     }
 
@@ -219,10 +232,18 @@ impl RootRange {
         let mut records = self.replay().await?;
         records.push(record.clone());
         RowProjection::rebuild(&records)?;
+        RangeCatalog::rebuild(&records)?;
         Ok(())
     }
 
     fn validate_replayed_record(&self, index: usize, record: &CommitRecord) -> OpenDbResult<()> {
+        if record.version != CommitRecord::VERSION {
+            return Err(OpenDbError::Storage(format!(
+                "root range WAL record {index} has commit version {}, expected {}",
+                record.version,
+                CommitRecord::VERSION
+            )));
+        }
         if record.range_id != self.range_id {
             return Err(OpenDbError::Storage(format!(
                 "root range WAL record {index} has range_id {:?}, expected {:?}",
@@ -297,6 +318,7 @@ mod tests {
     use super::*;
     use opendb_common::{LogicalTimestamp, OpenDbError, TransactionId};
     use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Mutation};
+    use opendb_storage::range_catalog::RangeDescriptor;
     use opendb_storage::wal::Wal;
     use std::time::Duration;
 
@@ -332,6 +354,33 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay committed records"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn root_range_replays_range_descriptor_metadata_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let record = CommitRecord::new(
+            TransactionId(8),
+            LogicalTimestamp(12),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: root_range_descriptor(),
+            }],
+        );
+
+        let root_range = RootRange::new(temp_dir.path());
+        root_range
+            .apply_committed(&record)
+            .await
+            .expect("append range descriptor record");
+
+        let restarted_root_range = RootRange::new(temp_dir.path());
+        assert_eq!(
+            restarted_root_range
+                .replay()
+                .await
+                .expect("replay range catalog metadata"),
             vec![record]
         );
     }
@@ -393,6 +442,89 @@ mod tests {
                 .await
                 .expect("replay after rejected append"),
             Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_rejects_range_descriptor_with_missing_parent_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let record = CommitRecord::new(
+            TransactionId(9),
+            LogicalTimestamp(13),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: RangeDescriptor {
+                    range_id: RangeId(2),
+                    parent_range_id: Some(RangeId(404)),
+                    key_start: Some("accounts/".to_string()),
+                    key_end: Some("orders/".to_string()),
+                    replica_node_ids: vec![0, 1, 2],
+                },
+            }],
+        );
+
+        let result = root_range.apply_committed(&record).await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::InvalidInput(message)) if message.contains("missing parent range")
+        ));
+        assert_eq!(
+            root_range
+                .replay()
+                .await
+                .expect("replay after rejected range descriptor"),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_apply_committed_serializes_validation_with_wal_append() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let first = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::CreateTable {
+                table: "events".to_string(),
+                columns: id_columns(),
+            }],
+        );
+        let second = CommitRecord::new(
+            TransactionId(11),
+            LogicalTimestamp(15),
+            vec![Mutation::CreateTable {
+                table: "events".to_string(),
+                columns: id_columns(),
+            }],
+        );
+        let left = root_range.clone();
+        let right = root_range.clone();
+
+        let (left_result, right_result) =
+            tokio::join!(left.apply_committed(&first), right.apply_committed(&second));
+
+        let results = [&left_result, &right_result];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one duplicate table create should commit"
+        );
+        assert!(
+            results.iter().any(|result| matches!(
+                result,
+                Err(OpenDbError::InvalidInput(message)) if message.contains("table already exists")
+            )),
+            "one concurrent duplicate table create should be rejected"
+        );
+        let records = root_range
+            .replay()
+            .await
+            .expect("replay after concurrent apply");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records == vec![first] || records == vec![second],
+            "unexpected committed record: {records:?}"
         );
     }
 
@@ -879,6 +1011,16 @@ mod tests {
             ColumnDefinition::primary_key("id", ColumnType::Int64),
             ColumnDefinition::new("name", ColumnType::Text),
         ]
+    }
+
+    fn root_range_descriptor() -> RangeDescriptor {
+        RangeDescriptor {
+            range_id: RangeId::ROOT,
+            parent_range_id: None,
+            key_start: None,
+            key_end: None,
+            replica_node_ids: vec![0, 1, 2],
+        }
     }
 
     async fn wait_for_replayed_records(root_range: &RootRange, expected: Vec<CommitRecord>) {

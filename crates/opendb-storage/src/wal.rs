@@ -297,7 +297,8 @@ mod tests {
     use crate::commit_stream::{
         ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
     };
-    use opendb_common::{LogicalTimestamp, TransactionId};
+    use crate::range_catalog::RangeDescriptor;
+    use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     #[tokio::test]
     async fn wal_appends_and_reads_records_in_order() {
@@ -339,6 +340,34 @@ mod tests {
         assert_eq!(
             wal.read_all().await.expect("read appended records"),
             vec![first, second]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_appends_and_reads_range_descriptor_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(3),
+            LogicalTimestamp(12),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: RangeDescriptor {
+                    range_id: RangeId::ROOT,
+                    parent_range_id: None,
+                    key_start: None,
+                    key_end: None,
+                    replica_node_ids: vec![0, 1, 2],
+                },
+            }],
+        );
+
+        wal.append(&record)
+            .await
+            .expect("append range descriptor record");
+
+        assert_eq!(
+            wal.read_all().await.expect("read range descriptor record"),
+            vec![record]
         );
     }
 
