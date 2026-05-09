@@ -131,6 +131,23 @@ async function exec(sql: string): Promise<Buffer[]> {
   }
 }
 
+async function execExpectError(sql: string): Promise<string> {
+  client.write(query(sql));
+  let errorPayload: string | undefined;
+  for (;;) {
+    const message = await readMessage();
+    if (message.tag === "E") {
+      errorPayload = message.payload.toString("utf8");
+    }
+    if (message.tag === "Z") {
+      if (errorPayload === undefined) {
+        throw new Error(`expected pgwire error for ${sql}`);
+      }
+      return errorPayload;
+    }
+  }
+}
+
 function rowText(row: Buffer): string[] {
   const columns = row.readUInt16BE(0);
   const values: string[] = [];
@@ -149,12 +166,16 @@ await connect();
 try {
   client.write(startup());
   await waitForReady();
-  await exec(`CREATE TABLE ${tableName} (id INT, name TEXT)`);
+  await exec(`CREATE TABLE ${tableName} (id INT PRIMARY KEY, name TEXT)`);
   await exec(`INSERT INTO ${tableName} VALUES (1, 'Ada')`);
   const rows = await exec(`SELECT * FROM ${tableName}`);
 
   if (!rows.some((row) => rowText(row).includes("Ada"))) {
     throw new Error("Ada row was not returned");
+  }
+  const duplicateError = await execExpectError(`INSERT INTO ${tableName} VALUES (1, 'Grace')`);
+  if (!duplicateError.includes("row already exists")) {
+    throw new Error(`duplicate primary key was not rejected as expected: ${duplicateError}`);
   }
 
   client.end();

@@ -35,11 +35,14 @@ impl Database {
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
-        self.ensure_leader_for_client_query().await?;
+        if statement.is_read() {
+            self.ensure_leader_for_client_query().await?;
+        }
 
         match self.engine.prepare(statement)? {
             PreparedQuery::Read(result) => Ok(result),
             PreparedQuery::Write { record, tag } => {
+                self.ensure_leader_for_client_query().await?;
                 self.root_range
                     .submit(RootRangeCommand {
                         record: record.clone(),
@@ -54,7 +57,7 @@ impl Database {
     async fn ensure_leader_for_client_query(&self) -> OpenDbResult<()> {
         match &self.peer_server {
             Some(peer_server) => peer_server.ensure_leader().await,
-            None => Ok(()),
+            None => self.root_range.ensure_client_query_leader().await,
         }
     }
 }
@@ -64,7 +67,10 @@ mod tests {
     use super::Database;
     use opendb_common::OpenDbError;
     use opendb_consensus::root_range::{RootRange, RootRangeAuthority};
-    use opendb_sql::{ast::QueryResult, parser::parse};
+    use opendb_sql::{
+        ast::{QueryResult, Statement},
+        parser::parse,
+    };
     use opendb_storage::commit_stream::Value;
 
     #[tokio::test]
@@ -76,7 +82,9 @@ mod tests {
 
         assert_eq!(
             database
-                .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+                .execute(
+                    parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse")
+                )
                 .await
                 .expect("create"),
             QueryResult::Command {
@@ -129,7 +137,7 @@ mod tests {
             .expect("open database");
 
         let result = database
-            .execute(parse("CREATE TABLE accounts (id INT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY)").expect("parse"))
             .await;
 
         assert!(matches!(
@@ -147,5 +155,57 @@ mod tests {
                 .exists(),
             "follower write must not create a local WAL"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_write_is_rejected_before_follower_leader_check() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new_with_authority(
+            temp_dir.path(),
+            RootRangeAuthority::follower(0, Some("opendb-0.opendb-peer:7000".to_string())),
+        );
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+
+        let result = database
+            .execute(parse("CREATE TABLE accounts (id INT)").expect("parse"))
+            .await;
+
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+        assert!(
+            !temp_dir
+                .path()
+                .join("root-range")
+                .join("commit.wal")
+                .exists(),
+            "invalid write must not create a local WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_read_checks_leadership_before_local_projection() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new_with_authority(
+            temp_dir.path(),
+            RootRangeAuthority::follower(0, Some("opendb-0.opendb-peer:7000".to_string())),
+        );
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+
+        let result = database
+            .execute(Statement::SelectAll {
+                table: "accounts".to_string(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::NotLeader {
+                leader_id: Some(0),
+                leader_addr: Some(addr),
+            }) if addr == "opendb-0.opendb-peer:7000"
+        ));
     }
 }

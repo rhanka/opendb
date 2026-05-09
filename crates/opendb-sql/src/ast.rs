@@ -1,10 +1,24 @@
-use opendb_storage::commit_stream::Value;
+use opendb_storage::commit_stream::{ColumnDefinition, Value};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    CreateTable { table: String, columns: Vec<String> },
-    Insert { table: String, values: Vec<Value> },
-    SelectAll { table: String },
+    CreateTable {
+        table: String,
+        columns: Vec<ColumnDefinition>,
+    },
+    Insert {
+        table: String,
+        values: Vec<Value>,
+    },
+    SelectAll {
+        table: String,
+    },
+}
+
+impl Statement {
+    pub fn is_read(&self) -> bool {
+        matches!(self, Self::SelectAll { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,6 +1,6 @@
 use crate::ast::{QueryResult, Statement};
 use opendb_common::{LogicalTimestamp, OpenDbError, OpenDbResult, TransactionId};
-use opendb_storage::commit_stream::{ColumnValue, CommitRecord, Mutation, Value};
+use opendb_storage::commit_stream::{ColumnType, ColumnValue, CommitRecord, Mutation, Value};
 use opendb_storage::row_projection::RowProjection;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,20 +45,31 @@ impl SqlEngine {
                         values.len()
                     )));
                 }
-                let row_key = match values.first() {
-                    Some(Value::Int64(value)) => value.to_string(),
-                    Some(Value::Text(value)) => value.clone(),
-                    None => {
-                        return Err(OpenDbError::Sql(
-                            "INSERT requires at least one value".to_owned(),
-                        ));
-                    }
-                };
+                let primary_key_index = table_state.primary_key_index().ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+                })?;
+                let primary_key_column =
+                    table_state.columns.get(primary_key_index).ok_or_else(|| {
+                        OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+                    })?;
+                let primary_key_value = values
+                    .get(primary_key_index)
+                    .ok_or_else(|| OpenDbError::Sql("INSERT requires a primary key".to_owned()))?;
+                if !value_matches_type(primary_key_value, &primary_key_column.data_type) {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "value for primary key column {} on table {} does not match {:?}",
+                        primary_key_column.name, table, primary_key_column.data_type
+                    )));
+                }
+                let row_key = value_to_key(primary_key_value);
                 let columns = table_state.columns.clone();
                 let column_values = columns
                     .into_iter()
                     .zip(values)
-                    .map(|(column, value)| ColumnValue { column, value })
+                    .map(|(column, value)| ColumnValue {
+                        column: column.name,
+                        value,
+                    })
                     .collect();
                 self.prepare_write(
                     vec![Mutation::InsertRow {
@@ -112,12 +123,12 @@ impl SqlEngine {
             .projection
             .table(table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        let column_names = table_state.column_names();
         let rows = table_state
             .rows
             .values()
             .map(|row| {
-                table_state
-                    .columns
+                column_names
                     .iter()
                     .map(|column| {
                         row.get(column).cloned().ok_or_else(|| {
@@ -130,10 +141,24 @@ impl SqlEngine {
             })
             .collect::<OpenDbResult<Vec<_>>>()?;
         Ok(QueryResult::Rows {
-            columns: table_state.columns.clone(),
+            columns: column_names,
             rows,
         })
     }
+}
+
+fn value_to_key(value: &Value) -> String {
+    match value {
+        Value::Int64(value) => value.to_string(),
+        Value::Text(value) => value.clone(),
+    }
+}
+
+fn value_matches_type(value: &Value, data_type: &ColumnType) -> bool {
+    matches!(
+        (value, data_type),
+        (Value::Int64(_), ColumnType::Int64) | (Value::Text(_), ColumnType::Text)
+    )
 }
 
 #[cfg(test)]
@@ -146,7 +171,9 @@ mod tests {
         let mut engine = SqlEngine::default();
         assert_eq!(
             engine
-                .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+                .execute(
+                    parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse")
+                )
                 .expect("create"),
             QueryResult::Command {
                 tag: "CREATE TABLE".to_owned()
@@ -176,7 +203,7 @@ mod tests {
     fn quoted_string_with_comma_executes() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
         engine
             .execute(parse("INSERT INTO accounts VALUES (1, 'Ada, Lovelace')").expect("parse"))
@@ -200,7 +227,7 @@ mod tests {
     fn failed_duplicate_key_insert_does_not_commit_or_consume_tx_id() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
         engine
             .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
@@ -225,7 +252,7 @@ mod tests {
     fn multi_row_select_order_is_deterministic() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
         engine
             .execute(parse("INSERT INTO accounts VALUES (2, 'Grace')").expect("parse"))
@@ -252,7 +279,7 @@ mod tests {
     fn prepared_invalid_write_does_not_mutate_or_consume_tx_id() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
         engine
             .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
@@ -286,7 +313,7 @@ mod tests {
     fn prepared_write_does_not_mutate_until_applied() {
         let mut engine = SqlEngine::default();
         let prepared_create = engine
-            .prepare(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .prepare(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("prepare create");
 
         assert_eq!(engine.commits().len(), 0);
@@ -317,7 +344,7 @@ mod tests {
     fn from_commits_rebuilds_rows_and_next_tx() {
         let mut source = SqlEngine::default();
         source
-            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
         source
             .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
@@ -341,5 +368,50 @@ mod tests {
         let last = rebuilt.commits().last().expect("last commit");
         assert_eq!(last.tx_id, TransactionId(3));
         assert_eq!(last.ts, LogicalTimestamp(3));
+    }
+
+    #[test]
+    fn create_table_requires_explicit_primary_key() {
+        let mut engine = SqlEngine::default();
+
+        let result =
+            engine.execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"));
+
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+        assert_eq!(engine.commits().len(), 0);
+    }
+
+    #[test]
+    fn primary_key_column_drives_row_identity_even_when_not_first() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (name TEXT, id INT PRIMARY KEY)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO accounts VALUES ('Ada', 1)").expect("parse"))
+            .expect("insert first");
+
+        let duplicate =
+            engine.execute(parse("INSERT INTO accounts VALUES ('Grace', 1)").expect("parse"));
+
+        assert!(matches!(duplicate, Err(OpenDbError::InvalidInput(_))));
+        assert_eq!(engine.commits().len(), 2);
+    }
+
+    #[test]
+    fn insert_values_must_match_declared_column_types() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+
+        let invalid_id =
+            engine.execute(parse("INSERT INTO accounts VALUES ('one', 'Ada')").expect("parse"));
+        let invalid_name =
+            engine.execute(parse("INSERT INTO accounts VALUES (1, 42)").expect("parse"));
+
+        assert!(matches!(invalid_id, Err(OpenDbError::InvalidInput(_))));
+        assert!(matches!(invalid_name, Err(OpenDbError::InvalidInput(_))));
+        assert_eq!(engine.commits().len(), 1);
     }
 }

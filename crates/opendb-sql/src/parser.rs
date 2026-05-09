@@ -1,6 +1,6 @@
 use crate::ast::Statement;
 use opendb_common::{OpenDbError, OpenDbResult};
-use opendb_storage::commit_stream::Value;
+use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Value};
 
 pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     let trimmed = sql.trim();
@@ -46,15 +46,59 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
     let table = rest[..open].trim().to_owned();
     let columns = rest[open + 1..close]
         .split(',')
-        .map(|part| part.split_whitespace().next().unwrap_or("").to_owned())
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
+        .map(parse_column_definition)
+        .collect::<OpenDbResult<Vec<_>>>()?;
     if table.is_empty() || columns.is_empty() {
         return Err(OpenDbError::Sql(
             "CREATE TABLE requires table and columns".to_owned(),
         ));
     }
     Ok(Statement::CreateTable { table, columns })
+}
+
+fn parse_column_definition(raw: &str) -> OpenDbResult<ColumnDefinition> {
+    let tokens = raw.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() != 2 && tokens.len() != 4 {
+        return Err(OpenDbError::Sql(format!(
+            "invalid column definition: {}",
+            raw.trim()
+        )));
+    }
+    let name = tokens[0];
+    if name.is_empty() {
+        return Err(OpenDbError::Sql("column name is required".to_owned()));
+    }
+    let data_type = parse_column_type(tokens[1])?;
+    let primary_key = if tokens.len() == 4 {
+        if tokens[2].eq_ignore_ascii_case("PRIMARY") && tokens[3].eq_ignore_ascii_case("KEY") {
+            true
+        } else {
+            return Err(OpenDbError::Sql(format!(
+                "unsupported column constraint on {name}"
+            )));
+        }
+    } else {
+        false
+    };
+
+    Ok(if primary_key {
+        ColumnDefinition::primary_key(name, data_type)
+    } else {
+        ColumnDefinition::new(name, data_type)
+    })
+}
+
+fn parse_column_type(raw: &str) -> OpenDbResult<ColumnType> {
+    if raw.eq_ignore_ascii_case("INT")
+        || raw.eq_ignore_ascii_case("INT64")
+        || raw.eq_ignore_ascii_case("BIGINT")
+    {
+        Ok(ColumnType::Int64)
+    } else if raw.eq_ignore_ascii_case("TEXT") {
+        Ok(ColumnType::Text)
+    } else {
+        Err(OpenDbError::Sql(format!("unsupported column type: {raw}")))
+    }
 }
 
 fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
@@ -157,7 +201,10 @@ mod tests {
             parse("CREATE TABLE accounts (id INT, name TEXT);").expect("create"),
             Statement::CreateTable {
                 table: "accounts".to_owned(),
-                columns: vec!["id".to_owned(), "name".to_owned()],
+                columns: vec![
+                    ColumnDefinition::new("id", ColumnType::Int64),
+                    ColumnDefinition::new("name", ColumnType::Text),
+                ],
             }
         );
         assert_eq!(
@@ -181,7 +228,10 @@ mod tests {
             parse("cReAtE tAbLe accounts (id INT, name TEXT)").expect("create"),
             Statement::CreateTable {
                 table: "accounts".to_owned(),
-                columns: vec!["id".to_owned(), "name".to_owned()],
+                columns: vec![
+                    ColumnDefinition::new("id", ColumnType::Int64),
+                    ColumnDefinition::new("name", ColumnType::Text),
+                ],
             }
         );
         assert_eq!(
@@ -254,6 +304,28 @@ mod tests {
     fn rejects_select_where_at_parse_time() {
         assert!(matches!(
             parse("SELECT * FROM accounts WHERE id = 1"),
+            Err(OpenDbError::Sql(_))
+        ));
+    }
+
+    #[test]
+    fn parses_primary_key_column_metadata() {
+        assert_eq!(
+            parse("CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT)").expect("create"),
+            Statement::CreateTable {
+                table: "accounts".to_owned(),
+                columns: vec![
+                    ColumnDefinition::primary_key("id", ColumnType::Int64),
+                    ColumnDefinition::new("name", ColumnType::Text),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_column_type() {
+        assert!(matches!(
+            parse("CREATE TABLE accounts (id UUID PRIMARY KEY)"),
             Err(OpenDbError::Sql(_))
         ));
     }

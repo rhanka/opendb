@@ -19,7 +19,7 @@ const readinessTimeoutMs = 10_000;
 const childExitTimeoutMs = 2_000;
 const maxCapturedOutputLength = 64 * 1024;
 
-test("opendb-node accepts create, insert, and select over pgwire", async () => {
+test("opendb-node accepts typed primary-key schema over pgwire", async () => {
   const output = await runSqlSmokeParity();
 
   expect(output).toContain("pgwire smoke passed");

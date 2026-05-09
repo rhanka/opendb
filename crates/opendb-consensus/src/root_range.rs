@@ -1,6 +1,6 @@
 use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
-use opendb_storage::{commit_stream::CommitRecord, wal::Wal};
+use opendb_storage::{commit_stream::CommitRecord, row_projection::RowProjection, wal::Wal};
 use openraft::BasicNode;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -117,12 +117,29 @@ impl RootRange {
         self.range_id
     }
 
+    pub async fn ensure_client_query_leader(&self) -> OpenDbResult<()> {
+        match &self.proposal_path {
+            RootRangeProposalPath::OpenRaft(_) => Ok(()),
+            RootRangeProposalPath::Local(authority) => match authority {
+                RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => Ok(()),
+                RootRangeAuthority::Follower {
+                    leader_id,
+                    leader_addr,
+                } => Err(OpenDbError::NotLeader {
+                    leader_id: *leader_id,
+                    leader_addr: leader_addr.clone(),
+                }),
+            },
+        }
+    }
+
     /// Applies a root-range record that has already been committed.
     ///
     /// Milestone 1 only wires this apply-side path. Callers must not use it as
     /// a proposal path; use `submit` for the reserved OpenRaft-facing API.
     pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
         self.validate_apply_record(record)?;
+        self.validate_semantic_append(record).await?;
         self.wal.append(record).await
     }
 
@@ -141,6 +158,7 @@ impl RootRange {
     /// milestones; followers reject before touching the local WAL.
     pub async fn submit(&self, command: RootRangeCommand) -> OpenDbResult<()> {
         self.validate_apply_record(&command.record)?;
+        self.validate_semantic_append(&command.record).await?;
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(raft) => {
                 let response = raft.submit(command).await?;
@@ -172,16 +190,35 @@ impl RootRange {
         for (index, record) in records.iter().enumerate() {
             self.validate_replayed_record(index, record)?;
         }
+        RowProjection::rebuild(&records).map_err(|error| {
+            OpenDbError::Storage(format!(
+                "root range WAL failed semantic replay validation: {error}"
+            ))
+        })?;
         Ok(records)
     }
 
     fn validate_apply_record(&self, record: &CommitRecord) -> OpenDbResult<()> {
+        if record.version != CommitRecord::VERSION {
+            return Err(OpenDbError::InvalidInput(format!(
+                "root range requires commit record version {}, got {}",
+                CommitRecord::VERSION,
+                record.version
+            )));
+        }
         if record.range_id != self.range_id {
             return Err(OpenDbError::InvalidInput(format!(
                 "root range requires record range_id {:?}, got {:?}",
                 self.range_id, record.range_id
             )));
         }
+        Ok(())
+    }
+
+    async fn validate_semantic_append(&self, record: &CommitRecord) -> OpenDbResult<()> {
+        let mut records = self.replay().await?;
+        records.push(record.clone());
+        RowProjection::rebuild(&records)?;
         Ok(())
     }
 
@@ -259,7 +296,7 @@ impl RootRangePeerServer {
 mod tests {
     use super::*;
     use opendb_common::{LogicalTimestamp, OpenDbError, TransactionId};
-    use opendb_storage::commit_stream::Mutation;
+    use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Mutation};
     use opendb_storage::wal::Wal;
     use std::time::Duration;
 
@@ -278,7 +315,7 @@ mod tests {
             LogicalTimestamp(11),
             vec![Mutation::CreateTable {
                 table: "accounts".to_string(),
-                columns: vec!["id".to_string(), "name".to_string()],
+                columns: account_columns(),
             }],
         );
 
@@ -308,7 +345,7 @@ mod tests {
             LogicalTimestamp(12),
             vec![Mutation::CreateTable {
                 table: "orders".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         forged_record.range_id = RangeId(98);
@@ -338,7 +375,7 @@ mod tests {
             LogicalTimestamp(12),
             vec![Mutation::CreateTable {
                 table: "orders".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         forged_record.range_id = RangeId(99);
@@ -367,7 +404,7 @@ mod tests {
             LogicalTimestamp(13),
             vec![Mutation::CreateTable {
                 table: "payments".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         forged_record.range_id = RangeId(100);
@@ -397,7 +434,7 @@ mod tests {
             LogicalTimestamp(14),
             vec![Mutation::CreateTable {
                 table: "ledger".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         forged_record.range_id = RangeId(101);
@@ -416,6 +453,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_rejects_invalid_schema_before_wal_append() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let invalid_record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::CreateTable {
+                table: "ledger".to_string(),
+                columns: vec![ColumnDefinition::new("id", ColumnType::Int64)],
+            }],
+        );
+
+        let result = root_range
+            .submit(RootRangeCommand {
+                record: invalid_record,
+            })
+            .await;
+
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+        assert!(
+            !temp_dir
+                .path()
+                .join("root-range")
+                .join("commit.wal")
+                .exists(),
+            "invalid root-range command must not create a WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_unsupported_commit_version_before_wal_append() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let mut invalid_record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::CreateTable {
+                table: "ledger".to_string(),
+                columns: id_columns(),
+            }],
+        );
+        invalid_record.version = CommitRecord::VERSION + 1;
+
+        let result = root_range
+            .submit(RootRangeCommand {
+                record: invalid_record,
+            })
+            .await;
+
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+        assert!(
+            !temp_dir
+                .path()
+                .join("root-range")
+                .join("commit.wal")
+                .exists(),
+            "unsupported commit version must not create a WAL"
+        );
+    }
+
+    #[tokio::test]
     async fn leader_submit_persists_root_commands_through_consensus_boundary() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range =
@@ -425,7 +523,7 @@ mod tests {
             LogicalTimestamp(15),
             vec![Mutation::CreateTable {
                 table: "audit_log".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
 
@@ -454,7 +552,7 @@ mod tests {
             LogicalTimestamp(16),
             vec![Mutation::CreateTable {
                 table: "events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
 
@@ -483,7 +581,7 @@ mod tests {
             LogicalTimestamp(17),
             vec![Mutation::CreateTable {
                 table: "events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
 
@@ -527,7 +625,7 @@ mod tests {
             LogicalTimestamp(18),
             vec![Mutation::CreateTable {
                 table: "raft_events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
 
@@ -580,7 +678,7 @@ mod tests {
             LogicalTimestamp(19),
             vec![Mutation::CreateTable {
                 table: "facade_events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
 
@@ -630,7 +728,7 @@ mod tests {
             LogicalTimestamp(20),
             vec![Mutation::CreateTable {
                 table: "restart_events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         root_range
@@ -659,7 +757,10 @@ mod tests {
             vec![Mutation::InsertRow {
                 table: "restart_events".to_string(),
                 key: "1".to_string(),
-                values: Vec::new(),
+                values: vec![opendb_storage::commit_stream::ColumnValue {
+                    column: "id".to_string(),
+                    value: opendb_storage::commit_stream::Value::Int64(1),
+                }],
             }],
         );
         restarted_root_range
@@ -732,7 +833,7 @@ mod tests {
             LogicalTimestamp(22),
             vec![Mutation::CreateTable {
                 table: "replicated_events".to_string(),
-                columns: vec!["id".to_string()],
+                columns: id_columns(),
             }],
         );
         let writer = if leader_id == 0 {
@@ -767,6 +868,17 @@ mod tests {
         let addr = listener.local_addr().expect("read reserved loopback addr");
         drop(listener);
         addr
+    }
+
+    fn id_columns() -> Vec<ColumnDefinition> {
+        vec![ColumnDefinition::primary_key("id", ColumnType::Int64)]
+    }
+
+    fn account_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition::primary_key("id", ColumnType::Int64),
+            ColumnDefinition::new("name", ColumnType::Text),
+        ]
     }
 
     async fn wait_for_replayed_records(root_range: &RootRange, expected: Vec<CommitRecord>) {

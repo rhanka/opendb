@@ -1,11 +1,29 @@
-use crate::commit_stream::{CommitRecord, Mutation, Value};
+use crate::commit_stream::{ColumnDefinition, ColumnType, CommitRecord, Mutation, Value};
 use opendb_common::{OpenDbError, OpenDbResult};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Table {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnDefinition>,
     pub rows: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+impl Table {
+    pub fn column_names(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    pub fn primary_key_index(&self) -> Option<usize> {
+        self.columns.iter().position(|column| column.primary_key)
+    }
+
+    pub fn primary_key_column(&self) -> Option<&ColumnDefinition> {
+        self.primary_key_index()
+            .and_then(|index| self.columns.get(index))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,13 +48,33 @@ impl RowProjection {
                             "table already exists: {table}"
                         )));
                     }
+                    if columns.is_empty() {
+                        return Err(OpenDbError::InvalidInput(format!(
+                            "table {table} requires at least one column"
+                        )));
+                    }
                     let mut seen_columns = BTreeMap::new();
+                    let mut primary_key_count = 0_usize;
                     for column in columns {
-                        if seen_columns.insert(column, ()).is_some() {
+                        if column.name.trim().is_empty() {
                             return Err(OpenDbError::InvalidInput(format!(
-                                "duplicate column {column} on table {table}"
+                                "table {table} has an empty column name"
                             )));
                         }
+                        if seen_columns.insert(&column.name, ()).is_some() {
+                            return Err(OpenDbError::InvalidInput(format!(
+                                "duplicate column {} on table {table}",
+                                column.name
+                            )));
+                        }
+                        if column.primary_key {
+                            primary_key_count += 1;
+                        }
+                    }
+                    if primary_key_count != 1 {
+                        return Err(OpenDbError::InvalidInput(format!(
+                            "table {table} requires exactly one primary key column"
+                        )));
                     }
                     self.tables.insert(
                         table.clone(),
@@ -62,10 +100,20 @@ impl RowProjection {
                     }
                     let mut row = BTreeMap::new();
                     for column_value in values {
-                        if !table_state.columns.contains(&column_value.column) {
+                        let column_definition = table_state
+                            .columns
+                            .iter()
+                            .find(|column| column.name == column_value.column)
+                            .ok_or_else(|| {
+                                OpenDbError::InvalidInput(format!(
+                                    "unknown column {} on table {}",
+                                    column_value.column, table
+                                ))
+                            })?;
+                        if !value_matches_type(&column_value.value, &column_definition.data_type) {
                             return Err(OpenDbError::InvalidInput(format!(
-                                "unknown column {} on table {}",
-                                column_value.column, table
+                                "value for column {} on table {} does not match {:?}",
+                                column_value.column, table, column_definition.data_type
                             )));
                         }
                         if row
@@ -79,11 +127,27 @@ impl RowProjection {
                         }
                     }
                     for column in &table_state.columns {
-                        if !row.contains_key(column) {
+                        if !row.contains_key(&column.name) {
                             return Err(OpenDbError::InvalidInput(format!(
-                                "missing column {column} on table {table}"
+                                "missing column {} on table {table}",
+                                column.name
                             )));
                         }
+                    }
+                    let primary_key = table_state.primary_key_column().ok_or_else(|| {
+                        OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+                    })?;
+                    let projected_key = row.get(&primary_key.name).ok_or_else(|| {
+                        OpenDbError::InvalidInput(format!(
+                            "missing primary key column {} on table {table}",
+                            primary_key.name
+                        ))
+                    })?;
+                    if value_to_key(projected_key) != *key {
+                        return Err(OpenDbError::InvalidInput(format!(
+                            "row key {key} does not match primary key column {} on table {table}",
+                            primary_key.name
+                        )));
                     }
                     table_state.rows.insert(key.clone(), row);
                 }
@@ -105,10 +169,26 @@ impl RowProjection {
     }
 }
 
+fn value_matches_type(value: &Value, data_type: &ColumnType) -> bool {
+    matches!(
+        (value, data_type),
+        (Value::Int64(_), ColumnType::Int64) | (Value::Text(_), ColumnType::Text)
+    )
+}
+
+fn value_to_key(value: &Value) -> String {
+    match value {
+        Value::Int64(value) => value.to_string(),
+        Value::Text(value) => value.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit_stream::{ColumnValue, CommitRecord, Mutation, Value};
+    use crate::commit_stream::{
+        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
+    };
     use opendb_common::{LogicalTimestamp, TransactionId};
 
     fn create_accounts_record(tx_id: u64) -> CommitRecord {
@@ -117,7 +197,7 @@ mod tests {
             LogicalTimestamp(tx_id),
             vec![Mutation::CreateTable {
                 table: "accounts".to_owned(),
-                columns: vec!["id".to_owned(), "name".to_owned()],
+                columns: accounts_columns(),
             }],
         )
     }
@@ -147,6 +227,17 @@ mod tests {
         RowProjection::rebuild(&[create_accounts_record(1)]).expect("rebuild")
     }
 
+    fn accounts_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition::primary_key("id", ColumnType::Int64),
+            ColumnDefinition::new("name", ColumnType::Text),
+        ]
+    }
+
+    fn id_only_columns() -> Vec<ColumnDefinition> {
+        vec![ColumnDefinition::primary_key("id", ColumnType::Int64)]
+    }
+
     #[test]
     fn row_projection_rebuilds_from_commit_stream() {
         let records = vec![
@@ -155,7 +246,7 @@ mod tests {
                 LogicalTimestamp(1),
                 vec![Mutation::CreateTable {
                     table: "accounts".to_owned(),
-                    columns: vec!["id".to_owned(), "name".to_owned()],
+                    columns: accounts_columns(),
                 }],
             ),
             CommitRecord::new(
@@ -287,11 +378,100 @@ mod tests {
             LogicalTimestamp(1),
             vec![Mutation::CreateTable {
                 table: "accounts".to_owned(),
-                columns: vec!["id".to_owned(), "id".to_owned()],
+                columns: vec![
+                    ColumnDefinition::primary_key("id", ColumnType::Int64),
+                    ColumnDefinition::new("id", ColumnType::Text),
+                ],
             }],
         );
 
         assert!(RowProjection::rebuild(&[record]).is_err());
+    }
+
+    #[test]
+    fn create_table_requires_exactly_one_primary_key() {
+        let missing_key = CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_owned(),
+                columns: vec![
+                    ColumnDefinition::new("id", ColumnType::Int64),
+                    ColumnDefinition::new("name", ColumnType::Text),
+                ],
+            }],
+        );
+        let duplicate_key = CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_owned(),
+                columns: vec![
+                    ColumnDefinition::primary_key("id", ColumnType::Int64),
+                    ColumnDefinition::primary_key("name", ColumnType::Text),
+                ],
+            }],
+        );
+
+        assert!(RowProjection::rebuild(&[missing_key]).is_err());
+        assert!(RowProjection::rebuild(&[duplicate_key]).is_err());
+    }
+
+    #[test]
+    fn insert_row_values_must_match_schema_types() {
+        let mut projection = rebuilt_accounts_projection();
+        let invalid_id = CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(2),
+            vec![Mutation::InsertRow {
+                table: "accounts".to_owned(),
+                key: "one".to_owned(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Text("one".to_owned()),
+                    },
+                    ColumnValue {
+                        column: "name".to_owned(),
+                        value: Value::Text("Ada".to_owned()),
+                    },
+                ],
+            }],
+        );
+
+        assert!(projection.apply(&invalid_id).is_err());
+    }
+
+    #[test]
+    fn insert_row_key_must_match_primary_key_value() {
+        let mut projection = rebuilt_accounts_projection();
+        let mismatched_key = CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(2),
+            vec![Mutation::InsertRow {
+                table: "accounts".to_owned(),
+                key: "2".to_owned(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Int64(1),
+                    },
+                    ColumnValue {
+                        column: "name".to_owned(),
+                        value: Value::Text("Ada".to_owned()),
+                    },
+                ],
+            }],
+        );
+
+        assert!(projection.apply(&mismatched_key).is_err());
+        assert!(
+            projection
+                .table("accounts")
+                .expect("accounts")
+                .rows
+                .is_empty()
+        );
     }
 
     #[test]
@@ -304,7 +484,7 @@ mod tests {
             vec![
                 Mutation::CreateTable {
                     table: "orders".to_owned(),
-                    columns: vec!["id".to_owned()],
+                    columns: id_only_columns(),
                 },
                 Mutation::InsertRow {
                     table: "accounts".to_owned(),

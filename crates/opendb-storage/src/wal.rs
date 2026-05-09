@@ -217,21 +217,38 @@ fn decode_frame(
     payload: &[u8],
     record_index: usize,
 ) -> OpenDbResult<CommitRecord> {
-    let record: CommitRecord = serde_json::from_slice(payload).map_err(|error| {
+    let raw_record: serde_json::Value = serde_json::from_slice(payload).map_err(|error| {
         OpenDbError::Storage(format!(
             "read wal {} record {record_index}: decode json: {error}",
             path.display()
         ))
     })?;
+    let record_version = raw_record
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            OpenDbError::Storage(format!(
+                "read wal {} record {record_index}: missing commit record version",
+                path.display()
+            ))
+        })?;
 
-    if record.version != CommitRecord::VERSION {
+    if record_version != u64::from(CommitRecord::VERSION) {
         return Err(OpenDbError::Storage(format!(
             "read wal {} record {record_index}: unsupported commit record version {}, expected {}",
             path.display(),
-            record.version,
+            record_version,
             CommitRecord::VERSION
         )));
     }
+
+    let record: CommitRecord = serde_json::from_value(raw_record).map_err(|error| {
+        OpenDbError::Storage(format!(
+            "read wal {} record {record_index}: decode commit record version {}: {error}",
+            path.display(),
+            CommitRecord::VERSION
+        ))
+    })?;
 
     Ok(record)
 }
@@ -277,7 +294,9 @@ fn storage_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit_stream::{ColumnValue, CommitRecord, Mutation, Value};
+    use crate::commit_stream::{
+        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
+    };
     use opendb_common::{LogicalTimestamp, TransactionId};
 
     #[tokio::test]
@@ -292,7 +311,7 @@ mod tests {
             LogicalTimestamp(10),
             vec![Mutation::CreateTable {
                 table: "users".to_string(),
-                columns: vec!["id".to_string(), "name".to_string()],
+                columns: users_columns(),
             }],
         );
         let second = CommitRecord::new(
@@ -342,7 +361,7 @@ mod tests {
         );
         assert_eq!(
             std::str::from_utf8(payload).expect("utf8 payload"),
-            r#"{"version":1,"tx_id":1,"range_id":1,"ts":10,"actor":"system","mutations":[{"InsertRow":{"table":"users","key":"1","values":[{"column":"id","value":{"Int64":1}},{"column":"name","value":{"Text":"Ada"}}]}}]}"#
+            r#"{"version":2,"tx_id":1,"range_id":1,"ts":10,"actor":"system","mutations":[{"InsertRow":{"table":"users","key":"1","values":[{"column":"id","value":{"Int64":1}},{"column":"name","value":{"Text":"Ada"}}]}}]}"#
         );
         assert_eq!(
             decode_frame(std::path::Path::new("golden.wal"), payload, 0).expect("decode payload"),
@@ -488,6 +507,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wal_rejects_legacy_v1_create_table_shape_with_version_error() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let legacy_payload = br#"{"version":1,"tx_id":1,"range_id":1,"ts":10,"actor":"system","mutations":[{"CreateTable":{"table":"users","columns":["id","name"]}}]}"#;
+
+        fs::write(&wal_path, encode_raw_payload_frame(legacy_payload))
+            .await
+            .expect("write legacy wal frame");
+
+        let error = wal
+            .read_all()
+            .await
+            .expect_err("reject legacy v1 create table shape");
+        assert!(error.to_string().contains("record 0"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported commit record version 1")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(wal_path.to_str().expect("utf8 path"))
+        );
+    }
+
+    #[tokio::test]
     async fn cloned_wal_instances_serialize_appends() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let wal = Wal::new(temp_dir.path().join("root-range.wal"));
@@ -534,5 +581,28 @@ mod tests {
                 ],
             }],
         )
+    }
+
+    fn users_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition::primary_key("id", ColumnType::Int64),
+            ColumnDefinition::new("name", ColumnType::Text),
+        ]
+    }
+
+    fn encode_raw_payload_frame(payload: &[u8]) -> Vec<u8> {
+        let payload_len = u32::try_from(payload.len())
+            .expect("legacy payload should fit wal frame")
+            .to_le_bytes();
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(WAL_MAGIC);
+        frame.extend_from_slice(&WAL_FRAME_VERSION.to_le_bytes());
+        frame.extend_from_slice(&FRAME_RESERVED.to_le_bytes());
+        frame.extend_from_slice(&payload_len);
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(payload);
+        let checksum = frame_checksum(&frame[4..8], &frame[8..12], payload);
+        frame[12..16].copy_from_slice(&checksum.to_le_bytes());
+        frame
     }
 }
