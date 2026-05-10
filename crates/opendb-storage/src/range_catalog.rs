@@ -47,7 +47,8 @@ impl RangeCatalog {
                 }
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
-                | Mutation::PutArchiveObjectPointer { .. } => {}
+                | Mutation::PutArchiveObjectPointer { .. }
+                | Mutation::PutRecoveryArtifactPointer { .. } => {}
             }
         }
         validate_parent_graph(&candidate)?;
@@ -264,6 +265,10 @@ fn sibling_ranges_overlap(previous: &RangeDescriptor, next: &RangeDescriptor) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_manifest::{
+        ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
+        RecoveryArtifactPointer,
+    };
     use crate::commit_stream::{CommitRecord, Mutation};
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
@@ -311,6 +316,33 @@ mod tests {
                     },
                 },
             ],
+        )
+    }
+
+    fn recovery_artifact_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: RecoveryArtifactPointer {
+                    artifact_kind: RecoveryArtifactKind::WalSegment,
+                    range_id: RangeId::ROOT,
+                    object: ArchiveObjectPointer {
+                        backend: ArchiveBackendKind::S3Compatible,
+                        bucket: "opendb-archives".to_owned(),
+                        key: "root-range/00000005.wal".to_owned(),
+                        content_sha256: "not-validated-by-range-catalog".to_owned(),
+                    },
+                    format_version: 0,
+                    tx_id_start: TransactionId(0),
+                    tx_id_end: TransactionId(10),
+                    ts_start: LogicalTimestamp(0),
+                    ts_end: LogicalTimestamp(10),
+                    record_count: 0,
+                    byte_len: 0,
+                    compression: CompressionKind::None,
+                },
+            }],
         )
     }
 
@@ -642,5 +674,22 @@ mod tests {
 
         assert!(catalog.descriptor(RangeId(2)).is_some());
         assert!(catalog.descriptor(RangeId(3)).is_some());
+    }
+
+    #[test]
+    fn range_catalog_ignores_recovery_artifact_metadata() {
+        let root = root_descriptor();
+        let root_record = CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: root.clone(),
+            }],
+        );
+
+        let catalog =
+            RangeCatalog::rebuild(&[root_record, recovery_artifact_record(2)]).expect("rebuild");
+
+        assert_eq!(catalog.descriptor(RangeId::ROOT), Some(&root));
     }
 }

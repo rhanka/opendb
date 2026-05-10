@@ -1,4 +1,4 @@
-use crate::archive_manifest::ArchiveObjectPointer;
+use crate::archive_manifest::{ArchiveObjectPointer, RecoveryArtifactPointer};
 use crate::range_catalog::RangeDescriptor;
 use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub enum Mutation {
     },
     PutArchiveObjectPointer {
         pointer: ArchiveObjectPointer,
+    },
+    PutRecoveryArtifactPointer {
+        artifact: RecoveryArtifactPointer,
     },
 }
 
@@ -144,7 +147,10 @@ impl CommitRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
+    use crate::archive_manifest::{
+        ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
+        RecoveryArtifactPointer,
+    };
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     #[test]
@@ -226,6 +232,52 @@ mod tests {
         assert_eq!(
             record.mutations,
             vec![Mutation::PutArchiveObjectPointer { pointer }]
+        );
+    }
+
+    #[test]
+    fn commit_record_serializes_recovery_artifact_pointer_metadata_mutation() {
+        let artifact = RecoveryArtifactPointer {
+            artifact_kind: RecoveryArtifactKind::WalSegment,
+            range_id: RangeId::ROOT,
+            object: ArchiveObjectPointer {
+                backend: ArchiveBackendKind::GoogleCloudStorage,
+                bucket: "opendb-archives".to_owned(),
+                key: "root-range/00000005.wal".to_owned(),
+                content_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_owned(),
+            },
+            format_version: 1,
+            tx_id_start: TransactionId(0),
+            tx_id_end: TransactionId(10),
+            ts_start: LogicalTimestamp(0),
+            ts_end: LogicalTimestamp(10),
+            record_count: 11,
+            byte_len: 4096,
+            compression: CompressionKind::None,
+        };
+        let record = CommitRecord::new(
+            TransactionId(50),
+            LogicalTimestamp(15),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: artifact.clone(),
+            }],
+        );
+        let encoded =
+            serde_json::to_string(&record).expect("serialize recovery artifact pointer record");
+        let decoded: CommitRecord =
+            serde_json::from_str(&encoded).expect("deserialize recovery artifact pointer record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(CommitRecord::VERSION, 2);
+        assert_eq!(
+            encoded,
+            r#"{"version":2,"tx_id":50,"range_id":1,"ts":15,"actor":"system","mutations":[{"PutRecoveryArtifactPointer":{"artifact":{"artifact_kind":"wal_segment","range_id":1,"object":{"backend":"google_cloud_storage","bucket":"opendb-archives","key":"root-range/00000005.wal","content_sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},"format_version":1,"tx_id_start":0,"tx_id_end":10,"ts_start":0,"ts_end":10,"record_count":11,"byte_len":4096,"compression":"none"}}}]}"#
+        );
+        assert_eq!(
+            record.mutations,
+            vec![Mutation::PutRecoveryArtifactPointer { artifact }]
         );
     }
 

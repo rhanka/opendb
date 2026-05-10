@@ -492,7 +492,10 @@ impl RootRangePeerServer {
 mod tests {
     use super::*;
     use opendb_common::{LogicalTimestamp, OpenDbError, TransactionId};
-    use opendb_storage::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
+    use opendb_storage::archive_manifest::{
+        ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
+        RecoveryArtifactPointer,
+    };
     use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Mutation};
     use opendb_storage::range_catalog::RangeDescriptor;
     use opendb_storage::wal::Wal;
@@ -705,6 +708,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_range_replays_recovery_artifact_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: recovery_artifact_pointer(),
+            }],
+        );
+
+        let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
+        root_range
+            .apply_committed(&record)
+            .await
+            .expect("append recovery artifact record");
+
+        let restarted_root_range = RootRange::new(temp_dir.path());
+        assert_eq!(
+            restarted_root_range
+                .replay()
+                .await
+                .expect("replay recovery artifact metadata"),
+            with_bootstrap(&restarted_root_range, vec![record])
+        );
+    }
+
+    #[tokio::test]
     async fn apply_committed_rejects_non_root_records_without_persisting() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new(temp_dir.path());
@@ -828,6 +859,74 @@ mod tests {
                 .await
                 .expect("replay after rejected archive pointer"),
             vec![root_range.expected_bootstrap_record()]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_rejects_invalid_recovery_artifact_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
+        let record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(14),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: RecoveryArtifactPointer {
+                    record_count: 0,
+                    ..recovery_artifact_pointer()
+                },
+            }],
+        );
+
+        let result = root_range.apply_committed(&record).await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::InvalidInput(message)) if message.contains("record_count")
+        ));
+        assert_eq!(
+            root_range
+                .replay()
+                .await
+                .expect("replay after rejected recovery artifact"),
+            vec![root_range.expected_bootstrap_record()]
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_invalid_recovery_artifact_in_wal() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        wal.append(&CommitRecord::root_bootstrap(vec![0]))
+            .await
+            .expect("append bootstrap");
+        wal.append(&CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: RecoveryArtifactPointer {
+                    record_count: 0,
+                    ..recovery_artifact_pointer()
+                },
+            }],
+        ))
+        .await
+        .expect("append forged recovery artifact");
+
+        let error = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect_err("reject invalid recovery artifact");
+
+        assert!(
+            error
+                .to_string()
+                .contains("root range WAL failed archive manifest replay validation"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("record_count"),
+            "unexpected error: {error}"
         );
     }
 
@@ -1489,6 +1588,25 @@ mod tests {
             key: "root-range/00000004.wal".to_string(),
             content_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
                 .to_string(),
+        }
+    }
+
+    fn recovery_artifact_pointer() -> RecoveryArtifactPointer {
+        RecoveryArtifactPointer {
+            artifact_kind: RecoveryArtifactKind::WalSegment,
+            range_id: RangeId::ROOT,
+            object: ArchiveObjectPointer {
+                key: "root-range/00000005.wal".to_string(),
+                ..archive_object_pointer()
+            },
+            format_version: 1,
+            tx_id_start: TransactionId(0),
+            tx_id_end: TransactionId(10),
+            ts_start: LogicalTimestamp(0),
+            ts_end: LogicalTimestamp(10),
+            record_count: 11,
+            byte_len: 4096,
+            compression: CompressionKind::None,
         }
     }
 

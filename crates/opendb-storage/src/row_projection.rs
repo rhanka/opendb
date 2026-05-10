@@ -151,7 +151,9 @@ impl RowProjection {
                     }
                     table_state.rows.insert(key.clone(), row);
                 }
-                Mutation::PutRangeDescriptor { .. } | Mutation::PutArchiveObjectPointer { .. } => {}
+                Mutation::PutRangeDescriptor { .. }
+                | Mutation::PutArchiveObjectPointer { .. }
+                | Mutation::PutRecoveryArtifactPointer { .. } => {}
             }
         }
         Ok(())
@@ -187,10 +189,14 @@ fn value_to_key(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_manifest::{
+        ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
+        RecoveryArtifactPointer,
+    };
     use crate::commit_stream::{
         ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
     };
-    use opendb_common::{LogicalTimestamp, TransactionId};
+    use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     fn create_accounts_record(tx_id: u64) -> CommitRecord {
         CommitRecord::new(
@@ -237,6 +243,33 @@ mod tests {
 
     fn id_only_columns() -> Vec<ColumnDefinition> {
         vec![ColumnDefinition::primary_key("id", ColumnType::Int64)]
+    }
+
+    fn recovery_artifact_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: RecoveryArtifactPointer {
+                    artifact_kind: RecoveryArtifactKind::WalSegment,
+                    range_id: RangeId::ROOT,
+                    object: ArchiveObjectPointer {
+                        backend: ArchiveBackendKind::S3Compatible,
+                        bucket: "opendb-archives".to_owned(),
+                        key: "root-range/00000005.wal".to_owned(),
+                        content_sha256: "not-validated-by-row-projection".to_owned(),
+                    },
+                    format_version: 0,
+                    tx_id_start: TransactionId(0),
+                    tx_id_end: TransactionId(10),
+                    ts_start: LogicalTimestamp(0),
+                    ts_end: LogicalTimestamp(10),
+                    record_count: 0,
+                    byte_len: 0,
+                    compression: CompressionKind::None,
+                },
+            }],
+        )
     }
 
     #[test]
@@ -501,5 +534,22 @@ mod tests {
         assert!(projection.apply(&record).is_err());
         assert_eq!(projection, before);
         assert!(projection.table("orders").is_none());
+    }
+
+    #[test]
+    fn row_projection_ignores_recovery_artifact_metadata() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            recovery_artifact_record(2),
+            insert_account_record(3, "1"),
+        ])
+        .expect("rebuild projection");
+        let accounts = projection.table("accounts").expect("accounts table");
+
+        assert_eq!(accounts.rows.len(), 1);
+        assert_eq!(
+            accounts.rows.get("1").and_then(|row| row.get("name")),
+            Some(&Value::Text("Ada".to_owned()))
+        );
     }
 }

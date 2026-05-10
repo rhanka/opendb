@@ -308,7 +308,10 @@ fn storage_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive_manifest::{ArchiveBackendKind, ArchiveObjectPointer};
+    use crate::archive_manifest::{
+        ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
+        RecoveryArtifactPointer,
+    };
     use crate::commit_stream::{
         ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
     };
@@ -469,6 +472,48 @@ mod tests {
         );
         assert_eq!(
             decode_frame(std::path::Path::new("archive-pointer.wal"), payload, 0)
+                .expect("decode payload"),
+            record
+        );
+    }
+
+    #[test]
+    fn wal_frame_has_stable_shape_for_recovery_artifact_record() {
+        let record = CommitRecord::new(
+            TransactionId(5),
+            LogicalTimestamp(14),
+            vec![Mutation::PutRecoveryArtifactPointer {
+                artifact: RecoveryArtifactPointer {
+                    artifact_kind: RecoveryArtifactKind::WalSegment,
+                    range_id: RangeId::ROOT,
+                    object: ArchiveObjectPointer {
+                        backend: ArchiveBackendKind::S3Compatible,
+                        bucket: "opendb-archives".to_owned(),
+                        key: "root-range/00000005.wal".to_owned(),
+                        content_sha256:
+                            "2222222222222222222222222222222222222222222222222222222222222222"
+                                .to_owned(),
+                    },
+                    format_version: 1,
+                    tx_id_start: TransactionId(0),
+                    tx_id_end: TransactionId(10),
+                    ts_start: LogicalTimestamp(0),
+                    ts_end: LogicalTimestamp(10),
+                    record_count: 11,
+                    byte_len: 4096,
+                    compression: CompressionKind::None,
+                },
+            }],
+        );
+        let frame = encode_frame(&record).expect("encode frame");
+        let payload = &frame[FRAME_HEADER_LEN..];
+
+        assert_eq!(
+            std::str::from_utf8(payload).expect("utf8 payload"),
+            r#"{"version":2,"tx_id":5,"range_id":1,"ts":14,"actor":"system","mutations":[{"PutRecoveryArtifactPointer":{"artifact":{"artifact_kind":"wal_segment","range_id":1,"object":{"backend":"s3_compatible","bucket":"opendb-archives","key":"root-range/00000005.wal","content_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"format_version":1,"tx_id_start":0,"tx_id_end":10,"ts_start":0,"ts_end":10,"record_count":11,"byte_len":4096,"compression":"none"}}}]}"#
+        );
+        assert_eq!(
+            decode_frame(std::path::Path::new("recovery-artifact.wal"), payload, 0)
                 .expect("decode payload"),
             record
         );
@@ -672,6 +717,48 @@ mod tests {
             .read_all()
             .await
             .expect_err("reject nested unknown field");
+
+        assert!(error.to_string().contains("record 0"));
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_recovery_artifact_with_unknown_nested_field() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"PutRecoveryArtifactPointer":{"artifact":{"artifact_kind":"wal_segment","range_id":1,"object":{"backend":"s3_compatible","bucket":"opendb-archives","key":"root-range/00000005.wal","content_sha256":"2222222222222222222222222222222222222222222222222222222222222222","unexpected":true},"format_version":1,"tx_id_start":0,"tx_id_end":10,"ts_start":0,"ts_end":10,"record_count":11,"byte_len":4096,"compression":"none"}}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject nested unknown field");
+
+        assert!(error.to_string().contains("record 0"));
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_recovery_artifact_with_unknown_artifact_field() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"PutRecoveryArtifactPointer":{"artifact":{"artifact_kind":"wal_segment","range_id":1,"object":{"backend":"s3_compatible","bucket":"opendb-archives","key":"root-range/00000005.wal","content_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"format_version":1,"tx_id_start":0,"tx_id_end":10,"ts_start":0,"ts_end":10,"record_count":11,"byte_len":4096,"compression":"none","unexpected":true}}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject artifact unknown field");
 
         assert!(error.to_string().contains("record 0"));
         assert!(
