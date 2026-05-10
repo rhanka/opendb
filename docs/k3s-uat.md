@@ -20,10 +20,27 @@ The documented recovery scenario is:
 
 1. create a table and insert a recovery smoke row through pgwire;
 2. identify and delete the current leader pod;
-3. wait for `OpenDbCluster/status` to report `Ready` with a leader pod again;
+3. wait for `OpenDbCluster/status` to report `Ready` with a leader pod again and `conditions[type=Recovered].status=True`;
 4. query the recovery smoke row through pgwire.
 
-The node `/status` endpoint should report that the root descriptor is known, WAL replay completed, and archive metadata replayed. The archive metadata is local replay metadata only in this sprint; recovery artifacts describe coverage but no upload or download happens.
+`npm run smoke:k3s` is non-destructive by default: it documents the scenario in the printed plan but does not delete pods or insert recovery rows. To execute the restart recovery scenario end-to-end, pass `--with-restart-recovery`:
+
+```bash
+npm run smoke:k3s -- --with-restart-recovery
+```
+
+This creates a temporary `recovery_smoke_*` table through pgwire, deletes the current leader pod, polls `OpenDbCluster.status.conditions[type=Recovered].status` until it flips to `True` with a fresh leader, and re-queries the inserted row. The flag still respects the kube-context allow-list and requires `--allow-nonlocal-context` for non-local clusters. The same behavior can be enabled via `OPENDB_K3S_WITH_RESTART_RECOVERY=1`.
+
+The operator-lite consumes each node's `/status` endpoint and reflects the recovery contract as standard Kubernetes conditions on `OpenDbCluster.status.conditions`:
+
+- `RootDescriptorKnown`
+- `WalReplayCompleted`
+- `ArchiveMetadataKnown`
+- `Recovered` (True iff `Ready` is True and the three above are True)
+
+A condition is `Unknown` while any running pod is unreachable, `False` only when at least one running pod explicitly reports it as false. `OpenDbCluster.status.phase` semantics are unchanged: `phase=Ready` continues to report kube readiness, not database recovery.
+
+The node `/status` endpoint reports root descriptor known, WAL replay completed, last replayed `tx_id` / `ts`, archive metadata replayed, and the latest known recovery artifact when any exists. Archive metadata is local replay metadata only in this sprint; recovery artifacts describe coverage but no upload or download happens.
 
 ```bash
 npm run smoke:k3s:plan

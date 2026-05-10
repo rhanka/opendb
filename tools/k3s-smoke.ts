@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tsxBin = join(repoRoot, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
 const pgwireSmokePath = join(repoRoot, "tools", "pgwire-smoke.ts");
+const pgwireExecPath = join(repoRoot, "tools", "pgwire-exec.ts");
 const defaultNamespace = "opendb-system";
 const defaultClusterName = "opendb";
 const defaultExpectedReplicas = 3;
@@ -32,6 +33,7 @@ export type K3sSmokePlanOptions = {
   kubectl: string;
   localPgwirePort: number;
   namespace: string;
+  withRestartRecovery: boolean;
 };
 
 export type PodSummary = {
@@ -49,6 +51,7 @@ type SmokeOptions = {
   namespace: string;
   printPlan: boolean;
   timeoutMs: number;
+  withRestartRecovery: boolean;
 };
 
 type PortForwardProcess = ChildProcessByStdio<null, Readable, Readable>;
@@ -61,6 +64,7 @@ export type ExecOptions = {
 
 export function buildK3sSmokePlan(options: K3sSmokePlanOptions): K3sSmokePlanStep[] {
   const selector = openDbPodSelector(options.clusterName);
+  const restart = options.withRestartRecovery;
 
   return [
     {
@@ -127,13 +131,23 @@ export function buildK3sSmokePlan(options: K3sSmokePlanOptions): K3sSmokePlanSte
       command: { command: "tsx", args: ["tools/pgwire-smoke.ts"] }
     },
     {
-      description: "create table and insert recovery smoke row through pgwire"
+      description: restart
+        ? "create table and insert recovery smoke row through pgwire"
+        : "create table and insert recovery smoke row through pgwire (non-destructive default: documentation only, pass --with-restart-recovery to execute)"
     },
     {
-      description: "delete the current leader pod"
+      description: "delete the current leader pod",
+      command: restart
+        ? {
+            command: options.kubectl,
+            args: ["delete", "pod", "<leader>", "-n", options.namespace]
+          }
+        : undefined
     },
     {
-      description: "wait for OpenDbCluster/status Ready with a leader pod"
+      description: restart
+        ? "wait for OpenDbCluster.status.conditions[type=Recovered].status=True with a leader pod"
+        : "wait for OpenDbCluster/status Ready with a leader pod"
     },
     {
       description: "query the recovery smoke row through pgwire"
@@ -142,6 +156,19 @@ export function buildK3sSmokePlan(options: K3sSmokePlanOptions): K3sSmokePlanSte
       description: "no object storage service is required"
     }
   ];
+}
+
+export function recoveryConditionIsTrue(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.status)) {
+    return false;
+  }
+  const conditions = optionalArray(value.status.conditions);
+  return conditions.some((conditionValue) => {
+    if (!isRecord(conditionValue)) {
+      return false;
+    }
+    return conditionValue.type === "Recovered" && conditionValue.status === "True";
+  });
 }
 
 export function commandText(command: CommandSpec): string {
@@ -262,7 +289,137 @@ async function runK3sSmoke(options: SmokeOptions): Promise<void> {
     await stopPortForward(portForward);
   }
 
+  if (options.withRestartRecovery) {
+    await runRestartRecovery(options);
+  }
+
   console.log("k3s smoke passed");
+}
+
+async function runRestartRecovery(options: SmokeOptions): Promise<void> {
+  const table = `recovery_smoke_${Date.now()}_${process.pid}`;
+  const expectedName = "restart-recovery";
+  console.log(`restart-recovery: using table ${table}`);
+
+  await withPgwirePortForward(options, async () => {
+    const results = await pgwireExec(options, [
+      `CREATE TABLE ${table} (id INT PRIMARY KEY, name TEXT)`,
+      `INSERT INTO ${table} VALUES (1, '${expectedName}')`
+    ]);
+    if (results.length !== 2) {
+      throw new Error(`pgwire-exec returned ${results.length} results, expected 2`);
+    }
+  });
+
+  const leaderBefore = await readLeaderPod(options);
+  if (leaderBefore === undefined) {
+    throw new Error("restart-recovery: no leader pod observed before delete");
+  }
+  console.log(`restart-recovery: deleting leader pod ${leaderBefore}`);
+  await run(options.kubectl, ["delete", "pod", leaderBefore, "-n", options.namespace], {
+    timeoutMs: options.timeoutMs
+  });
+
+  await waitForRecoveredCondition(options, leaderBefore);
+
+  await withPgwirePortForward(options, async () => {
+    const results = await pgwireExec(options, [`SELECT * FROM ${table} WHERE id = 1`]);
+    const select = results[0];
+    if (select === undefined || select.rows.length !== 1) {
+      throw new Error(
+        `restart-recovery: expected 1 row from ${table}, got ${JSON.stringify(results)}`
+      );
+    }
+    const row = select.rows[0];
+    if (row === undefined || !row.includes(expectedName)) {
+      throw new Error(
+        `restart-recovery: expected row to contain ${JSON.stringify(expectedName)}, got ${JSON.stringify(row)}`
+      );
+    }
+  });
+
+  console.log("restart-recovery passed");
+}
+
+async function withPgwirePortForward(
+  options: SmokeOptions,
+  body: () => Promise<void>
+): Promise<void> {
+  const portForward = startPortForward(options);
+  try {
+    await waitForPortForwardReady(portForward, options.localPgwirePort, options.timeoutMs);
+    await waitForTcp(options.localPgwirePort, options.timeoutMs);
+    await body();
+  } finally {
+    await stopPortForward(portForward);
+  }
+}
+
+async function pgwireExec(
+  options: SmokeOptions,
+  sqls: string[]
+): Promise<{ sql: string; rows: string[][] }[]> {
+  const output = await captureCommand(tsxBin, [pgwireExecPath, ...sqls], {
+    env: {
+      ...process.env,
+      OPENDB_PGWIRE_HOST: "127.0.0.1",
+      OPENDB_PGWIRE_PORT: String(options.localPgwirePort)
+    },
+    timeoutMs: options.timeoutMs
+  });
+  const lastLine = output.stdout.trim().split("\n").pop() ?? "";
+  return JSON.parse(lastLine);
+}
+
+async function readLeaderPod(options: SmokeOptions): Promise<string | undefined> {
+  const output = await captureCommand(
+    options.kubectl,
+    ["get", "opendbcluster", options.clusterName, "-n", options.namespace, "-o", "json"],
+    { timeoutMs: options.timeoutMs }
+  );
+  const cluster = JSON.parse(output.stdout);
+  if (!isRecord(cluster) || !isRecord(cluster.status)) {
+    return undefined;
+  }
+  const leader = cluster.status.leaderPod;
+  return typeof leader === "string" && leader.trim().length > 0 ? leader.trim() : undefined;
+}
+
+async function waitForRecoveredCondition(
+  options: SmokeOptions,
+  previousLeader: string
+): Promise<void> {
+  await poll(
+    `OpenDbCluster/${options.clusterName} Recovered=True after leader ${previousLeader} delete`,
+    options.timeoutMs,
+    async () => {
+      const output = await captureCommand(
+        options.kubectl,
+        ["get", "opendbcluster", options.clusterName, "-n", options.namespace, "-o", "json"],
+        { timeoutMs: options.timeoutMs }
+      );
+      const cluster = JSON.parse(output.stdout);
+      if (!clusterStatusIsReady(cluster, options.expectedReplicas)) {
+        throw new Error(
+          `cluster not Ready yet: ${JSON.stringify((cluster as { status?: unknown }).status ?? null)}`
+        );
+      }
+      if (!recoveryConditionIsTrue(cluster)) {
+        throw new Error(
+          `Recovered condition not True yet: ${JSON.stringify((cluster as { status?: unknown }).status ?? null)}`
+        );
+      }
+      const currentLeader =
+        isRecord(cluster) && isRecord(cluster.status) && typeof cluster.status.leaderPod === "string"
+          ? cluster.status.leaderPod
+          : "";
+      if (currentLeader === previousLeader) {
+        throw new Error(
+          `leader pod has not yet been replaced; still ${previousLeader}`
+        );
+      }
+    }
+  );
 }
 
 async function ensureNamespace(options: SmokeOptions): Promise<void> {
@@ -540,7 +697,8 @@ export function parseSmokeOptions(args: string[]): SmokeOptions {
     localPgwirePort: envNumber("OPENDB_LOCAL_PGWIRE_PORT", 15432),
     namespace: defaultNamespace,
     printPlan: false,
-    timeoutMs: envNumber("OPENDB_K3S_SMOKE_TIMEOUT_MS", defaultTimeoutMs)
+    timeoutMs: envNumber("OPENDB_K3S_SMOKE_TIMEOUT_MS", defaultTimeoutMs),
+    withRestartRecovery: process.env.OPENDB_K3S_WITH_RESTART_RECOVERY === "1"
   };
   rejectStaticManifestEnvOverride("OPENDB_CLUSTER_NAME", defaultClusterName);
   rejectStaticManifestEnvOverride("OPENDB_NAMESPACE", defaultNamespace);
@@ -569,6 +727,9 @@ export function parseSmokeOptions(args: string[]): SmokeOptions {
         break;
       case "--timeout-ms":
         options.timeoutMs = parsePositiveInt(requireArgValue(args, ++index, arg), arg);
+        break;
+      case "--with-restart-recovery":
+        options.withRestartRecovery = true;
         break;
       default:
         throw new Error(`unknown argument: ${arg}`);
