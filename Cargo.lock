@@ -1364,6 +1364,8 @@ dependencies = [
  "opendb-consensus",
  "opendb-sql",
  "opendb-storage",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

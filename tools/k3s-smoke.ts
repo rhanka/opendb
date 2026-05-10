@@ -125,6 +125,21 @@ export function buildK3sSmokePlan(options: K3sSmokePlanOptions): K3sSmokePlanSte
     {
       description: "Run pgwire SQL smoke through the Kubernetes Service",
       command: { command: "tsx", args: ["tools/pgwire-smoke.ts"] }
+    },
+    {
+      description: "create table and insert recovery smoke row through pgwire"
+    },
+    {
+      description: "delete the current leader pod"
+    },
+    {
+      description: "wait for OpenDbCluster/status Ready with a leader pod"
+    },
+    {
+      description: "query the recovery smoke row through pgwire"
+    },
+    {
+      description: "no object storage service is required"
     }
   ];
 }
@@ -511,7 +526,8 @@ function captureWithStdin(
         )
       );
     });
-    child.stdin.end(options.input);
+    child.stdin.write(options.input);
+    child.stdin.end();
   });
 }
 

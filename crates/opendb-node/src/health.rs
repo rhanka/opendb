@@ -2,7 +2,7 @@ use anyhow::Context;
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,12 +14,25 @@ use tokio::{
 #[derive(Clone, Debug)]
 pub struct HealthState {
     ready: Arc<AtomicBool>,
+    recovery_status: Arc<RwLock<RecoveryStatus>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStatus {
+    pub root_descriptor_known: bool,
+    pub wal_replay_completed: bool,
+    pub last_replayed_tx_id: Option<u64>,
+    pub last_replayed_ts: Option<u64>,
+    pub archive_metadata_replayed: bool,
+    pub latest_recovery_artifact: Option<String>,
 }
 
 impl HealthState {
     pub fn new(ready: bool) -> Self {
         Self {
             ready: Arc::new(AtomicBool::new(ready)),
+            recovery_status: Arc::new(RwLock::new(RecoveryStatus::default())),
         }
     }
 
@@ -30,13 +43,27 @@ impl HealthState {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
+
+    pub fn set_recovery_status(&self, recovery_status: RecoveryStatus) {
+        *self
+            .recovery_status
+            .write()
+            .expect("health recovery status lock poisoned") = recovery_status;
+    }
+
+    pub fn recovery_status(&self) -> RecoveryStatus {
+        self.recovery_status
+            .read()
+            .expect("health recovery status lock poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HealthResponse {
     status_code: u16,
     reason: &'static str,
-    body: &'static str,
+    body: String,
 }
 
 pub async fn serve(addr: SocketAddr, state: HealthState) -> anyhow::Result<()> {
@@ -80,17 +107,24 @@ fn response_for_path(path: &str, state: &HealthState) -> HealthResponse {
         "/ready" if !state.is_ready() => HealthResponse {
             status_code: 503,
             reason: "Service Unavailable",
-            body: "not ready\n",
+            body: "not ready\n".to_string(),
         },
         "/ready" | "/live" | "/healthz" | "/" => HealthResponse {
             status_code: 200,
             reason: "OK",
-            body: "ok\n",
+            body: "ok\n".to_string(),
+        },
+        "/status" => HealthResponse {
+            status_code: 200,
+            reason: "OK",
+            body: serde_json::to_string(&state.recovery_status())
+                .expect("serialize recovery status")
+                + "\n",
         },
         _ => HealthResponse {
             status_code: 404,
             reason: "Not Found",
-            body: "not found\n",
+            body: "not found\n".to_string(),
         },
     }
 }
@@ -141,5 +175,54 @@ mod tests {
         let state = HealthState::new(false);
 
         assert_eq!(response_for_path("/healthz", &state).status_code, 200);
+    }
+
+    #[test]
+    fn status_reports_recovery_watermark() {
+        let state = HealthState::new(false);
+        state.set_recovery_status(RecoveryStatus {
+            root_descriptor_known: true,
+            wal_replay_completed: true,
+            last_replayed_tx_id: Some(2),
+            last_replayed_ts: Some(2),
+            archive_metadata_replayed: true,
+            latest_recovery_artifact: None,
+        });
+
+        let response = response_for_path("/status", &state);
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).expect("status json"),
+            serde_json::json!({
+                "rootDescriptorKnown": true,
+                "walReplayCompleted": true,
+                "lastReplayedTxId": 2,
+                "lastReplayedTs": 2,
+                "archiveMetadataReplayed": true,
+                "latestRecoveryArtifact": null,
+            })
+        );
+        assert!(
+            response
+                .to_http()
+                .contains(&format!("content-length: {}", response.body.len()))
+        );
+    }
+
+    #[test]
+    fn status_does_not_affect_readiness() {
+        let state = HealthState::new(false);
+        state.set_recovery_status(RecoveryStatus {
+            root_descriptor_known: true,
+            wal_replay_completed: true,
+            last_replayed_tx_id: Some(0),
+            last_replayed_ts: Some(0),
+            archive_metadata_replayed: true,
+            latest_recovery_artifact: None,
+        });
+
+        assert_eq!(response_for_path("/status", &state).status_code, 200);
+        assert_eq!(response_for_path("/ready", &state).status_code, 503);
     }
 }

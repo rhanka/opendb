@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::NodeConfig;
-use crate::database::Database;
+use crate::database::{Database, DatabaseRecoveryStatus};
 use crate::health::HealthState;
 use opendb_consensus::root_range::{RootRange, RootRangePeerServer};
 
@@ -25,9 +25,9 @@ async fn main() -> anyhow::Result<()> {
     let health_state = HealthState::new(!config.uses_openraft());
     let (root_range, peer_server) = open_root_range(&config).await?;
     let peer_server = peer_server.map(Arc::new);
-    let database = Arc::new(Mutex::new(
-        open_database(root_range, peer_server.clone(), &config).await?,
-    ));
+    let opened_database = open_database(root_range, peer_server.clone(), &config).await?;
+    health_state.set_recovery_status(opened_database.recovery_status().clone().into());
+    let database = Arc::new(Mutex::new(opened_database));
     tracing::info!(
         node_id = config.node_id,
         pgwire_addr = %config.pgwire_addr,
@@ -117,5 +117,18 @@ async fn open_database(
         None => Database::open_with_root_range(root_range)
             .await
             .with_context(|| format!("open database at {}", config.data_dir.display())),
+    }
+}
+
+impl From<DatabaseRecoveryStatus> for health::RecoveryStatus {
+    fn from(status: DatabaseRecoveryStatus) -> Self {
+        Self {
+            root_descriptor_known: status.root_descriptor_known,
+            wal_replay_completed: status.wal_replay_completed,
+            last_replayed_tx_id: status.last_replayed_tx_id,
+            last_replayed_ts: status.last_replayed_ts,
+            archive_metadata_replayed: status.archive_metadata_replayed,
+            latest_recovery_artifact: None,
+        }
     }
 }

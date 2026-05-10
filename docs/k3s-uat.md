@@ -12,6 +12,19 @@ The smoke UAT validates the milestone-1 Kubernetes path against a real k3s-compa
 
 Do not wait on `rollout status statefulset/opendb`: follower Pods intentionally fail the `/ready` probe while the leader owns the pgwire Service.
 
+## Recovery Contract UAT
+
+The restart recovery UAT remains PVC/local-path only; no object storage service is required. It does not require MinIO, S3, GCS, Azure Blob, or any cloud archive endpoint.
+
+The documented recovery scenario is:
+
+1. create a table and insert a recovery smoke row through pgwire;
+2. identify and delete the current leader pod;
+3. wait for `OpenDbCluster/status` to report `Ready` with a leader pod again;
+4. query the recovery smoke row through pgwire.
+
+The node `/status` endpoint should report that the root descriptor is known, WAL replay completed, and archive metadata replayed. The archive metadata is local replay metadata only in this sprint; recovery artifacts describe coverage but no upload or download happens.
+
 ```bash
 npm run smoke:k3s:plan
 npm run smoke:k3s

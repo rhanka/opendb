@@ -4,6 +4,7 @@ use opendb_sql::{
     ast::{QueryResult, Statement},
     executor::{PreparedQuery, SqlEngine},
 };
+use opendb_storage::commit_stream::CommitRecord;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -11,6 +12,16 @@ pub struct Database {
     root_range: RootRange,
     engine: SqlEngine,
     peer_server: Option<Arc<RootRangePeerServer>>,
+    recovery_status: DatabaseRecoveryStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseRecoveryStatus {
+    pub root_descriptor_known: bool,
+    pub wal_replay_completed: bool,
+    pub last_replayed_tx_id: Option<u64>,
+    pub last_replayed_ts: Option<u64>,
+    pub archive_metadata_replayed: bool,
 }
 
 impl Database {
@@ -21,12 +32,14 @@ impl Database {
             Err(error) => return Err(error),
         }
         let records = root_range.replay().await?;
+        let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let engine = SqlEngine::from_commits(records)?;
 
         Ok(Self {
             root_range,
             engine,
             peer_server: None,
+            recovery_status,
         })
     }
 
@@ -40,12 +53,14 @@ impl Database {
             Err(error) => return Err(error),
         }
         let records = root_range.replay().await?;
+        let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let engine = SqlEngine::from_commits(records)?;
 
         Ok(Self {
             root_range,
             engine,
             peer_server: Some(peer_server),
+            recovery_status,
         })
     }
 
@@ -73,6 +88,22 @@ impl Database {
         match &self.peer_server {
             Some(peer_server) => peer_server.ensure_leader().await,
             None => self.root_range.ensure_client_query_leader().await,
+        }
+    }
+
+    pub fn recovery_status(&self) -> &DatabaseRecoveryStatus {
+        &self.recovery_status
+    }
+}
+
+impl DatabaseRecoveryStatus {
+    fn from_replayed_records(records: &[CommitRecord]) -> Self {
+        Self {
+            root_descriptor_known: records.first().is_some_and(CommitRecord::is_root_bootstrap),
+            wal_replay_completed: true,
+            last_replayed_tx_id: records.last().map(|record| record.tx_id.0),
+            last_replayed_ts: records.last().map(|record| record.ts.0),
+            archive_metadata_replayed: true,
         }
     }
 }
@@ -141,6 +172,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_reports_recovery_status_from_bootstrap_replay() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open database");
+
+        assert_eq!(
+            database.recovery_status(),
+            &super::DatabaseRecoveryStatus {
+                root_descriptor_known: true,
+                wal_replay_completed: true,
+                last_replayed_tx_id: Some(0),
+                last_replayed_ts: Some(0),
+                archive_metadata_replayed: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_reports_recovery_status_from_last_replayed_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let mut database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY)").expect("parse"))
+            .await
+            .expect("create table");
+        drop(database);
+
+        let reopened = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("reopen database");
+
+        assert_eq!(reopened.recovery_status().last_replayed_tx_id, Some(1));
+        assert_eq!(reopened.recovery_status().last_replayed_ts, Some(1));
+        assert!(reopened.recovery_status().root_descriptor_known);
+        assert!(reopened.recovery_status().wal_replay_completed);
+        assert!(reopened.recovery_status().archive_metadata_replayed);
+    }
+
+    #[tokio::test]
     async fn follower_database_rejects_writes_before_local_wal_append() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new_with_authority(
@@ -150,6 +223,16 @@ mod tests {
         let mut database = Database::open_with_root_range(root_range)
             .await
             .expect("open database");
+        assert_eq!(
+            database.recovery_status(),
+            &super::DatabaseRecoveryStatus {
+                root_descriptor_known: false,
+                wal_replay_completed: true,
+                last_replayed_tx_id: None,
+                last_replayed_ts: None,
+                archive_metadata_replayed: true,
+            }
+        );
 
         let result = database
             .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY)").expect("parse"))

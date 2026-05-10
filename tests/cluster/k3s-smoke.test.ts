@@ -32,6 +32,19 @@ test("k3s smoke plan uses the configured kubectl command and static milestone ma
   expect(commands).toContain("/tmp/kubectl-custom port-forward service/opendb-pgwire 15433:5432 -n opendb-system");
 });
 
+test("k3s smoke plan documents restart recovery without destructive default commands", () => {
+  const plan = buildK3sSmokePlan(parseSmokeOptions([]));
+  const output = plan
+    .map((step, index) => `${index + 1}. ${step.description}${step.command === undefined ? "" : `: ${commandText(step.command)}`}`)
+    .join("\n");
+  const deleteStep = plan.find((step) => step.description === "delete the current leader pod");
+
+  expect(output).toContain("delete the current leader pod");
+  expect(output).toContain("query the recovery smoke row through pgwire");
+  expect(output).toContain("no object storage service is required");
+  expect(deleteStep?.command).toBeUndefined();
+});
+
 test("pod summary counts running DB containers and ignores terminating pods", () => {
   const summary = summarizeOpenDbPods({
     items: [
@@ -76,7 +89,7 @@ test("cluster status readiness requires phase, replica count, and leader pod", (
 });
 
 test("capture command writes stdin to child processes", async () => {
-  const output = await captureCommand(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], {
+  const output = await captureCommand("cat", [], {
     input: "stdin-payload",
     timeoutMs: 5_000
   });
