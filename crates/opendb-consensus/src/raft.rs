@@ -59,7 +59,12 @@ impl RootRangeRaftHarness {
         members: BTreeMap<OpenDbRaftNodeId, BasicNode>,
     ) -> OpenDbResult<Self> {
         let data_dir = data_dir.as_ref();
-        let root_range = RootRange::new(data_dir);
+        let bootstrap_replica_node_ids = members.keys().copied().collect::<Vec<_>>();
+        let root_range = RootRange::new_with_authority_and_bootstrap_replicas(
+            data_dir,
+            crate::root_range::RootRangeAuthority::Standalone,
+            bootstrap_replica_node_ids,
+        );
         let store = RootRangeRaftStore::open(root_range.clone(), data_dir).await?;
         let (log_store, state_machine) = Adaptor::new(store);
         let config = Arc::new(root_range_raft_config()?);
@@ -322,7 +327,7 @@ impl RootRangeRaftStoreState {
         };
 
         match persisted {
-            Some(persisted) => Self::from_persisted(root_range, state_path, persisted),
+            Some(persisted) => Self::from_persisted(root_range, state_path, persisted).await,
             None => {
                 let existing_records = root_range.replay().await?;
                 if !existing_records.is_empty() {
@@ -337,7 +342,7 @@ impl RootRangeRaftStoreState {
         }
     }
 
-    fn from_persisted(
+    async fn from_persisted(
         root_range: RootRange,
         state_path: PathBuf,
         persisted: PersistedRootRangeRaftStoreState,
@@ -348,6 +353,7 @@ impl RootRangeRaftStoreState {
                 persisted.version, RAFT_STORE_VERSION
             )));
         }
+        validate_persisted_state_matches_wal(&root_range, &state_path, &persisted).await?;
 
         Ok(Self {
             root_range,
@@ -474,6 +480,61 @@ impl RootRangeRaftStoreState {
         self.applied_normal_count += 1;
         Ok(())
     }
+}
+
+async fn validate_persisted_state_matches_wal(
+    root_range: &RootRange,
+    state_path: &Path,
+    persisted: &PersistedRootRangeRaftStoreState,
+) -> OpenDbResult<()> {
+    let records = root_range.replay().await?;
+    if records.len() < persisted.applied_normal_count {
+        return Err(OpenDbError::Storage(format!(
+            "root range raft state {} reports {} applied normal records but WAL has {} records",
+            state_path.display(),
+            persisted.applied_normal_count,
+            records.len()
+        )));
+    }
+
+    let mut applied_normal_records = Vec::new();
+    if let Some(last_applied) = persisted.last_applied {
+        for entry in persisted.logs.values() {
+            if entry.log_id <= last_applied
+                && let EntryPayload::Normal(command) = &entry.payload
+            {
+                applied_normal_records.push(&command.record);
+            }
+        }
+    }
+
+    if applied_normal_records.len() != persisted.applied_normal_count {
+        return Err(OpenDbError::Storage(format!(
+            "root range raft state {} reports {} applied normal records but contains {} applied normal log entries",
+            state_path.display(),
+            persisted.applied_normal_count,
+            applied_normal_records.len()
+        )));
+    }
+
+    for (index, expected_record) in applied_normal_records.into_iter().enumerate() {
+        let wal_record = records.get(index).ok_or_else(|| {
+            OpenDbError::Storage(format!(
+                "root range raft state {} applied normal offset {index} is missing from WAL",
+                state_path.display()
+            ))
+        })?;
+        if wal_record != expected_record {
+            return Err(OpenDbError::Storage(format!(
+                "root range raft state {} applied normal offset {index} differs from WAL: wal {:?}, raft {:?}",
+                state_path.display(),
+                wal_record,
+                expected_record
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 impl RaftLogReader<RootRangeTypeConfig> for SharedRaftLogStore {
@@ -1005,4 +1066,48 @@ fn storage_file_error(path: &Path, operation: &str, err: impl std::fmt::Display)
         "{operation} for root range raft state {}: {err}",
         path.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::root_range::RootRangeAuthority;
+    use openraft::CommittedLeaderId;
+
+    #[tokio::test]
+    async fn raft_store_open_rejects_state_ahead_of_wal() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new_with_authority_and_bootstrap_replicas(
+            temp_dir.path(),
+            RootRangeAuthority::Standalone,
+            vec![0],
+        );
+        let log_id = LogId::new(CommittedLeaderId::new(1, 0), 1);
+        let state_path = temp_dir.path().join("root-range").join(RAFT_STORE_FILE);
+        let persisted = PersistedRootRangeRaftStoreState {
+            version: RAFT_STORE_VERSION,
+            logs: BTreeMap::new(),
+            vote: None,
+            committed: Some(log_id),
+            last_applied: Some(log_id),
+            last_membership: StoredMembership::default(),
+            current_snapshot: None,
+            last_purged_log_id: None,
+            applied_normal_count: 1,
+        };
+        write_json_file_atomic(&state_path, &persisted)
+            .await
+            .expect("write raft state");
+
+        let error = RootRangeRaftStore::open(root_range, temp_dir.path())
+            .await
+            .expect_err("reject raft state ahead of WAL");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reports 1 applied normal records but WAL has 0 records"),
+            "unexpected error: {error}"
+        );
+    }
 }

@@ -77,16 +77,61 @@ pub struct CommitRecord {
 
 impl CommitRecord {
     pub const VERSION: u16 = 2;
+    pub const BOOTSTRAP_ACTOR: &'static str = "system";
 
     pub fn new(tx_id: TransactionId, ts: LogicalTimestamp, mutations: Vec<Mutation>) -> Self {
+        Self::new_with_actor(tx_id, ts, Self::BOOTSTRAP_ACTOR, mutations)
+    }
+
+    pub fn new_with_actor(
+        tx_id: TransactionId,
+        ts: LogicalTimestamp,
+        actor: impl Into<String>,
+        mutations: Vec<Mutation>,
+    ) -> Self {
         Self {
             version: Self::VERSION,
             tx_id,
             range_id: RangeId::ROOT,
             ts,
-            actor: "system".to_string(),
+            actor: actor.into(),
             mutations,
         }
+    }
+
+    pub fn root_bootstrap(replica_node_ids: Vec<u64>) -> Self {
+        let mut replica_node_ids = replica_node_ids;
+        replica_node_ids.sort_unstable();
+        replica_node_ids.dedup();
+        Self::new_with_actor(
+            TransactionId(0),
+            LogicalTimestamp(0),
+            Self::BOOTSTRAP_ACTOR,
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: RangeDescriptor {
+                    range_id: RangeId::ROOT,
+                    parent_range_id: None,
+                    key_start: None,
+                    key_end: None,
+                    replica_node_ids,
+                },
+            }],
+        )
+    }
+
+    pub fn is_root_bootstrap(&self) -> bool {
+        self.tx_id == TransactionId(0)
+            && self.ts == LogicalTimestamp(0)
+            && self.range_id == RangeId::ROOT
+            && self.actor == Self::BOOTSTRAP_ACTOR
+            && matches!(
+                self.mutations.as_slice(),
+                [Mutation::PutRangeDescriptor { descriptor }]
+                    if descriptor.range_id == RangeId::ROOT
+                        && descriptor.parent_range_id.is_none()
+                        && descriptor.key_start.is_none()
+                        && descriptor.key_end.is_none()
+            )
     }
 }
 
@@ -176,5 +221,29 @@ mod tests {
             record.mutations,
             vec![Mutation::PutArchiveObjectPointer { pointer }]
         );
+    }
+
+    #[test]
+    fn commit_record_builds_stable_root_bootstrap_record() {
+        let record = CommitRecord::root_bootstrap(vec![2, 0, 1]);
+
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(record.tx_id, TransactionId(0));
+        assert_eq!(record.ts, LogicalTimestamp(0));
+        assert_eq!(record.range_id, RangeId::ROOT);
+        assert_eq!(record.actor, "system");
+        assert_eq!(
+            record.mutations,
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: RangeDescriptor {
+                    range_id: RangeId::ROOT,
+                    parent_range_id: None,
+                    key_start: None,
+                    key_end: None,
+                    replica_node_ids: vec![0, 1, 2],
+                },
+            }]
+        );
+        assert!(record.is_root_bootstrap());
     }
 }

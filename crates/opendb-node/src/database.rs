@@ -1,4 +1,4 @@
-use opendb_common::OpenDbResult;
+use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_consensus::root_range::{RootRange, RootRangeCommand, RootRangePeerServer};
 use opendb_sql::{
     ast::{QueryResult, Statement},
@@ -15,6 +15,11 @@ pub struct Database {
 
 impl Database {
     pub async fn open_with_root_range(root_range: RootRange) -> OpenDbResult<Self> {
+        match root_range.ensure_bootstrapped().await {
+            Ok(()) => {}
+            Err(OpenDbError::NotLeader { .. }) => {}
+            Err(error) => return Err(error),
+        }
         let records = root_range.replay().await?;
         let engine = SqlEngine::from_commits(records)?;
 
@@ -29,9 +34,19 @@ impl Database {
         root_range: RootRange,
         peer_server: Arc<RootRangePeerServer>,
     ) -> OpenDbResult<Self> {
-        let mut database = Self::open_with_root_range(root_range).await?;
-        database.peer_server = Some(peer_server);
-        Ok(database)
+        match root_range.ensure_bootstrapped().await {
+            Ok(()) => {}
+            Err(OpenDbError::NotLeader { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let records = root_range.replay().await?;
+        let engine = SqlEngine::from_commits(records)?;
+
+        Ok(Self {
+            root_range,
+            engine,
+            peer_server: Some(peer_server),
+        })
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {

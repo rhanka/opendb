@@ -75,6 +75,7 @@ pub struct RootRange {
     proposal_path: RootRangeProposalPath,
     semantic_append_lock: Arc<Mutex<()>>,
     openraft_submit_lock: Arc<Mutex<()>>,
+    bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
 }
 
 impl RootRange {
@@ -83,12 +84,23 @@ impl RootRange {
     }
 
     pub fn new_with_authority(data_dir: impl AsRef<Path>, authority: RootRangeAuthority) -> Self {
+        Self::new_with_authority_and_bootstrap_replicas(data_dir, authority, vec![0])
+    }
+
+    pub(crate) fn new_with_authority_and_bootstrap_replicas(
+        data_dir: impl AsRef<Path>,
+        authority: RootRangeAuthority,
+        mut bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
+    ) -> Self {
+        bootstrap_replica_node_ids.sort_unstable();
+        bootstrap_replica_node_ids.dedup();
         Self {
             range_id: RangeId::ROOT,
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::Local(authority),
             semantic_append_lock: Arc::new(Mutex::new(())),
             openraft_submit_lock: Arc::new(Mutex::new(())),
+            bootstrap_replica_node_ids,
         }
     }
 
@@ -111,6 +123,7 @@ impl RootRange {
                 "root range OpenRaft node id {node_id} is missing from initial peers"
             )));
         }
+        let bootstrap_replica_node_ids = members.keys().copied().collect::<Vec<_>>();
         let raft = Arc::new(RootRangeRaftHarness::new(node_id, data_dir.as_ref(), members).await?);
         let root_range = Self {
             range_id: RangeId::ROOT,
@@ -118,6 +131,7 @@ impl RootRange {
             proposal_path: RootRangeProposalPath::OpenRaft(Arc::clone(&raft)),
             semantic_append_lock: Arc::new(Mutex::new(())),
             openraft_submit_lock: Arc::new(Mutex::new(())),
+            bootstrap_replica_node_ids,
         };
 
         Ok((root_range, RootRangePeerServer { raft }))
@@ -127,9 +141,68 @@ impl RootRange {
         self.range_id
     }
 
+    pub async fn ensure_bootstrapped(&self) -> OpenDbResult<()> {
+        match &self.proposal_path {
+            RootRangeProposalPath::OpenRaft(raft) => {
+                let _guard = self.openraft_submit_lock.lock().await;
+                let records = self.wal.read_all().await?;
+                let expected = self.expected_bootstrap_record();
+                match records.first() {
+                    None => {
+                        self.validate_apply_record(&expected)?;
+                        self.validate_replay_sequence(std::slice::from_ref(&expected))?;
+                        let response = raft.submit(RootRangeCommand { record: expected }).await?;
+                        if response == RootRangeResponse::Applied {
+                            Ok(())
+                        } else {
+                            Err(OpenDbError::Storage(format!(
+                                "root range raft returned unexpected bootstrap response: {response:?}"
+                            )))
+                        }
+                    }
+                    Some(_) => self.validate_bootstrap_records(&records),
+                }
+            }
+            RootRangeProposalPath::Local(_) => {
+                let _guard = self.semantic_append_lock.lock().await;
+                let records = self.wal.read_all().await?;
+                let expected = self.expected_bootstrap_record();
+                match records.first() {
+                    None => match self.local_bootstrap_authority() {
+                        Ok(()) => {
+                            self.validate_apply_record(&expected)?;
+                            self.wal.append(&expected).await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Some(_) => self.validate_bootstrap_records(&records),
+                }
+            }
+        }
+    }
+
+    fn local_bootstrap_authority(&self) -> OpenDbResult<()> {
+        match &self.proposal_path {
+            RootRangeProposalPath::Local(
+                RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. },
+            ) => Ok(()),
+            RootRangeProposalPath::Local(RootRangeAuthority::Follower {
+                leader_id,
+                leader_addr,
+            }) => Err(OpenDbError::NotLeader {
+                leader_id: *leader_id,
+                leader_addr: leader_addr.clone(),
+            }),
+            RootRangeProposalPath::OpenRaft(_) => Ok(()),
+        }
+    }
+
     pub async fn ensure_client_query_leader(&self) -> OpenDbResult<()> {
         match &self.proposal_path {
-            RootRangeProposalPath::OpenRaft(_) => Ok(()),
+            RootRangeProposalPath::OpenRaft(_) => Err(OpenDbError::NotLeader {
+                leader_id: None,
+                leader_addr: None,
+            }),
             RootRangeProposalPath::Local(authority) => match authority {
                 RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => Ok(()),
                 RootRangeAuthority::Follower {
@@ -202,6 +275,7 @@ impl RootRange {
         for (index, record) in records.iter().enumerate() {
             self.validate_replayed_record(index, record)?;
         }
+        self.validate_replay_sequence(&records)?;
         RowProjection::rebuild(&records).map_err(|error| {
             OpenDbError::Storage(format!(
                 "root range WAL failed semantic replay validation: {error}"
@@ -239,7 +313,14 @@ impl RootRange {
 
     async fn validate_semantic_append(&self, record: &CommitRecord) -> OpenDbResult<()> {
         let mut records = self.replay().await?;
+        if records.is_empty() && !record.is_root_bootstrap() {
+            return Err(OpenDbError::InvalidInput(
+                "root descriptor bootstrap must be committed before user records".to_string(),
+            ));
+        }
         records.push(record.clone());
+        self.validate_replay_sequence(&records)
+            .map_err(sequence_validation_error_for_append)?;
         RowProjection::rebuild(&records)?;
         RangeCatalog::rebuild(&records)?;
         ArchiveManifest::rebuild(&records)?;
@@ -261,6 +342,90 @@ impl RootRange {
             )));
         }
         Ok(())
+    }
+
+    fn expected_bootstrap_record(&self) -> CommitRecord {
+        CommitRecord::root_bootstrap(self.bootstrap_replica_node_ids.clone())
+    }
+
+    fn validate_bootstrap_records(&self, records: &[CommitRecord]) -> OpenDbResult<()> {
+        match records.first() {
+            Some(first) if first == &self.expected_bootstrap_record() => {
+                self.validate_replay_sequence(records)
+            }
+            Some(first) if first.is_root_bootstrap() => Err(OpenDbError::Storage(format!(
+                "root descriptor bootstrap does not match expected replicas {:?}: got {:?}",
+                self.bootstrap_replica_node_ids, first
+            ))),
+            Some(_) => Err(OpenDbError::Storage(
+                "root descriptor bootstrap is missing from the first WAL record".to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_replay_sequence(&self, records: &[CommitRecord]) -> OpenDbResult<()> {
+        let Some(first) = records.first() else {
+            return Ok(());
+        };
+        let expected = self.expected_bootstrap_record();
+        if first != &expected {
+            if first.is_root_bootstrap() {
+                return Err(OpenDbError::Storage(format!(
+                    "root descriptor bootstrap does not match expected replicas {:?}: got {:?}",
+                    self.bootstrap_replica_node_ids, first
+                )));
+            }
+            return Err(OpenDbError::Storage(
+                "root descriptor bootstrap is missing from the first WAL record".to_string(),
+            ));
+        }
+
+        let mut previous_tx_id = first.tx_id;
+        let mut previous_ts = first.ts;
+        for (index, record) in records.iter().enumerate().skip(1) {
+            if record.is_root_bootstrap() || record.tx_id == opendb_common::TransactionId(0) {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} repeats root descriptor bootstrap tx_id"
+                )));
+            }
+            if record.ts == opendb_common::LogicalTimestamp(0) {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} repeats root descriptor bootstrap timestamp"
+                )));
+            }
+            if record.mutations.is_empty() {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} must contain at least one mutation"
+                )));
+            }
+            if record.actor.trim().is_empty() || record.actor != record.actor.trim() {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} actor must not be empty or padded"
+                )));
+            }
+            if record.tx_id <= previous_tx_id {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} must have strictly increasing tx_id"
+                )));
+            }
+            if record.ts <= previous_ts {
+                return Err(OpenDbError::Storage(format!(
+                    "root range record {index} must have strictly increasing ts"
+                )));
+            }
+            previous_tx_id = record.tx_id;
+            previous_ts = record.ts;
+        }
+
+        Ok(())
+    }
+}
+
+fn sequence_validation_error_for_append(error: OpenDbError) -> OpenDbError {
+    match error {
+        OpenDbError::Storage(message) => OpenDbError::InvalidInput(message),
+        error => error,
     }
 }
 
@@ -354,6 +519,7 @@ mod tests {
 
         let root_range = RootRange::new(temp_dir.path());
         assert_eq!(root_range.range_id(), RangeId::ROOT);
+        bootstrap(&root_range).await;
         root_range
             .apply_committed(&record)
             .await
@@ -365,7 +531,114 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay committed records"),
-            vec![record]
+            with_bootstrap(&restarted_root_range, vec![record])
+        );
+    }
+
+    #[tokio::test]
+    async fn root_range_bootstraps_root_descriptor_once() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+
+        root_range.ensure_bootstrapped().await.expect("bootstrap");
+        root_range
+            .ensure_bootstrapped()
+            .await
+            .expect("idempotent bootstrap");
+
+        assert_eq!(
+            root_range.replay().await.expect("replay"),
+            vec![CommitRecord::root_bootstrap(vec![0])]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_record_before_bootstrap_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let record = CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_string(),
+                columns: account_columns(),
+            }],
+        );
+
+        let error = root_range
+            .apply_committed(&record)
+            .await
+            .expect_err("reject missing bootstrap");
+
+        assert!(
+            error.to_string().contains("root descriptor bootstrap"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(root_range.replay().await.expect("replay"), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn openraft_root_range_requires_peer_server_for_client_query_leadership() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let (root_range, peer_server) = RootRange::new_raft_backed(
+            temp_dir.path(),
+            0,
+            vec![RootRangePeer {
+                node_id: 0,
+                addr: "127.0.0.1:0".to_string(),
+            }],
+        )
+        .await
+        .expect("reopen raft-backed root range");
+
+        let result = root_range.ensure_client_query_leader().await;
+
+        assert!(matches!(
+            result,
+            Err(OpenDbError::NotLeader {
+                leader_id: None,
+                leader_addr: None,
+            })
+        ));
+        peer_server.shutdown().await.expect("shutdown raft");
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_non_monotonic_user_tx_id() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        wal.append(&CommitRecord::root_bootstrap(vec![0]))
+            .await
+            .expect("append bootstrap");
+        wal.append(&CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(2),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_string(),
+                columns: account_columns(),
+            }],
+        ))
+        .await
+        .expect("append first user record");
+        wal.append(&CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(3),
+            vec![Mutation::CreateTable {
+                table: "orders".to_string(),
+                columns: id_columns(),
+            }],
+        ))
+        .await
+        .expect("append forged duplicate tx");
+
+        let error = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect_err("reject duplicate tx");
+
+        assert!(
+            error.to_string().contains("strictly increasing tx_id"),
+            "unexpected error: {error}"
         );
     }
 
@@ -376,11 +649,18 @@ mod tests {
             TransactionId(8),
             LogicalTimestamp(12),
             vec![Mutation::PutRangeDescriptor {
-                descriptor: root_range_descriptor(),
+                descriptor: RangeDescriptor {
+                    range_id: RangeId(2),
+                    parent_range_id: Some(RangeId::ROOT),
+                    key_start: Some("accounts/".to_string()),
+                    key_end: Some("orders/".to_string()),
+                    replica_node_ids: vec![0],
+                },
             }],
         );
 
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         root_range
             .apply_committed(&record)
             .await
@@ -392,7 +672,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay range catalog metadata"),
-            vec![record]
+            with_bootstrap(&restarted_root_range, vec![record])
         );
     }
 
@@ -408,6 +688,7 @@ mod tests {
         );
 
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         root_range
             .apply_committed(&record)
             .await
@@ -419,7 +700,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay archive manifest metadata"),
-            vec![record]
+            with_bootstrap(&restarted_root_range, vec![record])
         );
     }
 
@@ -487,6 +768,7 @@ mod tests {
     async fn apply_committed_rejects_range_descriptor_with_missing_parent_without_persisting() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         let record = CommitRecord::new(
             TransactionId(9),
             LogicalTimestamp(13),
@@ -512,7 +794,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay after rejected range descriptor"),
-            Vec::new()
+            vec![root_range.expected_bootstrap_record()]
         );
     }
 
@@ -520,6 +802,7 @@ mod tests {
     async fn apply_committed_rejects_invalid_archive_pointer_without_persisting() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         let record = CommitRecord::new(
             TransactionId(10),
             LogicalTimestamp(14),
@@ -544,7 +827,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay after rejected archive pointer"),
-            Vec::new()
+            vec![root_range.expected_bootstrap_record()]
         );
     }
 
@@ -552,6 +835,7 @@ mod tests {
     async fn concurrent_apply_committed_serializes_validation_with_wal_append() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         let first = CommitRecord::new(
             TransactionId(10),
             LogicalTimestamp(14),
@@ -591,9 +875,10 @@ mod tests {
             .replay()
             .await
             .expect("replay after concurrent apply");
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert!(
-            records == vec![first] || records == vec![second],
+            records == with_bootstrap(&root_range, vec![first])
+                || records == with_bootstrap(&root_range, vec![second]),
             "unexpected committed record: {records:?}"
         );
     }
@@ -720,6 +1005,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range =
             RootRange::new_with_authority(temp_dir.path(), RootRangeAuthority::leader(0));
+        bootstrap(&root_range).await;
         let record = CommitRecord::new(
             TransactionId(11),
             LogicalTimestamp(15),
@@ -741,7 +1027,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay leader-submitted command"),
-            vec![record]
+            with_bootstrap(&root_range, vec![record])
         );
     }
 
@@ -749,6 +1035,7 @@ mod tests {
     async fn standalone_submit_persists_root_commands_through_consensus_boundary() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
         let record = CommitRecord::new(
             TransactionId(12),
             LogicalTimestamp(16),
@@ -767,7 +1054,7 @@ mod tests {
 
         assert_eq!(
             root_range.replay().await.expect("replay submitted command"),
-            vec![record]
+            with_bootstrap(&root_range, vec![record])
         );
     }
 
@@ -821,6 +1108,13 @@ mod tests {
             .wait_for_leader(0, Duration::from_secs(3))
             .await
             .expect("single node elects itself");
+        let bootstrap_record = CommitRecord::root_bootstrap(vec![0]);
+        harness
+            .submit(RootRangeCommand {
+                record: bootstrap_record.clone(),
+            })
+            .await
+            .expect("client_write root bootstrap");
 
         let record = CommitRecord::new(
             TransactionId(14),
@@ -844,7 +1138,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay root-range WAL after client_write"),
-            vec![record]
+            vec![bootstrap_record, record]
         );
 
         harness
@@ -874,6 +1168,7 @@ mod tests {
             .wait_for_leader(0, Duration::from_secs(3))
             .await
             .expect("single-node root range leader");
+        bootstrap(&root_range).await;
 
         let record = CommitRecord::new(
             TransactionId(15),
@@ -896,7 +1191,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay root-range WAL after raft-backed submit"),
-            vec![record]
+            with_bootstrap(&root_range, vec![record])
         );
 
         peer_server
@@ -926,6 +1221,7 @@ mod tests {
             .wait_for_leader(0, Duration::from_secs(3))
             .await
             .expect("single-node root range leader");
+        bootstrap(&root_range).await;
 
         let first = CommitRecord::new(
             TransactionId(18),
@@ -972,9 +1268,10 @@ mod tests {
             .replay()
             .await
             .expect("replay after concurrent raft submit");
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert!(
-            records == vec![first] || records == vec![second],
+            records == with_bootstrap(&root_range, vec![first])
+                || records == with_bootstrap(&root_range, vec![second]),
             "unexpected committed record: {records:?}"
         );
 
@@ -1003,6 +1300,7 @@ mod tests {
             .wait_for_leader(0, Duration::from_secs(3))
             .await
             .expect("single-node root range leader");
+        bootstrap(&root_range).await;
 
         let first_record = CommitRecord::new(
             TransactionId(16),
@@ -1027,6 +1325,10 @@ mod tests {
             RootRange::new_raft_backed(temp_dir.path(), 0, vec![peer])
                 .await
                 .expect("restart raft-backed root range");
+        restarted_root_range
+            .ensure_bootstrapped()
+            .await
+            .expect("restarted bootstrap is idempotent");
         restarted_peer_server
             .wait_for_leader(0, Duration::from_secs(3))
             .await
@@ -1056,7 +1358,7 @@ mod tests {
                 .replay()
                 .await
                 .expect("replay root-range WAL after raft restart"),
-            vec![first_record, second_record]
+            with_bootstrap(&restarted_root_range, vec![first_record, second_record])
         );
 
         restarted_peer_server
@@ -1108,6 +1410,12 @@ mod tests {
             .wait_for_any_leader(Duration::from_secs(5))
             .await
             .expect("elect a root range leader");
+        let writer = if leader_id == 0 {
+            &root_range_0
+        } else {
+            &root_range_1
+        };
+        bootstrap(writer).await;
 
         let record = CommitRecord::new(
             TransactionId(18),
@@ -1117,11 +1425,6 @@ mod tests {
                 columns: id_columns(),
             }],
         );
-        let writer = if leader_id == 0 {
-            &root_range_0
-        } else {
-            &root_range_1
-        };
         writer
             .submit(RootRangeCommand {
                 record: record.clone(),
@@ -1129,8 +1432,12 @@ mod tests {
             .await
             .expect("submit through elected root range leader");
 
-        wait_for_replayed_records(&root_range_0, vec![record.clone()]).await;
-        wait_for_replayed_records(&root_range_1, vec![record]).await;
+        wait_for_replayed_records(
+            &root_range_0,
+            with_bootstrap(&root_range_0, vec![record.clone()]),
+        )
+        .await;
+        wait_for_replayed_records(&root_range_1, with_bootstrap(&root_range_1, vec![record])).await;
 
         serve_0.abort();
         serve_1.abort();
@@ -1142,6 +1449,19 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown node 1 raft");
+    }
+
+    async fn bootstrap(root_range: &RootRange) {
+        root_range
+            .ensure_bootstrapped()
+            .await
+            .expect("bootstrap root range");
+    }
+
+    fn with_bootstrap(root_range: &RootRange, records: Vec<CommitRecord>) -> Vec<CommitRecord> {
+        let mut expected = vec![root_range.expected_bootstrap_record()];
+        expected.extend(records);
+        expected
     }
 
     fn reserve_loopback_addr() -> std::net::SocketAddr {
@@ -1160,16 +1480,6 @@ mod tests {
             ColumnDefinition::primary_key("id", ColumnType::Int64),
             ColumnDefinition::new("name", ColumnType::Text),
         ]
-    }
-
-    fn root_range_descriptor() -> RangeDescriptor {
-        RangeDescriptor {
-            range_id: RangeId::ROOT,
-            parent_range_id: None,
-            key_start: None,
-            key_end: None,
-            replica_node_ids: vec![0, 1, 2],
-        }
     }
 
     fn archive_object_pointer() -> ArchiveObjectPointer {
