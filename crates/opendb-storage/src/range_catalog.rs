@@ -31,18 +31,27 @@ impl RangeCatalog {
             match mutation {
                 Mutation::PutRangeDescriptor { descriptor } => {
                     validate_descriptor_shape(descriptor)?;
-                    candidate.insert(descriptor.range_id, descriptor.clone());
+                    match candidate.get(&descriptor.range_id) {
+                        Some(existing) if existing == descriptor => {}
+                        Some(existing) => {
+                            return Err(OpenDbError::InvalidInput(format!(
+                                "range {:?} has conflicting descriptor update: existing {:?}, new {:?}",
+                                descriptor.range_id, existing, descriptor
+                            )));
+                        }
+                        None => {
+                            candidate.insert(descriptor.range_id, descriptor.clone());
+                        }
+                    }
                 }
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
                 | Mutation::PutArchiveObjectPointer { .. } => {}
             }
         }
-        for mutation in &record.mutations {
-            if let Mutation::PutRangeDescriptor { descriptor } = mutation {
-                validate_descriptor_parent(descriptor, &candidate)?;
-            }
-        }
+        validate_parent_graph(&candidate)?;
+        validate_root_descriptor(&candidate)?;
+        validate_sibling_ranges(&candidate)?;
         self.descriptors = candidate;
         Ok(())
     }
@@ -102,26 +111,153 @@ fn validate_descriptor_shape(descriptor: &RangeDescriptor) -> OpenDbResult<()> {
     Ok(())
 }
 
-fn validate_descriptor_parent(
+fn validate_root_descriptor(descriptors: &BTreeMap<RangeId, RangeDescriptor>) -> OpenDbResult<()> {
+    if !descriptors.is_empty() && !descriptors.contains_key(&RangeId::ROOT) {
+        return Err(OpenDbError::InvalidInput(
+            "range catalog requires exactly one root descriptor".to_string(),
+        ));
+    }
+    if let Some(root_descriptor) = descriptors.get(&RangeId::ROOT)
+        && (root_descriptor.parent_range_id.is_some()
+            || root_descriptor.key_start.is_some()
+            || root_descriptor.key_end.is_some())
+    {
+        return Err(OpenDbError::InvalidInput(
+            "root range descriptor must not have parent or key bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_parent_graph(descriptors: &BTreeMap<RangeId, RangeDescriptor>) -> OpenDbResult<()> {
+    for descriptor in descriptors.values() {
+        if descriptor.range_id == RangeId::ROOT {
+            continue;
+        }
+        validate_parent_chain(descriptor, descriptors)?;
+        validate_child_bounds(descriptor, descriptors)?;
+    }
+    Ok(())
+}
+
+fn validate_parent_chain(
     descriptor: &RangeDescriptor,
     descriptors: &BTreeMap<RangeId, RangeDescriptor>,
 ) -> OpenDbResult<()> {
-    if descriptor.range_id == RangeId::ROOT {
-        return Ok(());
+    let mut visited = BTreeSet::new();
+    let mut current_range_id = descriptor.range_id;
+
+    loop {
+        if current_range_id == RangeId::ROOT {
+            return if descriptors.contains_key(&RangeId::ROOT) {
+                Ok(())
+            } else {
+                Err(OpenDbError::InvalidInput(format!(
+                    "range {:?} references missing parent range {:?}",
+                    descriptor.range_id,
+                    RangeId::ROOT
+                )))
+            };
+        }
+        if !visited.insert(current_range_id) {
+            return Err(OpenDbError::InvalidInput(format!(
+                "range {:?} has parent cycle through range {:?}",
+                descriptor.range_id, current_range_id
+            )));
+        }
+        let current = descriptors.get(&current_range_id).ok_or_else(|| {
+            OpenDbError::InvalidInput(format!(
+                "range {:?} references missing parent range {:?}",
+                descriptor.range_id, current_range_id
+            ))
+        })?;
+        current_range_id = current.parent_range_id.ok_or_else(|| {
+            OpenDbError::InvalidInput(format!(
+                "range {:?} requires a parent range",
+                current.range_id
+            ))
+        })?;
     }
-    let parent_range_id = descriptor.parent_range_id.ok_or_else(|| {
-        OpenDbError::InvalidInput(format!(
-            "range {:?} requires a parent range",
-            descriptor.range_id
-        ))
-    })?;
-    if !descriptors.contains_key(&parent_range_id) {
+}
+
+fn validate_child_bounds(
+    descriptor: &RangeDescriptor,
+    descriptors: &BTreeMap<RangeId, RangeDescriptor>,
+) -> OpenDbResult<()> {
+    let parent_range_id = descriptor.parent_range_id.expect("parent graph validated");
+    let parent = descriptors
+        .get(&parent_range_id)
+        .expect("parent graph validated");
+
+    if descriptor.key_start.is_none() && parent.key_start.is_some() {
         return Err(OpenDbError::InvalidInput(format!(
-            "range {:?} references missing parent range {:?}",
+            "range {:?} has unbounded key_start outside parent {:?}",
+            descriptor.range_id, parent_range_id
+        )));
+    }
+    if let (Some(child_start), Some(parent_start)) = (&descriptor.key_start, &parent.key_start)
+        && child_start < parent_start
+    {
+        return Err(OpenDbError::InvalidInput(format!(
+            "range {:?} starts before parent {:?}",
+            descriptor.range_id, parent_range_id
+        )));
+    }
+    if descriptor.key_end.is_none() && parent.key_end.is_some() {
+        return Err(OpenDbError::InvalidInput(format!(
+            "range {:?} has unbounded key_end outside parent {:?}",
+            descriptor.range_id, parent_range_id
+        )));
+    }
+    if let (Some(child_end), Some(parent_end)) = (&descriptor.key_end, &parent.key_end)
+        && child_end > parent_end
+    {
+        return Err(OpenDbError::InvalidInput(format!(
+            "range {:?} ends after parent {:?}",
             descriptor.range_id, parent_range_id
         )));
     }
     Ok(())
+}
+
+fn validate_sibling_ranges(descriptors: &BTreeMap<RangeId, RangeDescriptor>) -> OpenDbResult<()> {
+    let mut siblings_by_parent: BTreeMap<RangeId, Vec<&RangeDescriptor>> = BTreeMap::new();
+    for descriptor in descriptors.values() {
+        if let Some(parent_range_id) = descriptor.parent_range_id {
+            siblings_by_parent
+                .entry(parent_range_id)
+                .or_default()
+                .push(descriptor);
+        }
+    }
+
+    for (parent_range_id, siblings) in siblings_by_parent {
+        let mut sorted = siblings;
+        sorted.sort_by(|left, right| {
+            left.key_start
+                .cmp(&right.key_start)
+                .then_with(|| left.key_end.cmp(&right.key_end))
+                .then_with(|| left.range_id.cmp(&right.range_id))
+        });
+        for pair in sorted.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            if sibling_ranges_overlap(previous, next) {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "range {:?} overlaps sibling {:?} under parent {:?}",
+                    previous.range_id, next.range_id, parent_range_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sibling_ranges_overlap(previous: &RangeDescriptor, next: &RangeDescriptor) -> bool {
+    match (&previous.key_end, &next.key_start) {
+        (Some(previous_end), Some(next_start)) => previous_end > next_start,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +265,53 @@ mod tests {
     use super::*;
     use crate::commit_stream::{CommitRecord, Mutation};
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
+
+    fn root_descriptor() -> RangeDescriptor {
+        RangeDescriptor {
+            range_id: RangeId::ROOT,
+            parent_range_id: None,
+            key_start: None,
+            key_end: None,
+            replica_node_ids: vec![0],
+        }
+    }
+
+    fn child_descriptor(
+        range_id: RangeId,
+        key_start: Option<&str>,
+        key_end: Option<&str>,
+    ) -> RangeDescriptor {
+        RangeDescriptor {
+            range_id,
+            parent_range_id: Some(RangeId::ROOT),
+            key_start: key_start.map(str::to_owned),
+            key_end: key_end.map(str::to_owned),
+            replica_node_ids: vec![0],
+        }
+    }
+
+    fn root_and_child_record(
+        range_id: RangeId,
+        key_start: Option<&str>,
+        key_end: Option<&str>,
+        replica_node_ids: Vec<u64>,
+    ) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(50),
+            LogicalTimestamp(15),
+            vec![
+                Mutation::PutRangeDescriptor {
+                    descriptor: root_descriptor(),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: RangeDescriptor {
+                        replica_node_ids,
+                        ..child_descriptor(range_id, key_start, key_end)
+                    },
+                },
+            ],
+        )
+    }
 
     #[test]
     fn range_catalog_rebuilds_descriptors_from_committed_metadata() {
@@ -279,5 +462,184 @@ mod tests {
                 "expected {expected_message:?}, got {error}"
             );
         }
+    }
+
+    #[test]
+    fn range_catalog_rejects_parent_cycle_in_one_commit() {
+        let record = CommitRecord::new(
+            TransactionId(51),
+            LogicalTimestamp(16),
+            vec![
+                Mutation::PutRangeDescriptor {
+                    descriptor: root_descriptor(),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId(3)),
+                        key_start: Some("a".to_owned()),
+                        key_end: Some("m".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId(2)),
+                        key_start: Some("m".to_owned()),
+                        key_end: Some("z".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                },
+            ],
+        );
+
+        let error = RangeCatalog::rebuild(&[record]).expect_err("reject cycle");
+
+        assert!(
+            error.to_string().contains("parent cycle"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn range_catalog_accepts_idempotent_descriptor_update() {
+        let first = root_and_child_record(RangeId(2), Some("a"), Some("m"), vec![0]);
+        let update = CommitRecord::new(
+            TransactionId(52),
+            LogicalTimestamp(17),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: child_descriptor(RangeId(2), Some("a"), Some("m")),
+            }],
+        );
+
+        let catalog = RangeCatalog::rebuild(&[first, update]).expect("accept idempotent update");
+
+        assert!(catalog.descriptor(RangeId(2)).is_some());
+    }
+
+    #[test]
+    fn range_catalog_rejects_conflicting_descriptor_update() {
+        let first = root_and_child_record(RangeId(2), Some("a"), Some("m"), vec![0]);
+        let update = CommitRecord::new(
+            TransactionId(52),
+            LogicalTimestamp(17),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: RangeDescriptor {
+                    range_id: RangeId(2),
+                    parent_range_id: Some(RangeId::ROOT),
+                    key_start: Some("a".to_owned()),
+                    key_end: Some("z".to_owned()),
+                    replica_node_ids: vec![0],
+                },
+            }],
+        );
+
+        let error = RangeCatalog::rebuild(&[first, update]).expect_err("reject update");
+
+        assert!(
+            error.to_string().contains("conflicting descriptor"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn range_catalog_rejects_overlapping_sibling_ranges() {
+        let record = CommitRecord::new(
+            TransactionId(53),
+            LogicalTimestamp(18),
+            vec![
+                Mutation::PutRangeDescriptor {
+                    descriptor: root_descriptor(),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: child_descriptor(RangeId(2), Some("a"), Some("m")),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: child_descriptor(RangeId(3), Some("k"), Some("z")),
+                },
+            ],
+        );
+
+        let error = RangeCatalog::rebuild(&[record]).expect_err("reject overlap");
+
+        assert!(
+            error.to_string().contains("overlap"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn range_catalog_rejects_unbounded_child_edge_inside_bounded_parent() {
+        let cases = vec![
+            (
+                RangeDescriptor {
+                    range_id: RangeId(3),
+                    parent_range_id: Some(RangeId(2)),
+                    key_start: None,
+                    key_end: Some("m".to_owned()),
+                    replica_node_ids: vec![0],
+                },
+                "unbounded key_start",
+            ),
+            (
+                RangeDescriptor {
+                    range_id: RangeId(3),
+                    parent_range_id: Some(RangeId(2)),
+                    key_start: Some("m".to_owned()),
+                    key_end: None,
+                    replica_node_ids: vec![0],
+                },
+                "unbounded key_end",
+            ),
+        ];
+
+        for (child, expected_message) in cases {
+            let record = CommitRecord::new(
+                TransactionId(54),
+                LogicalTimestamp(19),
+                vec![
+                    Mutation::PutRangeDescriptor {
+                        descriptor: root_descriptor(),
+                    },
+                    Mutation::PutRangeDescriptor {
+                        descriptor: child_descriptor(RangeId(2), Some("a"), Some("z")),
+                    },
+                    Mutation::PutRangeDescriptor { descriptor: child },
+                ],
+            );
+
+            let error =
+                RangeCatalog::rebuild(&[record]).expect_err("reject child edge outside parent");
+
+            assert!(
+                error.to_string().contains(expected_message),
+                "expected {expected_message:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_catalog_accepts_adjacent_siblings_and_gaps() {
+        let record = CommitRecord::new(
+            TransactionId(55),
+            LogicalTimestamp(20),
+            vec![
+                Mutation::PutRangeDescriptor {
+                    descriptor: root_descriptor(),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: child_descriptor(RangeId(2), None, Some("accounts/")),
+                },
+                Mutation::PutRangeDescriptor {
+                    descriptor: child_descriptor(RangeId(3), Some("orders/"), None),
+                },
+            ],
+        );
+
+        let catalog = RangeCatalog::rebuild(&[record]).expect("gaps are allowed in sprint 2");
+
+        assert!(catalog.descriptor(RangeId(2)).is_some());
+        assert!(catalog.descriptor(RangeId(3)).is_some());
     }
 }
