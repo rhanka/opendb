@@ -1,4 +1,5 @@
 mod crd;
+mod recovery;
 
 use std::time::Duration;
 
