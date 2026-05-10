@@ -158,11 +158,16 @@ fn observed_open_db_pod_from_kube(pod: &Pod) -> Option<crd::ObservedOpenDbPod> {
             .iter()
             .any(|condition| condition.type_ == "Ready" && condition.status == "True")
     });
+    let pod_ip = status
+        .and_then(|status| status.pod_ip.as_ref())
+        .map(|ip| ip.trim().to_string())
+        .filter(|ip| !ip.is_empty());
 
     Some(crd::ObservedOpenDbPod {
         name,
         node_running,
         leader_ready,
+        pod_ip,
     })
 }
 
@@ -198,6 +203,7 @@ mod tests {
                 name: "opendb-0".to_string(),
                 node_running: true,
                 leader_ready: true,
+                pod_ip: None,
             })
         );
     }
@@ -221,6 +227,7 @@ mod tests {
                 name: "opendb-1".to_string(),
                 node_running: true,
                 leader_ready: false,
+                pod_ip: None,
             })
         );
     }
@@ -231,6 +238,7 @@ mod tests {
             ready_replicas: 1,
             phase: "Ready".to_string(),
             leader_pod: Some("opendb-0".to_string()),
+            recovery: None,
             conditions: Vec::new(),
         });
 
@@ -245,6 +253,7 @@ mod tests {
             ready_replicas: 0,
             phase: "Pending".to_string(),
             leader_pod: None,
+            recovery: None,
             conditions: Vec::new(),
         });
         let status = patch["status"].as_object().expect("status object");
