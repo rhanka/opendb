@@ -4,18 +4,21 @@ use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Value {
     Int64(i64),
     Text(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ColumnType {
     Int64,
     Text,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: ColumnType,
@@ -41,12 +44,14 @@ impl ColumnDefinition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnValue {
     pub column: String,
     pub value: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Mutation {
     CreateTable {
         table: String,
@@ -66,6 +71,7 @@ pub enum Mutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitRecord {
     pub version: u16,
     pub tx_id: TransactionId,

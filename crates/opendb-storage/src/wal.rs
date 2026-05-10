@@ -640,6 +640,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wal_rejects_known_record_with_unknown_field() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","unexpected":true,"mutations":[]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject unknown field");
+
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_known_mutation_with_unknown_nested_field() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"PutRangeDescriptor":{"descriptor":{"range_id":1,"parent_range_id":null,"key_start":null,"key_end":null,"replica_node_ids":[0,1,2],"unexpected":true}}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject nested unknown field");
+
+        assert!(error.to_string().contains("record 0"));
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_unknown_mutation_variant() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"DropEverything":{}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject unknown mutation");
+
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_does_not_truncate_future_commit_version_frame() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let mut future_record = insert_record(1, 10, "1", "Ada");
+        future_record.version = CommitRecord::VERSION + 1;
+        let original = encode_frame(&future_record).expect("encode future version");
+        fs::write(&wal_path, &original)
+            .await
+            .expect("write future version wal");
+
+        let result = wal.append(&insert_record(2, 11, "2", "Grace")).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&wal_path)
+                .await
+                .expect("read wal after append error"),
+            original
+        );
+    }
+
+    #[tokio::test]
     async fn cloned_wal_instances_serialize_appends() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let wal = Wal::new(temp_dir.path().join("root-range.wal"));

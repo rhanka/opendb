@@ -11,6 +11,7 @@ pub enum ArchiveBackendKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveObjectPointer {
     pub backend: ArchiveBackendKind,
     pub bucket: String,
