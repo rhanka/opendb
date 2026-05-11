@@ -322,21 +322,27 @@ async function runRestartRecovery(options: SmokeOptions): Promise<void> {
 
   await waitForRecoveredCondition(options, leaderBefore);
 
-  await withPgwirePortForward(options, async () => {
-    const results = await pgwireExec(options, [`SELECT * FROM ${table} WHERE id = 1`]);
-    const select = results[0];
-    if (select === undefined || select.rows.length !== 1) {
-      throw new Error(
-        `restart-recovery: expected 1 row from ${table}, got ${JSON.stringify(results)}`
-      );
+  await poll(
+    `restart-recovery SELECT after leader switch from ${leaderBefore}`,
+    options.timeoutMs,
+    async () => {
+      await withPgwirePortForward(options, async () => {
+        const results = await pgwireExec(options, [`SELECT * FROM ${table} WHERE id = 1`]);
+        const select = results[0];
+        if (select === undefined || select.rows.length !== 1) {
+          throw new Error(
+            `expected 1 row from ${table}, got ${JSON.stringify(results)}`
+          );
+        }
+        const row = select.rows[0];
+        if (row === undefined || !row.includes(expectedName)) {
+          throw new Error(
+            `expected row to contain ${JSON.stringify(expectedName)}, got ${JSON.stringify(row)}`
+          );
+        }
+      });
     }
-    const row = select.rows[0];
-    if (row === undefined || !row.includes(expectedName)) {
-      throw new Error(
-        `restart-recovery: expected row to contain ${JSON.stringify(expectedName)}, got ${JSON.stringify(row)}`
-      );
-    }
-  });
+  );
 
   console.log("restart-recovery passed");
 }

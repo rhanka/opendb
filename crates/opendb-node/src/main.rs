@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::config::NodeConfig;
 use crate::database::{Database, DatabaseRecoveryStatus};
 use crate::health::HealthState;
+use opendb_common::OpenDbError;
 use opendb_consensus::root_range::{RootRange, RootRangePeerServer};
 
 #[tokio::main]
@@ -38,16 +39,26 @@ async fn main() -> anyhow::Result<()> {
         "starting opendb node"
     );
 
+    let recovery_refresh = maintain_recovery_status(
+        Arc::clone(&database),
+        health_state.clone(),
+        std::time::Duration::from_secs(1),
+    );
+
     if let Some(peer_server) = peer_server {
         let readiness = maintain_root_range_readiness(
             Arc::clone(&peer_server),
             config.node_id,
             health_state.clone(),
         );
+        let bootstrap_retry =
+            maintain_root_range_bootstrap(Arc::clone(&database), std::time::Duration::from_secs(1));
         tokio::try_join!(
             health::serve(config.health_addr, health_state),
             pgwire::serve(config.pgwire_addr, database),
             readiness,
+            recovery_refresh,
+            bootstrap_retry,
             async move {
                 peer_server
                     .serve(config.internal_addr)
@@ -59,10 +70,85 @@ async fn main() -> anyhow::Result<()> {
         tokio::try_join!(
             health::serve(config.health_addr, health_state),
             pgwire::serve(config.pgwire_addr, database),
+            recovery_refresh,
         )?;
     }
 
     Ok(())
+}
+
+/// Retries `ensure_bootstrapped` while the local WAL has no root descriptor.
+///
+/// In OpenRaft mode, the initial call at open time can race with leader
+/// election: every replica may see "NotLeader" before any leader is elected,
+/// and the result is swallowed. Without a retry, the cluster would stay Ready
+/// (kube sense) with no root descriptor in any WAL, and every user write would
+/// be rejected as "bootstrap missing". This loop keeps trying every replica;
+/// the leader eventually succeeds and the bootstrap is replicated to followers
+/// via Raft.
+async fn maintain_root_range_bootstrap(
+    database: Arc<Mutex<Database>>,
+    retry_interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(retry_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let snapshot = {
+            let db = database.lock().await;
+            db.compute_recovery_status().await
+        };
+        match snapshot {
+            Ok(status) if status.root_descriptor_known => return Ok(()),
+            Ok(_) => {
+                let db = database.lock().await;
+                match db.ensure_root_range_bootstrapped().await {
+                    Ok(()) => {
+                        tracing::info!("root range bootstrap committed via consensus");
+                    }
+                    Err(OpenDbError::NotLeader { .. }) => {
+                        // expected on followers; the leader will succeed and
+                        // we'll see root_descriptor_known become true on the
+                        // next tick once Raft replicates the bootstrap entry.
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "ensure_root_range_bootstrapped failed");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "compute_recovery_status during bootstrap retry failed"
+                );
+            }
+        }
+    }
+}
+
+async fn maintain_recovery_status(
+    database: Arc<Mutex<Database>>,
+    health_state: HealthState,
+    refresh_interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(refresh_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate tick; the open-time status is already published in main.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let snapshot = {
+            let db = database.lock().await;
+            db.compute_recovery_status().await
+        };
+        match snapshot {
+            Ok(status) => health_state.set_recovery_status(status.into()),
+            Err(error) => {
+                tracing::warn!(?error, "refresh recovery status failed");
+            }
+        }
+    }
 }
 
 async fn open_root_range(

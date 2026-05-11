@@ -65,6 +65,14 @@ impl Database {
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
+        // Records may arrive on this replica via OpenRaft replication
+        // (`apply_to_state_machine` → `root_range.apply_committed`) without
+        // ever going through `Database::execute`. Refresh the SQL engine from
+        // the canonical commit stream before every query so that the engine
+        // never lags behind the WAL — required for a follower that just won an
+        // election to be able to read records the previous leader committed.
+        self.refresh_engine_from_wal().await?;
+
         if statement.is_read() {
             self.ensure_leader_for_client_query().await?;
         }
@@ -84,6 +92,15 @@ impl Database {
         }
     }
 
+    /// Rebuilds the in-memory SQL engine from the canonical commit stream.
+    /// Used before every `execute` so that records committed via OpenRaft
+    /// replication (which bypass `Database::execute`) are observed on reads.
+    async fn refresh_engine_from_wal(&mut self) -> OpenDbResult<()> {
+        let records = self.root_range.replay().await?;
+        self.engine = SqlEngine::from_commits(records)?;
+        Ok(())
+    }
+
     async fn ensure_leader_for_client_query(&self) -> OpenDbResult<()> {
         match &self.peer_server {
             Some(peer_server) => peer_server.ensure_leader().await,
@@ -93,6 +110,23 @@ impl Database {
 
     pub fn recovery_status(&self) -> &DatabaseRecoveryStatus {
         &self.recovery_status
+    }
+
+    /// Re-reads the canonical commit stream and returns a fresh recovery status
+    /// snapshot. Use this instead of `recovery_status()` when you need the live
+    /// state: the cached value only reflects what the WAL looked like at open.
+    pub async fn compute_recovery_status(&self) -> OpenDbResult<DatabaseRecoveryStatus> {
+        let records = self.root_range.replay().await?;
+        Ok(DatabaseRecoveryStatus::from_replayed_records(&records))
+    }
+
+    /// Re-runs `ensure_bootstrapped` against the underlying root range.
+    /// Used by the bootstrap retry loop in `main`: the first attempt at
+    /// open time can race with OpenRaft leader election and silently return
+    /// `NotLeader`. The retry loop keeps trying until the WAL has the root
+    /// descriptor.
+    pub async fn ensure_root_range_bootstrapped(&self) -> OpenDbResult<()> {
+        self.root_range.ensure_bootstrapped().await
     }
 }
 
@@ -188,6 +222,37 @@ mod tests {
                 archive_metadata_replayed: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn compute_recovery_status_reflects_records_appended_after_open() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let mut database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open database");
+        let open_time_status = database.recovery_status().clone();
+        assert_eq!(open_time_status.last_replayed_tx_id, Some(0));
+
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY)").expect("parse"))
+            .await
+            .expect("create table");
+
+        let cached = database.recovery_status();
+        assert_eq!(
+            cached, &open_time_status,
+            "cached recovery_status() must keep the open-time snapshot"
+        );
+
+        let live = database
+            .compute_recovery_status()
+            .await
+            .expect("compute recovery status");
+        assert!(live.root_descriptor_known);
+        assert!(live.wal_replay_completed);
+        assert_eq!(live.last_replayed_tx_id, Some(1));
+        assert_eq!(live.last_replayed_ts, Some(1));
+        assert!(live.archive_metadata_replayed);
     }
 
     #[tokio::test]
