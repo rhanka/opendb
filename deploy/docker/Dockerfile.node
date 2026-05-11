@@ -1,0 +1,11 @@
+FROM debian:trixie-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/opendb-node /usr/local/bin/opendb-node
+
+EXPOSE 5432 8080
+
+ENTRYPOINT ["/usr/local/bin/opendb-node"]

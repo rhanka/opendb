@@ -1,5 +1,30 @@
 # k3s UAT
 
+## Provisioning a local cluster
+
+`npm run k3s:up` provisions a local k3d-backed k3s cluster end-to-end:
+
+1. installs the `k3d` binary into `~/.local/bin/k3d` if missing (override with `OPENDB_K3D_BIN` / `--k3d-bin`);
+2. runs `cargo build --release -p opendb-node -p opendb-operator` (skip with `--skip-build` / `OPENDB_K3D_SKIP_BUILD=1`);
+3. builds the `opendb-node:dev` and `opendb-operator:dev` images from `deploy/docker/Dockerfile.node` and `deploy/docker/Dockerfile.operator`;
+4. creates a k3d cluster named `opendb-dev` (override with `--cluster-name` / `OPENDB_K3D_CLUSTER`);
+5. imports both images into the cluster.
+
+After it finishes, `kubectl config current-context` reports `k3d-opendb-dev` and the smoke UAT below can be run.
+
+```bash
+npm run k3s:up                       # provision (cargo + docker + k3d)
+npm run smoke:k3s                    # default non-destructive UAT
+npm run smoke:k3s -- --with-restart-recovery   # opt-in restart recovery UAT
+npm run k3s:down                     # tear down the local cluster
+```
+
+The provisioning script never touches non-local kube contexts: it only creates and imports into the locally-managed k3d cluster. The smoke command continues to refuse non-`k3d-*` / `kind-*` / `k3s` / `minikube` / `docker-desktop` / `rancher-desktop` contexts unless `--allow-nonlocal-context` is also passed.
+
+Docker must be running before `npm run k3s:up`; the script exits with a clear error if the daemon is not reachable.
+
+## Smoke UAT
+
 The smoke UAT validates the milestone-1 Kubernetes path against a real k3s-compatible cluster:
 
 1. apply the generated `OpenDbCluster` CRD;
@@ -39,6 +64,10 @@ The operator-lite consumes each node's `/status` endpoint and reflects the recov
 - `Recovered` (True iff `Ready` is True and the three above are True)
 
 A condition is `Unknown` while any running pod is unreachable, `False` only when at least one running pod explicitly reports it as false. `OpenDbCluster.status.phase` semantics are unchanged: `phase=Ready` continues to report kube readiness, not database recovery.
+
+### Known limitation surfaced by `--with-restart-recovery`
+
+After a leader-pod delete, the existing recovery contract does not yet propagate the root bootstrap descriptor to a follower that comes back with an empty local WAL. Such a follower replays zero records, reports `rootDescriptorKnown=false`, and the cluster-wide `Recovered` condition stays `False` with reason `RootDescriptorMissing`. This is a true reflection of cluster state, not a Sprint 3 regression: Sprint 3 only adds visibility. The propagation gap will be addressed in a later sprint (split/merge metadata or Raft snapshot install). Use `npm run smoke:k3s -- --with-restart-recovery` as a diagnostic in the meantime — it will fail loudly on this open issue rather than masking it.
 
 The node `/status` endpoint reports root descriptor known, WAL replay completed, last replayed `tx_id` / `ts`, archive metadata replayed, and the latest known recovery artifact when any exists. Archive metadata is local replay metadata only in this sprint; recovery artifacts describe coverage but no upload or download happens.
 
