@@ -149,6 +149,10 @@ pub struct ClusterRecoveryAggregate {
     pub last_replayed_tx_id: Option<u64>,
     pub last_replayed_ts: Option<u64>,
     pub latest_recovery_artifact: Option<String>,
+    pub range_catalog_reporting_pods: i32,
+    pub range_catalog_active_counts: std::collections::BTreeSet<usize>,
+    pub range_catalog_last_split_tx_id: Option<u64>,
+    pub range_catalog_last_merge_tx_id: Option<u64>,
 }
 
 pub fn aggregate_cluster_recovery(
@@ -166,6 +170,10 @@ pub fn aggregate_cluster_recovery(
     let mut last_tx: Option<u64> = None;
     let mut last_ts: Option<u64> = None;
     let mut artifact_candidates: Vec<(String, String)> = Vec::new();
+    let mut range_catalog_reporting = 0;
+    let mut range_catalog_active_counts = std::collections::BTreeSet::new();
+    let mut range_catalog_last_split: Option<u64> = None;
+    let mut range_catalog_last_merge: Option<u64> = None;
 
     for pod in &running {
         match &pod.status {
@@ -184,6 +192,14 @@ pub fn aggregate_cluster_recovery(
                 if let Some(artifact) = &status.latest_recovery_artifact {
                     artifact_candidates.push((pod.name.clone(), artifact.clone()));
                 }
+                if let Some(catalog) = &status.range_catalog {
+                    range_catalog_reporting += 1;
+                    range_catalog_active_counts.insert(catalog.active_range_count);
+                    range_catalog_last_split =
+                        max_option(range_catalog_last_split, catalog.last_split_tx_id);
+                    range_catalog_last_merge =
+                        max_option(range_catalog_last_merge, catalog.last_merge_tx_id);
+                }
             }
             Err(_) => unreachable += 1,
         }
@@ -201,6 +217,10 @@ pub fn aggregate_cluster_recovery(
         last_replayed_tx_id: last_tx,
         last_replayed_ts: last_ts,
         latest_recovery_artifact,
+        range_catalog_reporting_pods: range_catalog_reporting,
+        range_catalog_active_counts,
+        range_catalog_last_split_tx_id: range_catalog_last_split,
+        range_catalog_last_merge_tx_id: range_catalog_last_merge,
     })
 }
 

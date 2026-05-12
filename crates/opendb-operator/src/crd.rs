@@ -21,6 +21,11 @@ const CONDITION_ROOT_DESCRIPTOR_KNOWN: &str = "RootDescriptorKnown";
 const CONDITION_WAL_REPLAY_COMPLETED: &str = "WalReplayCompleted";
 const CONDITION_ARCHIVE_METADATA_KNOWN: &str = "ArchiveMetadataKnown";
 const CONDITION_RECOVERED: &str = "Recovered";
+const CONDITION_RANGE_CATALOG_STABLE: &str = "RangeCatalogStable";
+
+const REASON_ACTIVE_RANGE_COUNT_AGREES: &str = "ActiveRangeCountAgrees";
+const REASON_DIVERGENT_CATALOG: &str = "DivergentCatalog";
+const REASON_RANGE_CATALOG_STATUS_UNKNOWN: &str = "StatusUnknown";
 
 #[derive(CustomResource, Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[kube(
@@ -66,6 +71,17 @@ pub struct OpenDbClusterRecoverySummary {
     pub last_replayed_tx_id: Option<u64>,
     pub last_replayed_ts: Option<u64>,
     pub latest_recovery_artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_catalog: Option<OpenDbClusterRangeCatalogSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDbClusterRangeCatalogSummary {
+    pub reporting_replicas: i32,
+    pub active_range_count: Option<usize>,
+    pub last_split_tx_id: Option<u64>,
+    pub last_merge_tx_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -217,6 +233,22 @@ pub fn compute_open_db_cluster_status_at(
         .iter()
         .any(|c| c.r#type == "Ready" && c.status == CONDITION_TRUE);
 
+    let range_catalog_summary = if aggregate.range_catalog_reporting_pods > 0 {
+        let active_count = if aggregate.range_catalog_active_counts.len() == 1 {
+            aggregate.range_catalog_active_counts.iter().next().copied()
+        } else {
+            None
+        };
+        Some(OpenDbClusterRangeCatalogSummary {
+            reporting_replicas: aggregate.range_catalog_reporting_pods,
+            active_range_count: active_count,
+            last_split_tx_id: aggregate.range_catalog_last_split_tx_id,
+            last_merge_tx_id: aggregate.range_catalog_last_merge_tx_id,
+        })
+    } else {
+        None
+    };
+
     status.recovery = Some(OpenDbClusterRecoverySummary {
         root_descriptor_known_replicas: aggregate.root_descriptor_known_pods,
         wal_replay_completed_replicas: aggregate.wal_replay_completed_pods,
@@ -225,6 +257,7 @@ pub fn compute_open_db_cluster_status_at(
         last_replayed_tx_id: aggregate.last_replayed_tx_id,
         last_replayed_ts: aggregate.last_replayed_ts,
         latest_recovery_artifact: aggregate.latest_recovery_artifact.clone(),
+        range_catalog: range_catalog_summary,
     });
 
     let triple = recovery_condition_triple(&aggregate);
@@ -246,8 +279,67 @@ pub fn compute_open_db_cluster_status_at(
     status
         .conditions
         .push(recovered_condition(&triple, ready_condition_true, now));
+    status
+        .conditions
+        .push(range_catalog_condition(&aggregate, now));
 
     status
+}
+
+fn range_catalog_condition(
+    aggregate: &ClusterRecoveryAggregate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OpenDbClusterCondition {
+    let unreachable = aggregate.unreachable_pods;
+    if aggregate.range_catalog_reporting_pods == 0 || unreachable > 0 {
+        return OpenDbClusterCondition {
+            r#type: CONDITION_RANGE_CATALOG_STABLE.to_string(),
+            status: CONDITION_UNKNOWN.to_string(),
+            reason: REASON_RANGE_CATALOG_STATUS_UNKNOWN.to_string(),
+            message: if aggregate.range_catalog_reporting_pods == 0 {
+                "no pod reported a range catalog snapshot".to_string()
+            } else {
+                format!("{unreachable} replica(s) unreachable")
+            },
+            last_transition_time: Some(now),
+        };
+    }
+    if aggregate.range_catalog_active_counts.len() == 1 {
+        let count = aggregate
+            .range_catalog_active_counts
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(0);
+        let split = aggregate
+            .range_catalog_last_split_tx_id
+            .map(|tx| tx.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let merge = aggregate
+            .range_catalog_last_merge_tx_id
+            .map(|tx| tx.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        OpenDbClusterCondition {
+            r#type: CONDITION_RANGE_CATALOG_STABLE.to_string(),
+            status: CONDITION_TRUE.to_string(),
+            reason: REASON_ACTIVE_RANGE_COUNT_AGREES.to_string(),
+            message: format!("active ranges={count} (lastSplit txId={split}, lastMerge txId={merge})"),
+            last_transition_time: Some(now),
+        }
+    } else {
+        let counts: Vec<String> = aggregate
+            .range_catalog_active_counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect();
+        OpenDbClusterCondition {
+            r#type: CONDITION_RANGE_CATALOG_STABLE.to_string(),
+            status: CONDITION_FALSE.to_string(),
+            reason: REASON_DIVERGENT_CATALOG.to_string(),
+            message: format!("active_range_count diverges across pods: [{}]", counts.join(",")),
+            last_transition_time: Some(now),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -659,6 +751,38 @@ mod tests {
                 last_replayed_tx_id: Some(7),
                 last_replayed_ts: Some(7),
                 latest_recovery_artifact: None,
+                range_catalog_reporting_pods: 0,
+                range_catalog_active_counts: std::collections::BTreeSet::new(),
+                range_catalog_last_split_tx_id: None,
+                range_catalog_last_merge_tx_id: None,
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn aggregate_with_catalog(
+            running: i32,
+            root: i32,
+            wal: i32,
+            archive: i32,
+            unreachable: i32,
+            reporting: i32,
+            active_counts: &[usize],
+            last_split: Option<u64>,
+            last_merge: Option<u64>,
+        ) -> ClusterRecoveryAggregate {
+            ClusterRecoveryAggregate {
+                observed_running_pods: running,
+                root_descriptor_known_pods: root,
+                wal_replay_completed_pods: wal,
+                archive_metadata_replayed_pods: archive,
+                unreachable_pods: unreachable,
+                last_replayed_tx_id: Some(7),
+                last_replayed_ts: Some(7),
+                latest_recovery_artifact: None,
+                range_catalog_reporting_pods: reporting,
+                range_catalog_active_counts: active_counts.iter().copied().collect(),
+                range_catalog_last_split_tx_id: last_split,
+                range_catalog_last_merge_tx_id: last_merge,
             }
         }
 
@@ -763,6 +887,95 @@ mod tests {
             assert_eq!(recovery["archiveMetadataReplayedReplicas"], 3);
             assert_eq!(recovery["unreachableReplicas"], 0);
             assert_eq!(recovery["lastReplayedTxId"], 7);
+        }
+
+        #[test]
+        fn range_catalog_condition_true_when_all_pods_agree() {
+            let status = compute_open_db_cluster_status_with_recovery(
+                snapshot(3, Some("opendb-0")),
+                Some(aggregate_with_catalog(
+                    3,
+                    3,
+                    3,
+                    3,
+                    0,
+                    3,
+                    &[2],
+                    Some(5),
+                    None,
+                )),
+            );
+
+            let by_type = condition_map(&status.conditions);
+            assert_eq!(by_type["RangeCatalogStable"].status, "True");
+            assert_eq!(by_type["RangeCatalogStable"].reason, "ActiveRangeCountAgrees");
+            assert!(by_type["RangeCatalogStable"]
+                .message
+                .contains("active ranges=2"));
+            assert!(by_type["RangeCatalogStable"]
+                .message
+                .contains("lastSplit txId=5"));
+            let json = serde_json::to_value(&status).expect("serialize");
+            let summary = &json["recovery"]["rangeCatalog"];
+            assert_eq!(summary["reportingReplicas"], 3);
+            assert_eq!(summary["activeRangeCount"], 2);
+            assert_eq!(summary["lastSplitTxId"], 5);
+            assert!(summary["lastMergeTxId"].is_null());
+        }
+
+        #[test]
+        fn range_catalog_condition_unknown_when_any_pod_unreachable() {
+            let status = compute_open_db_cluster_status_with_recovery(
+                snapshot(3, Some("opendb-0")),
+                Some(aggregate_with_catalog(
+                    3, 3, 3, 3, 1, 2, &[2], None, None,
+                )),
+            );
+
+            let by_type = condition_map(&status.conditions);
+            assert_eq!(by_type["RangeCatalogStable"].status, "Unknown");
+            assert_eq!(by_type["RangeCatalogStable"].reason, "StatusUnknown");
+        }
+
+        #[test]
+        fn range_catalog_condition_false_on_divergent_active_count() {
+            let status = compute_open_db_cluster_status_with_recovery(
+                snapshot(3, Some("opendb-0")),
+                Some(aggregate_with_catalog(
+                    3,
+                    3,
+                    3,
+                    3,
+                    0,
+                    3,
+                    &[2, 3],
+                    Some(5),
+                    None,
+                )),
+            );
+
+            let by_type = condition_map(&status.conditions);
+            assert_eq!(by_type["RangeCatalogStable"].status, "False");
+            assert_eq!(by_type["RangeCatalogStable"].reason, "DivergentCatalog");
+            assert!(by_type["RangeCatalogStable"]
+                .message
+                .contains("active_range_count diverges"));
+            let json = serde_json::to_value(&status).expect("serialize");
+            assert!(json["recovery"]["rangeCatalog"]["activeRangeCount"].is_null());
+        }
+
+        #[test]
+        fn range_catalog_condition_unknown_when_no_pod_reports_block() {
+            let status = compute_open_db_cluster_status_with_recovery(
+                snapshot(3, Some("opendb-0")),
+                Some(aggregate(3, 3, 3, 3, 0)),
+            );
+
+            let by_type = condition_map(&status.conditions);
+            assert_eq!(by_type["RangeCatalogStable"].status, "Unknown");
+            assert_eq!(by_type["RangeCatalogStable"].reason, "StatusUnknown");
+            let json = serde_json::to_value(&status).expect("serialize");
+            assert!(json["recovery"]["rangeCatalog"].is_null());
         }
     }
 }
