@@ -1,8 +1,11 @@
 use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
 use opendb_storage::{
-    archive_manifest::ArchiveManifest, commit_stream::CommitRecord, range_catalog::RangeCatalog,
-    row_projection::RowProjection, wal::Wal,
+    archive_manifest::ArchiveManifest,
+    commit_stream::{CommitRecord, Mutation},
+    range_catalog::RangeCatalog,
+    row_projection::RowProjection,
+    wal::Wal,
 };
 use openraft::BasicNode;
 use std::collections::BTreeMap;
@@ -291,6 +294,7 @@ impl RootRange {
                 "root range WAL failed archive manifest replay validation: {error}"
             ))
         })?;
+        validate_record_routes(&records)?;
         Ok(records)
     }
 
@@ -302,16 +306,11 @@ impl RootRange {
                 record.version
             )));
         }
-        if record.range_id != self.range_id {
-            return Err(OpenDbError::InvalidInput(format!(
-                "root range requires record range_id {:?}, got {:?}",
-                self.range_id, record.range_id
-            )));
-        }
         Ok(())
     }
 
     async fn validate_semantic_append(&self, record: &CommitRecord) -> OpenDbResult<()> {
+        validate_metadata_record_range(record).map_err(sequence_validation_error_for_append)?;
         let mut records = self.replay().await?;
         if records.is_empty() && !record.is_root_bootstrap() {
             return Err(OpenDbError::InvalidInput(
@@ -324,6 +323,7 @@ impl RootRange {
         RowProjection::rebuild(&records)?;
         RangeCatalog::rebuild(&records)?;
         ArchiveManifest::rebuild(&records)?;
+        validate_record_routes(&records).map_err(sequence_validation_error_for_append)?;
         Ok(())
     }
 
@@ -333,12 +333,6 @@ impl RootRange {
                 "root range WAL record {index} has commit version {}, expected {}",
                 record.version,
                 CommitRecord::VERSION
-            )));
-        }
-        if record.range_id != self.range_id {
-            return Err(OpenDbError::Storage(format!(
-                "root range WAL record {index} has range_id {:?}, expected {:?}",
-                record.range_id, self.range_id
             )));
         }
         Ok(())
@@ -422,6 +416,62 @@ impl RootRange {
     }
 }
 
+fn validate_record_routes(records: &[CommitRecord]) -> OpenDbResult<()> {
+    let mut catalog = RangeCatalog::default();
+    for record in records {
+        validate_metadata_record_range(record)?;
+        catalog.apply(record)?;
+        for mutation in &record.mutations {
+            if let Mutation::InsertRow { table, key, .. } = mutation {
+                let route_key = format!("{table}/{key}");
+                let expected = catalog
+                    .route_key(&route_key)
+                    .map(|descriptor| descriptor.range_id)
+                    .ok_or_else(|| {
+                        OpenDbError::Storage(format!("no range route for key {route_key}"))
+                    })?;
+                if record.range_id != expected {
+                    return Err(OpenDbError::Storage(format!(
+                        "row route key {route_key} expected range {:?}, got {:?}",
+                        expected, record.range_id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_record_range(record: &CommitRecord) -> OpenDbResult<()> {
+    let has_metadata = record.mutations.iter().any(|mutation| {
+        matches!(
+            mutation,
+            Mutation::CreateTable { .. }
+                | Mutation::PutRangeDescriptor { .. }
+                | Mutation::SplitRange { .. }
+                | Mutation::MergeRanges { .. }
+                | Mutation::PutArchiveObjectPointer { .. }
+                | Mutation::PutRecoveryArtifactPointer { .. }
+        )
+    });
+    let has_row = record
+        .mutations
+        .iter()
+        .any(|mutation| matches!(mutation, Mutation::InsertRow { .. }));
+    if has_metadata && has_row {
+        return Err(OpenDbError::Storage(
+            "commit record must not mix metadata and row mutations".to_string(),
+        ));
+    }
+    if has_metadata && record.range_id != opendb_common::RangeId::ROOT {
+        return Err(OpenDbError::Storage(format!(
+            "metadata mutation must use root range, got {:?}",
+            record.range_id
+        )));
+    }
+    Ok(())
+}
+
 fn sequence_validation_error_for_append(error: OpenDbError) -> OpenDbError {
     match error {
         OpenDbError::Storage(message) => OpenDbError::InvalidInput(message),
@@ -496,7 +546,9 @@ mod tests {
         ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
         RecoveryArtifactPointer,
     };
-    use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Mutation};
+    use opendb_storage::commit_stream::{
+        ColumnDefinition, ColumnType, ColumnValue, Mutation, RangeSplit, Value,
+    };
     use opendb_storage::range_catalog::RangeDescriptor;
     use opendb_storage::wal::Wal;
     use std::time::Duration;
@@ -983,32 +1035,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_rejects_forged_non_root_records_in_root_wal() {
+    async fn replay_accepts_known_routed_non_root_row_record() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let mut forged_record = CommitRecord::new(
-            TransactionId(9),
-            LogicalTimestamp(13),
-            vec![Mutation::CreateTable {
-                table: "payments".to_string(),
-                columns: id_columns(),
-            }],
-        );
-        forged_record.range_id = RangeId(100);
         let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
-        wal.append(&forged_record)
+        wal.append(&CommitRecord::root_bootstrap(vec![0]))
             .await
-            .expect("forge root wal record");
+            .expect("append bootstrap");
+        wal.append(&CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_owned(),
+                columns: account_columns(),
+            }],
+        ))
+        .await
+        .expect("append create");
+        wal.append(&CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(2),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "orders/".to_owned(),
+                    left: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: Some("orders/".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                    right: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: Some("orders/".to_owned()),
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
+                },
+            }],
+        ))
+        .await
+        .expect("append split");
+        wal.append(&CommitRecord::new_for_range(
+            RangeId(2),
+            TransactionId(3),
+            LogicalTimestamp(3),
+            CommitRecord::BOOTSTRAP_ACTOR,
+            vec![Mutation::InsertRow {
+                table: "accounts".to_owned(),
+                key: "1".to_owned(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Int64(1),
+                    },
+                    ColumnValue {
+                        column: "name".to_owned(),
+                        value: Value::Text("Ada".to_owned()),
+                    },
+                ],
+            }],
+        ))
+        .await
+        .expect("append routed insert");
 
-        let root_range = RootRange::new(temp_dir.path());
-        let result = root_range.replay().await;
+        let records = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect("replay routed WAL");
 
-        assert!(matches!(
-            result,
-            Err(OpenDbError::Storage(message))
-                if message.contains("root range WAL")
-                    && message.contains("record 0")
-                    && message.contains("100")
-        ));
+        assert_eq!(records.last().expect("last").range_id, RangeId(2));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_unknown_non_root_row_range() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        wal.append(&CommitRecord::root_bootstrap(vec![0]))
+            .await
+            .expect("append bootstrap");
+        wal.append(&CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::CreateTable {
+                table: "accounts".to_owned(),
+                columns: vec![ColumnDefinition::primary_key("id", ColumnType::Int64)],
+            }],
+        ))
+        .await
+        .expect("append create");
+        wal.append(&CommitRecord::new_for_range(
+            RangeId(404),
+            TransactionId(2),
+            LogicalTimestamp(2),
+            CommitRecord::BOOTSTRAP_ACTOR,
+            vec![Mutation::InsertRow {
+                table: "accounts".to_owned(),
+                key: "1".to_owned(),
+                values: vec![ColumnValue {
+                    column: "id".to_owned(),
+                    value: Value::Int64(1),
+                }],
+            }],
+        ))
+        .await
+        .expect("append forged insert");
+
+        let error = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect_err("reject unknown range");
+
+        assert!(error.to_string().contains("range"));
     }
 
     #[tokio::test]
