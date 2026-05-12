@@ -85,9 +85,14 @@ async fn execute_simple_query(
 
     match result {
         Ok(QueryResult::Command { tag }) => write_command_complete(stream, &tag).await?,
-        Ok(QueryResult::Rows { columns, rows }) => {
+        Ok(QueryResult::Rows {
+            columns,
+            column_types,
+            rows,
+        }) => {
             let row_count = rows.len();
-            write_row_description(stream, &columns).await?;
+            let resolved_types = resolve_row_description_types(&columns, &column_types, &rows);
+            write_row_description(stream, &columns, &resolved_types).await?;
             for row in rows {
                 write_data_row(stream, &row).await?;
             }
@@ -187,24 +192,68 @@ async fn write_command_complete(stream: &mut TcpStream, tag: &str) -> anyhow::Re
     write_message(stream, b'C', &payload).await
 }
 
-async fn write_row_description(stream: &mut TcpStream, columns: &[String]) -> anyhow::Result<()> {
+async fn write_row_description(
+    stream: &mut TcpStream,
+    columns: &[String],
+    column_types: &[opendb_storage::commit_stream::ColumnType],
+) -> anyhow::Result<()> {
     let mut payload = Vec::new();
     payload.extend_from_slice(
         &u16::try_from(columns.len())
             .context("too many columns")?
             .to_be_bytes(),
     );
-    for column in columns {
+    for (index, column) in columns.iter().enumerate() {
         payload.extend_from_slice(column.as_bytes());
         payload.push(0);
         payload.extend_from_slice(&0_i32.to_be_bytes());
         payload.extend_from_slice(&0_i16.to_be_bytes());
-        payload.extend_from_slice(&25_i32.to_be_bytes());
+        let oid = column_types
+            .get(index)
+            .map(oid_for_column_type)
+            .unwrap_or(25);
+        payload.extend_from_slice(&oid.to_be_bytes());
         payload.extend_from_slice(&(-1_i16).to_be_bytes());
         payload.extend_from_slice(&(-1_i32).to_be_bytes());
         payload.extend_from_slice(&0_i16.to_be_bytes());
     }
     write_message(stream, b'T', &payload).await
+}
+
+fn oid_for_column_type(column_type: &opendb_storage::commit_stream::ColumnType) -> i32 {
+    use opendb_storage::commit_stream::ColumnType;
+    match column_type {
+        ColumnType::Int64 => 20,       // INT8
+        ColumnType::Text => 25,        // TEXT
+        ColumnType::Bool => 16,        // BOOL
+        ColumnType::Float64 => 701,    // FLOAT8
+        ColumnType::Timestamp => 1114, // TIMESTAMP
+    }
+}
+
+fn resolve_row_description_types(
+    columns: &[String],
+    column_types: &[opendb_storage::commit_stream::ColumnType],
+    rows: &[Vec<Value>],
+) -> Vec<opendb_storage::commit_stream::ColumnType> {
+    use opendb_storage::commit_stream::ColumnType;
+    if column_types.len() == columns.len() {
+        return column_types.to_vec();
+    }
+    let mut resolved = vec![ColumnType::Text; columns.len()];
+    if let Some(first_row) = rows.first() {
+        for (index, value) in first_row.iter().enumerate().take(resolved.len()) {
+            resolved[index] = match value {
+                Value::Int64(_) => ColumnType::Int64,
+                Value::Text(_) => ColumnType::Text,
+                Value::Bool(_) => ColumnType::Bool,
+                Value::Float64(_) => ColumnType::Float64,
+                Value::Timestamp(_) => ColumnType::Timestamp,
+                Value::Null => ColumnType::Text,
+            };
+        }
+    }
+    resolved
 }
 
 async fn write_data_row(stream: &mut TcpStream, row: &[Value]) -> anyhow::Result<()> {

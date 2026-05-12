@@ -1,4 +1,12 @@
-use opendb_storage::commit_stream::{ColumnDefinition, Value};
+use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Value};
+
+// `column_types` is currently always emitted as `Vec::new()` by the engine;
+// pgwire derives the row-description OIDs from the first row instead. This
+// will become non-empty in a later sprint when the SQL layer carries column
+// types end to end.
+//
+// Keeping the field on `QueryResult::Rows` (not behind an `Option`) avoids
+// churn on every test that pattern-matches the variant.
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Predicate {
@@ -36,6 +44,8 @@ pub enum QueryResult {
     },
     Rows {
         columns: Vec<String>,
+        #[doc = "Per-column SQL type. Empty vector means \"unknown\" (legacy callers)."]
+        column_types: Vec<ColumnType>,
         rows: Vec<Vec<Value>>,
     },
 }

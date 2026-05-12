@@ -480,6 +480,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(1), Value::Text("Ada".to_owned())]],
             }
         );

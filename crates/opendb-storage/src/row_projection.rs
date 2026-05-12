@@ -16,6 +16,13 @@ impl Table {
             .collect()
     }
 
+    pub fn column_types(&self) -> Vec<ColumnType> {
+        self.columns
+            .iter()
+            .map(|column| column.data_type.clone())
+            .collect()
+    }
+
     pub fn primary_key_index(&self) -> Option<usize> {
         self.columns.iter().position(|column| column.primary_key)
     }

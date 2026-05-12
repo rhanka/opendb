@@ -209,6 +209,7 @@ impl SqlEngine {
         Ok((
             QueryResult::Rows {
                 columns: column_names,
+                column_types: Vec::new(),
                 rows,
             },
             route,
@@ -440,6 +441,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(1), Value::Text("Ada".to_owned())]],
             }
         );
@@ -465,6 +467,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(2), Value::Text("Grace".to_owned())]],
             }
         );
@@ -474,6 +477,7 @@ mod tests {
                 .expect("select missing"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: Vec::new(),
             }
         );
@@ -513,6 +517,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["token".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![
                     Value::Text("a=b".to_owned()),
                     Value::Text("Ada".to_owned())
@@ -537,6 +542,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![
                     Value::Int64(1),
                     Value::Text("Ada, Lovelace".to_owned())
@@ -589,6 +595,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![
                     vec![Value::Int64(1), Value::Text("Ada".to_owned())],
                     vec![Value::Int64(2), Value::Text("Grace".to_owned())],
@@ -619,6 +626,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(1), Value::Text("Ada".to_owned())]],
             }
         );
@@ -658,6 +666,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: Vec::new(),
             }
         );
@@ -681,6 +690,7 @@ mod tests {
                 .expect("select"),
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(1), Value::Text("Ada".to_owned())]],
             }
         );
@@ -835,6 +845,7 @@ mod tests {
             result,
             QueryResult::Rows {
                 columns: vec!["id".to_owned(), "status".to_owned()],
+                column_types: vec![],
                 rows: vec![vec![Value::Int64(1), Value::Text("completed".to_owned())]],
             }
         );
