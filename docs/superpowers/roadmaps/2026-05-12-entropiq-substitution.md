@@ -62,16 +62,23 @@ one sprint = 2-5 active days of paired work).
 | 10 | `SELECT` with `INNER`/`LEFT JOIN`, `WHERE` composé, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET` | 5-7 d  | 28 join sites and 4 groupBy use cases pass                    |
 | 11 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, snapshot isolation)         | 5-7 d  | 15 transaction sites compatible                               |
 | 12 | pgwire prepared-statement protocol + parameter binding + Drizzle compat | 4-5 d  | Drizzle client connects and runs unmodified queries           |
+| 12.5 | Benchmarks: OpenDB vs PostgreSQL (`tools/bench-pg.ts` ts-only via `pg`) — INSERT/SELECT throughput, JSONB roundtrip, named INSERT, transaction overhead. Numbers committed under `docs/bench/` | 3-4 d  | first quantitative comparison and regression baseline         |
 | 13 | POC entropiq read-only on 1-5 tables (e.g. `folders`, `initiatives`)   | 2-3 d  | first end-to-end proof against entropiq's HTTP API            |
 | 14 | POC élargi: 10-20 tables, writes + simple joins, no complex tx         | 3-5 d  | covers majority of entropiq's hot paths                       |
-| 15 | Substitution complète: full migrations replay + UAT entropiq full + perf | 5-7 d  | drop-in DATABASE_URL swap                                     |
+| 15 | Substitution complète: full migrations replay + UAT entropiq full + perf-vs-PG report | 5-7 d  | drop-in DATABASE_URL swap with documented perf delta          |
+
+The bench harness lands in Sprint 12.5 but is **incrementally seeded from
+Sprint 7 onwards**: each sprint that introduces a SQL feature also adds a
+matching micro-benchmark fixture under `tools/bench/`, so by the time
+Sprint 12.5 runs the full comparison the input set is already non-trivial.
 
 Totals (in active workdays):
 
 - POC partiel (Sprint 9 done): **~15-20 d** ≈ 3 weeks of active work.
 - POC élargi (Sprint 11 done): **~25-30 d** ≈ 5-6 weeks.
-- Substitution complète et stable (Sprint 15 done): **~35-50 d**
-  ≈ 7-10 weeks.
+- Bench baseline (Sprint 12.5 done): **~32-39 d** ≈ 6-8 weeks.
+- Substitution complète et stable (Sprint 15 done): **~42-55 d**
+  ≈ 8-11 weeks.
 
 In calendar weeks at a 4-6 active-hours-per-day cadence with the user,
 those numbers translate to roughly:
