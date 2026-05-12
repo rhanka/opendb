@@ -4,8 +4,41 @@ use opendb_sql::{
     ast::{QueryResult, Statement},
     executor::{PreparedQuery, RouteIntent, SqlEngine},
 };
-use opendb_storage::{commit_stream::CommitRecord, range_catalog::RangeCatalog};
+use opendb_storage::{
+    commit_stream::{CommitRecord, Mutation, RangeMerge, RangeSplit},
+    range_catalog::{RangeCatalog, RangeDescriptor},
+};
 use std::sync::Arc;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposedRangeSplit {
+    pub source_range_id: RangeId,
+    pub split_key: String,
+    pub left_range_id: Option<RangeId>,
+    pub right_range_id: Option<RangeId>,
+    pub left_replica_node_ids: Option<Vec<u64>>,
+    pub right_replica_node_ids: Option<Vec<u64>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeSplitProposalResult {
+    pub left_range_id: RangeId,
+    pub right_range_id: RangeId,
+    pub tx_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposedRangeMerge {
+    pub source_range_ids: Vec<RangeId>,
+    pub merged_range_id: Option<RangeId>,
+    pub replica_node_ids: Option<Vec<u64>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeMergeProposalResult {
+    pub merged_range_id: RangeId,
+    pub tx_id: u64,
+}
 
 #[derive(Debug)]
 pub struct Database {
@@ -103,6 +136,199 @@ impl Database {
                 Ok(QueryResult::Command { tag })
             }
         }
+    }
+
+    pub async fn propose_range_split(
+        &mut self,
+        request: ProposedRangeSplit,
+    ) -> OpenDbResult<RangeSplitProposalResult> {
+        self.refresh_engine_from_wal().await?;
+        self.ensure_leader_for_client_query().await?;
+
+        let source = self
+            .range_catalog
+            .descriptor(request.source_range_id)
+            .cloned()
+            .ok_or_else(|| {
+                OpenDbError::InvalidInput(format!(
+                    "split source range {:?} does not exist",
+                    request.source_range_id
+                ))
+            })?;
+        if !self
+            .range_catalog
+            .active_range_ids()
+            .contains(&request.source_range_id)
+        {
+            return Err(OpenDbError::InvalidInput(format!(
+                "split source range {:?} is not active",
+                request.source_range_id
+            )));
+        }
+
+        let left_range_id = request
+            .left_range_id
+            .unwrap_or_else(|| self.range_catalog.allocate_range_id());
+        let right_range_id = request.right_range_id.unwrap_or_else(|| {
+            let next_after_left = RangeId(left_range_id.0 + 1);
+            let allocated = self.range_catalog.allocate_range_id();
+            if allocated == left_range_id {
+                next_after_left
+            } else {
+                allocated.max(next_after_left)
+            }
+        });
+        if left_range_id == right_range_id {
+            return Err(OpenDbError::InvalidInput(format!(
+                "split children for range {:?} must use distinct new range ids",
+                request.source_range_id
+            )));
+        }
+        let split_key_bound = Some(request.split_key.clone());
+        let left_replicas = request
+            .left_replica_node_ids
+            .unwrap_or_else(|| source.replica_node_ids.clone());
+        let right_replicas = request
+            .right_replica_node_ids
+            .unwrap_or_else(|| source.replica_node_ids.clone());
+
+        let split = RangeSplit {
+            source_range_id: request.source_range_id,
+            split_key: request.split_key,
+            left: RangeDescriptor {
+                range_id: left_range_id,
+                parent_range_id: Some(request.source_range_id),
+                key_start: source.key_start.clone(),
+                key_end: split_key_bound.clone(),
+                replica_node_ids: left_replicas,
+            },
+            right: RangeDescriptor {
+                range_id: right_range_id,
+                parent_range_id: Some(request.source_range_id),
+                key_start: split_key_bound,
+                key_end: source.key_end.clone(),
+                replica_node_ids: right_replicas,
+            },
+        };
+
+        let record = self
+            .engine
+            .build_next_record(vec![Mutation::SplitRange { split }]);
+        let tx_id = record.tx_id.0;
+        self.root_range
+            .submit(RootRangeCommand {
+                record: record.clone(),
+            })
+            .await?;
+        self.engine.apply_committed(record)?;
+        self.refresh_engine_from_wal().await?;
+
+        Ok(RangeSplitProposalResult {
+            left_range_id,
+            right_range_id,
+            tx_id,
+        })
+    }
+
+    pub async fn propose_range_merge(
+        &mut self,
+        request: ProposedRangeMerge,
+    ) -> OpenDbResult<RangeMergeProposalResult> {
+        self.refresh_engine_from_wal().await?;
+        self.ensure_leader_for_client_query().await?;
+
+        if request.source_range_ids.len() < 2 {
+            return Err(OpenDbError::InvalidInput(
+                "range merge requires at least two source ranges".to_string(),
+            ));
+        }
+        let mut source_descriptors = Vec::with_capacity(request.source_range_ids.len());
+        for source_range_id in &request.source_range_ids {
+            let descriptor = self
+                .range_catalog
+                .descriptor(*source_range_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!(
+                        "merge source range {:?} does not exist",
+                        source_range_id
+                    ))
+                })?;
+            if !self
+                .range_catalog
+                .active_range_ids()
+                .contains(source_range_id)
+            {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "merge source range {:?} is not active",
+                    source_range_id
+                )));
+            }
+            source_descriptors.push(descriptor);
+        }
+
+        let shared_parent = source_descriptors
+            .first()
+            .and_then(|descriptor| descriptor.parent_range_id)
+            .ok_or_else(|| {
+                OpenDbError::InvalidInput("range merge sources require a parent range".to_string())
+            })?;
+
+        let merged_range_id = request
+            .merged_range_id
+            .unwrap_or_else(|| self.range_catalog.allocate_range_id());
+
+        let mut ordered = source_descriptors.clone();
+        ordered.sort_by(|left, right| {
+            left.key_start
+                .cmp(&right.key_start)
+                .then_with(|| left.key_end.cmp(&right.key_end))
+                .then_with(|| left.range_id.cmp(&right.range_id))
+        });
+        let outer_start = ordered
+            .first()
+            .expect("non-empty sources")
+            .key_start
+            .clone();
+        let outer_end = ordered.last().expect("non-empty sources").key_end.clone();
+
+        let replica_node_ids = request.replica_node_ids.unwrap_or_else(|| {
+            let mut union: Vec<u64> = source_descriptors
+                .iter()
+                .flat_map(|descriptor| descriptor.replica_node_ids.clone())
+                .collect();
+            union.sort_unstable();
+            union.dedup();
+            union
+        });
+
+        let merge = RangeMerge {
+            source_range_ids: request.source_range_ids.clone(),
+            merged: RangeDescriptor {
+                range_id: merged_range_id,
+                parent_range_id: Some(shared_parent),
+                key_start: outer_start,
+                key_end: outer_end,
+                replica_node_ids,
+            },
+        };
+
+        let record = self
+            .engine
+            .build_next_record(vec![Mutation::MergeRanges { merge }]);
+        let tx_id = record.tx_id.0;
+        self.root_range
+            .submit(RootRangeCommand {
+                record: record.clone(),
+            })
+            .await?;
+        self.engine.apply_committed(record)?;
+        self.refresh_engine_from_wal().await?;
+
+        Ok(RangeMergeProposalResult {
+            merged_range_id,
+            tx_id,
+        })
     }
 
     fn resolve_route(&self, route: &RouteIntent) -> OpenDbResult<RangeId> {
@@ -425,6 +651,125 @@ mod tests {
 
         let records = local_root_range.replay().await.expect("replay");
         assert_eq!(records.last().expect("last record").range_id, RangeId(2));
+    }
+
+    #[tokio::test]
+    async fn propose_range_split_assigns_ids_and_stamps_metadata_on_root() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+
+        let result = database
+            .propose_range_split(super::ProposedRangeSplit {
+                source_range_id: RangeId::ROOT,
+                split_key: "accounts/5".to_owned(),
+                left_range_id: None,
+                right_range_id: None,
+                left_replica_node_ids: None,
+                right_replica_node_ids: None,
+            })
+            .await
+            .expect("propose split");
+
+        assert_eq!(result.left_range_id, RangeId(2));
+        assert_eq!(result.right_range_id, RangeId(3));
+        let records = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect("replay");
+        let last = records.last().expect("last");
+        assert_eq!(last.range_id, RangeId::ROOT);
+        assert!(matches!(
+            last.mutations.as_slice(),
+            [opendb_storage::commit_stream::Mutation::SplitRange { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn propose_range_split_rejected_when_source_inactive() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+        database
+            .propose_range_split(super::ProposedRangeSplit {
+                source_range_id: RangeId::ROOT,
+                split_key: "accounts/5".to_owned(),
+                left_range_id: None,
+                right_range_id: None,
+                left_replica_node_ids: None,
+                right_replica_node_ids: None,
+            })
+            .await
+            .expect("first split");
+
+        let result = database
+            .propose_range_split(super::ProposedRangeSplit {
+                source_range_id: RangeId::ROOT,
+                split_key: "accounts/9".to_owned(),
+                left_range_id: None,
+                right_range_id: None,
+                left_replica_node_ids: None,
+                right_replica_node_ids: None,
+            })
+            .await;
+
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn propose_range_merge_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+        let split = database
+            .propose_range_split(super::ProposedRangeSplit {
+                source_range_id: RangeId::ROOT,
+                split_key: "accounts/5".to_owned(),
+                left_range_id: None,
+                right_range_id: None,
+                left_replica_node_ids: None,
+                right_replica_node_ids: None,
+            })
+            .await
+            .expect("split");
+
+        let result = database
+            .propose_range_merge(super::ProposedRangeMerge {
+                source_range_ids: vec![split.left_range_id, split.right_range_id],
+                merged_range_id: None,
+                replica_node_ids: None,
+            })
+            .await
+            .expect("merge");
+
+        assert_eq!(result.merged_range_id, RangeId(4));
+        let records = RootRange::new(temp_dir.path())
+            .replay()
+            .await
+            .expect("replay");
+        let last = records.last().expect("last");
+        assert!(matches!(
+            last.mutations.as_slice(),
+            [opendb_storage::commit_stream::Mutation::MergeRanges { .. }]
+        ));
     }
 
     #[tokio::test]

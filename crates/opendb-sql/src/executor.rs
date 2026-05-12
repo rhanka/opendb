@@ -125,7 +125,7 @@ impl SqlEngine {
         Ok(engine)
     }
 
-    fn build_next_record(&self, mutations: Vec<Mutation>) -> CommitRecord {
+    pub fn build_next_record(&self, mutations: Vec<Mutation>) -> CommitRecord {
         let next_tx = self.next_tx + 1;
         CommitRecord::new(TransactionId(next_tx), LogicalTimestamp(next_tx), mutations)
     }
