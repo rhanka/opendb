@@ -78,8 +78,8 @@ impl Database {
         }
 
         match self.engine.prepare(statement)? {
-            PreparedQuery::Read(result) => Ok(result),
-            PreparedQuery::Write { record, tag } => {
+            PreparedQuery::Read { result, .. } => Ok(result),
+            PreparedQuery::Write { record, tag, .. } => {
                 self.ensure_leader_for_client_query().await?;
                 self.root_range
                     .submit(RootRangeCommand {

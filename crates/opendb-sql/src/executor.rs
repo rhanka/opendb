@@ -4,9 +4,23 @@ use opendb_storage::commit_stream::{ColumnType, ColumnValue, CommitRecord, Mutat
 use opendb_storage::row_projection::RowProjection;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteIntent {
+    Root,
+    Key { table: String, key: String },
+    Scan { table: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparedQuery {
-    Read(QueryResult),
-    Write { record: CommitRecord, tag: String },
+    Read {
+        result: QueryResult,
+        route: RouteIntent,
+    },
+    Write {
+        record: CommitRecord,
+        tag: String,
+        route: RouteIntent,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -19,8 +33,8 @@ pub struct SqlEngine {
 impl SqlEngine {
     pub fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
         match self.prepare(statement)? {
-            PreparedQuery::Read(result) => Ok(result),
-            PreparedQuery::Write { record, tag } => {
+            PreparedQuery::Read { result, .. } => Ok(result),
+            PreparedQuery::Write { record, tag, .. } => {
                 self.apply_committed(record)?;
                 Ok(QueryResult::Command { tag })
             }
@@ -32,6 +46,7 @@ impl SqlEngine {
             Statement::CreateTable { table, columns } => self.prepare_write(
                 vec![Mutation::CreateTable { table, columns }],
                 "CREATE TABLE",
+                RouteIntent::Root,
             ),
             Statement::Insert { table, values } => {
                 let table_state = self
@@ -71,6 +86,10 @@ impl SqlEngine {
                         value,
                     })
                     .collect();
+                let route = RouteIntent::Key {
+                    table: table.clone(),
+                    key: route_key(&table, &row_key),
+                };
                 self.prepare_write(
                     vec![Mutation::InsertRow {
                         table,
@@ -78,11 +97,12 @@ impl SqlEngine {
                         values: column_values,
                     }],
                     "INSERT 0 1",
+                    route,
                 )
             }
             Statement::SelectAll { table, predicate } => self
                 .select_all(&table, predicate.as_ref())
-                .map(PreparedQuery::Read),
+                .map(|(result, route)| PreparedQuery::Read { result, route }),
         }
     }
 
@@ -110,23 +130,33 @@ impl SqlEngine {
         CommitRecord::new(TransactionId(next_tx), LogicalTimestamp(next_tx), mutations)
     }
 
-    fn prepare_write(&self, mutations: Vec<Mutation>, tag: &str) -> OpenDbResult<PreparedQuery> {
+    fn prepare_write(
+        &self,
+        mutations: Vec<Mutation>,
+        tag: &str,
+        route: RouteIntent,
+    ) -> OpenDbResult<PreparedQuery> {
         let record = self.build_next_record(mutations);
         let mut validated_projection = self.projection.clone();
         validated_projection.apply(&record)?;
         Ok(PreparedQuery::Write {
             record,
             tag: tag.to_owned(),
+            route,
         })
     }
 
-    fn select_all(&self, table: &str, predicate: Option<&Predicate>) -> OpenDbResult<QueryResult> {
+    fn select_all(
+        &self,
+        table: &str,
+        predicate: Option<&Predicate>,
+    ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let table_state = self
             .projection
             .table(table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
         let column_names = table_state.column_names();
-        let rows = match predicate {
+        let (rows, route) = match predicate {
             Some(predicate) => {
                 let primary_key = table_state.primary_key_column().ok_or_else(|| {
                     OpenDbError::InvalidInput(format!("table {table} has no primary key"))
@@ -144,24 +174,44 @@ impl SqlEngine {
                     )));
                 }
                 let row_key = value_to_key(&predicate.value);
-                match table_state.rows.get(&row_key) {
+                let route = RouteIntent::Key {
+                    table: table.to_owned(),
+                    key: route_key(table, &row_key),
+                };
+                let rows = match table_state.rows.get(&row_key) {
                     Some(row) if row.get(&primary_key.name) == Some(&predicate.value) => {
                         vec![project_row(table, &column_names, row)?]
                     }
                     Some(_) | None => Vec::new(),
-                }
+                };
+                (rows, route)
             }
-            None => table_state
-                .rows
-                .values()
-                .map(|row| project_row(table, &column_names, row))
-                .collect::<OpenDbResult<Vec<_>>>()?,
+            None => {
+                let rows = table_state
+                    .rows
+                    .values()
+                    .map(|row| project_row(table, &column_names, row))
+                    .collect::<OpenDbResult<Vec<_>>>()?;
+                (
+                    rows,
+                    RouteIntent::Scan {
+                        table: table.to_owned(),
+                    },
+                )
+            }
         };
-        Ok(QueryResult::Rows {
-            columns: column_names,
-            rows,
-        })
+        Ok((
+            QueryResult::Rows {
+                columns: column_names,
+                rows,
+            },
+            route,
+        ))
     }
+}
+
+fn route_key(table: &str, row_key: &str) -> String {
+    format!("{table}/{row_key}")
 }
 
 fn project_row(
@@ -432,10 +482,11 @@ mod tests {
                 .is_err()
         );
 
-        let PreparedQuery::Write { record, tag } = prepared_create else {
+        let PreparedQuery::Write { record, tag, route } = prepared_create else {
             panic!("create should prepare as write");
         };
         assert_eq!(tag, "CREATE TABLE");
+        assert_eq!(route, RouteIntent::Root);
         engine.apply_committed(record).expect("apply create");
 
         assert_eq!(
@@ -505,6 +556,83 @@ mod tests {
 
         assert!(matches!(duplicate, Err(OpenDbError::InvalidInput(_))));
         assert_eq!(engine.commits().len(), 2);
+    }
+
+    #[test]
+    fn insert_prepare_returns_primary_key_route_intent() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+
+        let prepared = engine
+            .prepare(parse("INSERT INTO accounts VALUES (7, 'Ada')").expect("parse"))
+            .expect("prepare insert");
+
+        assert!(matches!(
+            prepared,
+            PreparedQuery::Write {
+                route: RouteIntent::Key { ref table, ref key },
+                ..
+            } if table == "accounts" && key == "accounts/7"
+        ));
+    }
+
+    #[test]
+    fn select_where_prepare_returns_primary_key_route_intent() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+
+        let prepared = engine
+            .prepare(parse("SELECT * FROM accounts WHERE id = 7").expect("parse"))
+            .expect("prepare select");
+
+        assert!(matches!(
+            prepared,
+            PreparedQuery::Read {
+                route: RouteIntent::Key { ref table, ref key },
+                ..
+            } if table == "accounts" && key == "accounts/7"
+        ));
+    }
+
+    #[test]
+    fn create_table_prepare_returns_root_route_intent() {
+        let engine = SqlEngine::default();
+
+        let prepared = engine
+            .prepare(parse("CREATE TABLE accounts (id INT PRIMARY KEY)").expect("parse"))
+            .expect("prepare create");
+
+        assert!(matches!(
+            prepared,
+            PreparedQuery::Write {
+                route: RouteIntent::Root,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn select_scan_prepare_returns_scan_route_intent() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+
+        let prepared = engine
+            .prepare(parse("SELECT * FROM accounts").expect("parse"))
+            .expect("prepare scan");
+
+        assert!(matches!(
+            prepared,
+            PreparedQuery::Read {
+                route: RouteIntent::Scan { ref table },
+                ..
+            } if table == "accounts"
+        ));
     }
 
     #[test]
