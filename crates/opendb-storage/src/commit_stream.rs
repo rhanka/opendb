@@ -3,11 +3,21 @@ use crate::range_catalog::RangeDescriptor;
 use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Value {
     Int64(i64),
     Text(String),
+    Bool(bool),
+    Float64(f64),
+    Timestamp(i64),
+    Null,
+}
+
+impl Value {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -15,14 +25,32 @@ pub enum Value {
 pub enum ColumnType {
     Int64,
     Text,
+    Bool,
+    Float64,
+    Timestamp,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DefaultExpr {
+    Const(Value),
+    Now,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: ColumnType,
     pub primary_key: bool,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<DefaultExpr>,
 }
 
 impl ColumnDefinition {
@@ -31,6 +59,8 @@ impl ColumnDefinition {
             name: name.into(),
             data_type,
             primary_key: false,
+            nullable: true,
+            default: None,
         }
     }
 
@@ -39,11 +69,23 @@ impl ColumnDefinition {
             name: name.into(),
             data_type,
             primary_key: true,
+            nullable: false,
+            default: None,
         }
+    }
+
+    pub fn not_null(mut self) -> Self {
+        self.nullable = false;
+        self
+    }
+
+    pub fn with_default(mut self, expr: DefaultExpr) -> Self {
+        self.default = Some(expr);
+        self
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnValue {
     pub column: String,
@@ -66,7 +108,7 @@ pub struct RangeMerge {
     pub merged: RangeDescriptor,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Mutation {
     CreateTable {
@@ -95,7 +137,7 @@ pub enum Mutation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommitRecord {
     pub version: u16,
@@ -184,6 +226,49 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
+
+    #[test]
+    fn value_round_trips_through_serde_for_every_variant() {
+        for value in [
+            Value::Int64(42),
+            Value::Text("hello".to_owned()),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Float64(3.5),
+            Value::Timestamp(1_700_000_000_000_000),
+            Value::Null,
+        ] {
+            let json = serde_json::to_string(&value).expect("serialize");
+            let parsed: Value = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, value);
+        }
+    }
+
+    #[test]
+    fn column_definition_serializes_nullable_and_default() {
+        let definition = ColumnDefinition::new("created_at", ColumnType::Timestamp)
+            .not_null()
+            .with_default(DefaultExpr::Now);
+        let json = serde_json::to_value(&definition).expect("serialize");
+
+        assert_eq!(json["name"], "created_at");
+        assert_eq!(json["data_type"], "Timestamp");
+        assert_eq!(json["primary_key"], false);
+        assert_eq!(json["nullable"], false);
+        assert_eq!(json["default"], "Now");
+    }
+
+    #[test]
+    fn column_definition_reads_legacy_payload_without_nullable_and_default() {
+        let legacy = serde_json::json!({
+            "name": "id",
+            "data_type": "Int64",
+            "primary_key": true,
+        });
+        let parsed: ColumnDefinition = serde_json::from_value(legacy).expect("legacy parse");
+        assert!(parsed.nullable);
+        assert!(parsed.default.is_none());
+    }
 
     #[test]
     fn commit_record_has_stable_version_and_root_range() {

@@ -230,7 +230,24 @@ fn value_to_text(value: &Value) -> String {
     match value {
         Value::Int64(value) => value.to_string(),
         Value::Text(value) => value.clone(),
+        Value::Bool(true) => "t".to_string(),
+        Value::Bool(false) => "f".to_string(),
+        Value::Float64(value) => format!("{value}"),
+        Value::Timestamp(value) => format_timestamp_micros(*value),
+        Value::Null => String::new(),
     }
+}
+
+fn format_timestamp_micros(micros: i64) -> String {
+    // Microseconds since 1970-01-01 (UTC, no timezone). For Sprint 6 we
+    // accept a partial implementation that handles the common case
+    // (non-negative). Negative values still render but with seconds
+    // offset semantics — refined in a later sprint.
+    let secs = micros.div_euclid(1_000_000);
+    let frac = micros.rem_euclid(1_000_000) as u32;
+    let datetime =
+        chrono::DateTime::from_timestamp(secs, frac * 1_000).unwrap_or_else(chrono::Utc::now);
+    datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
 async fn write_error_response(stream: &mut TcpStream, message: &str) -> anyhow::Result<()> {

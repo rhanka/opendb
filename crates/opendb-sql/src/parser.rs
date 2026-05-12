@@ -131,7 +131,11 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
         .into_iter()
         .map(parse_value)
         .collect::<OpenDbResult<Vec<_>>>()?;
-    Ok(Statement::Insert { table, values })
+    Ok(Statement::Insert {
+        table,
+        columns: None,
+        values,
+    })
 }
 
 fn split_values(raw: &str) -> OpenDbResult<Vec<&str>> {
@@ -266,6 +270,7 @@ mod tests {
             parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("insert"),
             Statement::Insert {
                 table: "accounts".to_owned(),
+                columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
             }
         );
@@ -294,6 +299,7 @@ mod tests {
             parse("iNsErT iNtO accounts vAlUeS (1, 'Ada')").expect("insert"),
             Statement::Insert {
                 table: "accounts".to_owned(),
+                columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
             }
         );
@@ -312,6 +318,7 @@ mod tests {
             parse("INSERT INTO accounts VALUES (1, 'Ada, Lovelace')").expect("insert"),
             Statement::Insert {
                 table: "accounts".to_owned(),
+                columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada, Lovelace".to_owned())],
             }
         );

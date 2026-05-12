@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 clap.workspace = true
 opendb-common = { path = "../opendb-common" }
 opendb-consensus = { path = "../opendb-consensus" }

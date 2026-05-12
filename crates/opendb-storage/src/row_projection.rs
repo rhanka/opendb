@@ -2,7 +2,7 @@ use crate::commit_stream::{ColumnDefinition, ColumnType, CommitRecord, Mutation,
 use opendb_common::{OpenDbError, OpenDbResult};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Table {
     pub columns: Vec<ColumnDefinition>,
     pub rows: BTreeMap<String, BTreeMap<String, Value>>,
@@ -26,7 +26,7 @@ impl Table {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowProjection {
     tables: BTreeMap<String, Table>,
 }
@@ -177,7 +177,12 @@ impl RowProjection {
 fn value_matches_type(value: &Value, data_type: &ColumnType) -> bool {
     matches!(
         (value, data_type),
-        (Value::Int64(_), ColumnType::Int64) | (Value::Text(_), ColumnType::Text)
+        (Value::Int64(_), ColumnType::Int64)
+            | (Value::Text(_), ColumnType::Text)
+            | (Value::Bool(_), ColumnType::Bool)
+            | (Value::Float64(_), ColumnType::Float64)
+            | (Value::Timestamp(_), ColumnType::Timestamp)
+            | (Value::Null, _)
     )
 }
 
@@ -185,6 +190,10 @@ fn value_to_key(value: &Value) -> String {
     match value {
         Value::Int64(value) => value.to_string(),
         Value::Text(value) => value.clone(),
+        Value::Bool(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Timestamp(value) => value.to_string(),
+        Value::Null => "null".to_string(),
     }
 }
 

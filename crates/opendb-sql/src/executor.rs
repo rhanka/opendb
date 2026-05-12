@@ -10,7 +10,7 @@ pub enum RouteIntent {
     Scan { table: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PreparedQuery {
     Read {
         result: QueryResult,
@@ -48,7 +48,11 @@ impl SqlEngine {
                 "CREATE TABLE",
                 RouteIntent::Root,
             ),
-            Statement::Insert { table, values } => {
+            Statement::Insert {
+                table,
+                columns: _named_columns,
+                values,
+            } => {
                 let table_state = self
                     .projection
                     .table(&table)
@@ -235,13 +239,22 @@ fn value_to_key(value: &Value) -> String {
     match value {
         Value::Int64(value) => value.to_string(),
         Value::Text(value) => value.clone(),
+        Value::Bool(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Timestamp(value) => value.to_string(),
+        Value::Null => "null".to_string(),
     }
 }
 
 fn value_matches_type(value: &Value, data_type: &ColumnType) -> bool {
     matches!(
         (value, data_type),
-        (Value::Int64(_), ColumnType::Int64) | (Value::Text(_), ColumnType::Text)
+        (Value::Int64(_), ColumnType::Int64)
+            | (Value::Text(_), ColumnType::Text)
+            | (Value::Bool(_), ColumnType::Bool)
+            | (Value::Float64(_), ColumnType::Float64)
+            | (Value::Timestamp(_), ColumnType::Timestamp)
+            | (Value::Null, _)
     )
 }
 
