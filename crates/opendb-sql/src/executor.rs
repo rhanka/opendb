@@ -1,6 +1,8 @@
 use crate::ast::{Predicate, QueryResult, Statement};
 use opendb_common::{LogicalTimestamp, OpenDbError, OpenDbResult, TransactionId};
-use opendb_storage::commit_stream::{ColumnType, ColumnValue, CommitRecord, Mutation, Value};
+use opendb_storage::commit_stream::{
+    ColumnDefinition, ColumnType, ColumnValue, CommitRecord, DefaultExpr, Mutation, Value,
+};
 use opendb_storage::row_projection::RowProjection;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,29 +52,32 @@ impl SqlEngine {
             ),
             Statement::Insert {
                 table,
-                columns: _named_columns,
+                columns: named_columns,
                 values,
             } => {
                 let table_state = self
                     .projection
                     .table(&table)
                     .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
-                if values.len() != table_state.columns.len() {
-                    return Err(OpenDbError::Sql(format!(
-                        "expected {} values, got {}",
-                        table_state.columns.len(),
-                        values.len()
-                    )));
-                }
+                let columns = table_state.columns.clone();
+                let now_microseconds = (self.next_tx + 1) as i64;
+                let column_values = materialize_insert_values(
+                    &table,
+                    &columns,
+                    &named_columns,
+                    values,
+                    now_microseconds,
+                )?;
+
                 let primary_key_index = table_state.primary_key_index().ok_or_else(|| {
                     OpenDbError::InvalidInput(format!("table {table} has no primary key"))
                 })?;
-                let primary_key_column =
-                    table_state.columns.get(primary_key_index).ok_or_else(|| {
-                        OpenDbError::InvalidInput(format!("table {table} has no primary key"))
-                    })?;
-                let primary_key_value = values
+                let primary_key_column = columns.get(primary_key_index).ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+                })?;
+                let primary_key_value = column_values
                     .get(primary_key_index)
+                    .map(|v| &v.value)
                     .ok_or_else(|| OpenDbError::Sql("INSERT requires a primary key".to_owned()))?;
                 if !value_matches_type(primary_key_value, &primary_key_column.data_type) {
                     return Err(OpenDbError::InvalidInput(format!(
@@ -80,16 +85,13 @@ impl SqlEngine {
                         primary_key_column.name, table, primary_key_column.data_type
                     )));
                 }
+                if primary_key_value.is_null() {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "primary key column {} on table {table} must not be NULL",
+                        primary_key_column.name
+                    )));
+                }
                 let row_key = value_to_key(primary_key_value);
-                let columns = table_state.columns.clone();
-                let column_values = columns
-                    .into_iter()
-                    .zip(values)
-                    .map(|(column, value)| ColumnValue {
-                        column: column.name,
-                        value,
-                    })
-                    .collect();
                 let route = RouteIntent::Key {
                     table: table.clone(),
                     key: route_key(&table, &row_key),
@@ -233,6 +235,154 @@ fn project_row(
             })
         })
         .collect::<OpenDbResult<Vec<_>>>()
+}
+
+fn coerce_value(value: Value, target: &ColumnType) -> Value {
+    match (value, target) {
+        (Value::Int64(v), ColumnType::Float64) => Value::Float64(v as f64),
+        (Value::Int64(v), ColumnType::Timestamp) => Value::Timestamp(v),
+        (other, _) => other,
+    }
+}
+
+fn materialize_insert_values(
+    table: &str,
+    schema: &[ColumnDefinition],
+    named_columns: &Option<Vec<String>>,
+    values: Vec<Value>,
+    now_microseconds: i64,
+) -> OpenDbResult<Vec<ColumnValue>> {
+    match named_columns {
+        None => {
+            if values.len() != schema.len() {
+                return Err(OpenDbError::Sql(format!(
+                    "expected {} values, got {}",
+                    schema.len(),
+                    values.len()
+                )));
+            }
+            let mut result = Vec::with_capacity(schema.len());
+            for (column, value) in schema.iter().zip(values.into_iter()) {
+                let value = coerce_value(value, &column.data_type);
+                if value.is_null() && !column.nullable {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "column {} on table {table} is NOT NULL",
+                        column.name
+                    )));
+                }
+                if !value.is_null() && !value_matches_type(&value, &column.data_type) {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "value for column {} on table {table} does not match {:?}",
+                        column.name, column.data_type
+                    )));
+                }
+                result.push(ColumnValue {
+                    column: column.name.clone(),
+                    value,
+                });
+            }
+            Ok(result)
+        }
+        Some(names) => {
+            if names.len() != values.len() {
+                return Err(OpenDbError::Sql(format!(
+                    "INSERT column list ({} columns) does not match values ({} values)",
+                    names.len(),
+                    values.len()
+                )));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for name in names {
+                if !seen.insert(name.clone()) {
+                    return Err(OpenDbError::Sql(format!(
+                        "INSERT column {name} listed more than once"
+                    )));
+                }
+                if !schema.iter().any(|column| &column.name == name) {
+                    return Err(OpenDbError::Sql(format!(
+                        "unknown column {name} on table {table}"
+                    )));
+                }
+            }
+            let provided: std::collections::BTreeMap<String, Value> =
+                names.iter().cloned().zip(values).collect();
+
+            let mut result = Vec::with_capacity(schema.len());
+            for column in schema {
+                let value = match provided.get(&column.name) {
+                    Some(value) => {
+                        let value = coerce_value(value.clone(), &column.data_type);
+                        if value.is_null() {
+                            if !column.nullable {
+                                return Err(OpenDbError::InvalidInput(format!(
+                                    "column {} on table {table} is NOT NULL",
+                                    column.name
+                                )));
+                            }
+                            value
+                        } else {
+                            if !value_matches_type(&value, &column.data_type) {
+                                return Err(OpenDbError::InvalidInput(format!(
+                                    "value for column {} on table {table} does not match {:?}",
+                                    column.name, column.data_type
+                                )));
+                            }
+                            value
+                        }
+                    }
+                    None => default_value_for_column(table, column, now_microseconds)?,
+                };
+                result.push(ColumnValue {
+                    column: column.name.clone(),
+                    value,
+                });
+            }
+            Ok(result)
+        }
+    }
+}
+
+fn default_value_for_column(
+    table: &str,
+    column: &ColumnDefinition,
+    now_microseconds: i64,
+) -> OpenDbResult<Value> {
+    match &column.default {
+        Some(DefaultExpr::Const(value)) => {
+            if value.is_null() && !column.nullable {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "column {} on table {table} is NOT NULL but DEFAULT NULL",
+                    column.name
+                )));
+            }
+            if !value.is_null() && !value_matches_type(value, &column.data_type) {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "DEFAULT for column {} on table {table} does not match {:?}",
+                    column.name, column.data_type
+                )));
+            }
+            Ok(value.clone())
+        }
+        Some(DefaultExpr::Now) => {
+            if !matches!(column.data_type, ColumnType::Timestamp) {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "DEFAULT NOW() requires TIMESTAMP column on {}",
+                    column.name
+                )));
+            }
+            Ok(Value::Timestamp(now_microseconds))
+        }
+        None => {
+            if column.nullable {
+                Ok(Value::Null)
+            } else {
+                Err(OpenDbError::InvalidInput(format!(
+                    "column {} on table {table} is NOT NULL and has no DEFAULT; INSERT must provide a value",
+                    column.name
+                )))
+            }
+        }
+    }
 }
 
 fn value_to_key(value: &Value) -> String {
@@ -663,5 +813,123 @@ mod tests {
         assert!(matches!(invalid_id, Err(OpenDbError::InvalidInput(_))));
         assert!(matches!(invalid_name, Err(OpenDbError::InvalidInput(_))));
         assert_eq!(engine.commits().len(), 1);
+    }
+
+    #[test]
+    fn named_insert_applies_const_default_for_missing_column() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'completed')")
+                    .expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id) VALUES (1)").expect("parse"))
+            .expect("insert");
+
+        let result = engine
+            .execute(parse("SELECT * FROM t").expect("parse"))
+            .expect("select");
+        assert_eq!(
+            result,
+            QueryResult::Rows {
+                columns: vec!["id".to_owned(), "status".to_owned()],
+                rows: vec![vec![Value::Int64(1), Value::Text("completed".to_owned())]],
+            }
+        );
+    }
+
+    #[test]
+    fn named_insert_applies_default_now_as_logical_timestamp() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse(
+                    "CREATE TABLE t (id INT PRIMARY KEY, created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+                )
+                .expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id) VALUES (1)").expect("parse"))
+            .expect("insert");
+
+        let last = engine.commits().last().expect("commit");
+        let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let created_at = values
+            .iter()
+            .find(|cv| cv.column == "created_at")
+            .expect("created_at column");
+        assert_eq!(created_at.value, Value::Timestamp(last.tx_id.0 as i64));
+    }
+
+    #[test]
+    fn named_insert_rejects_missing_not_null_column_without_default() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").expect("parse"),
+            )
+            .expect("create");
+
+        let result = engine.execute(parse("INSERT INTO t (id) VALUES (1)").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn named_insert_rejects_unknown_column() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
+            .expect("create");
+
+        let result =
+            engine.execute(parse("INSERT INTO t (id, surprise) VALUES (1, 'x')").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::Sql(_))));
+    }
+
+    #[test]
+    fn positional_insert_rejects_null_into_not_null_column() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").expect("parse"),
+            )
+            .expect("create");
+
+        let result = engine.execute(parse("INSERT INTO t VALUES (1, NULL)").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn named_insert_supports_bool_float_timestamp_values() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, done BOOL, ratio FLOAT8, at TIMESTAMP)")
+                    .expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(
+                parse("INSERT INTO t (id, done, ratio, at) VALUES (1, TRUE, 0.5, 42)")
+                    .expect("parse"),
+            )
+            .expect("insert");
+
+        let last = engine.commits().last().expect("commit");
+        let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let mut by_name = std::collections::BTreeMap::new();
+        for cv in values {
+            by_name.insert(cv.column.clone(), cv.value.clone());
+        }
+        assert_eq!(by_name["done"], Value::Bool(true));
+        assert_eq!(by_name["ratio"], Value::Float64(0.5));
+        assert_eq!(by_name["at"], Value::Timestamp(42));
     }
 }
