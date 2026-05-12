@@ -82,3 +82,34 @@ async fn wal_reads_frame_v1_record_v2_range_split_fixture() {
         [Mutation::SplitRange { .. }]
     ));
 }
+
+#[tokio::test]
+async fn wal_reads_frame_v1_record_v2_typed_defaults_fixture() {
+    use opendb_storage::commit_stream::{ColumnType, DefaultExpr};
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("commit.wal");
+    let bytes = decode_hex(include_str!(
+        "fixtures/wal/frame-v1-record-v2-typed-defaults.hex"
+    ));
+    assert_frame(&bytes);
+
+    tokio::fs::write(&path, bytes)
+        .await
+        .expect("write wal fixture");
+
+    let records = Wal::new(&path).read_all().await.expect("read fixture");
+
+    assert_eq!(records.len(), 1);
+    let Mutation::CreateTable { table, columns } = &records[0].mutations[0] else {
+        panic!("expected CreateTable mutation");
+    };
+    assert_eq!(table, "typed_events");
+    assert_eq!(columns.len(), 4);
+    assert_eq!(columns[3].name, "created_at");
+    assert!(matches!(columns[3].data_type, ColumnType::Timestamp));
+    assert!(!columns[3].nullable);
+    assert!(matches!(columns[3].default, Some(DefaultExpr::Now)));
+    assert!(matches!(columns[1].data_type, ColumnType::Bool));
+    assert!(matches!(columns[2].data_type, ColumnType::Float64));
+}

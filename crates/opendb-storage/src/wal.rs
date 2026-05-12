@@ -313,7 +313,8 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use crate::commit_stream::{
-        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, RangeSplit, Value,
+        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, DefaultExpr, Mutation, RangeSplit,
+        Value,
     };
     use crate::range_catalog::RangeDescriptor;
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
@@ -386,6 +387,98 @@ mod tests {
         assert_eq!(
             wal.read_all().await.expect("read range descriptor record"),
             vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_appends_and_reads_typed_column_definition_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(7),
+            LogicalTimestamp(16),
+            vec![Mutation::CreateTable {
+                table: "typed_events".to_owned(),
+                columns: vec![
+                    ColumnDefinition::primary_key("id", ColumnType::Int64),
+                    ColumnDefinition::new("completed", ColumnType::Bool)
+                        .with_default(DefaultExpr::Const(Value::Bool(false))),
+                    ColumnDefinition::new("ratio", ColumnType::Float64),
+                    ColumnDefinition::new("created_at", ColumnType::Timestamp)
+                        .not_null()
+                        .with_default(DefaultExpr::Now),
+                ],
+            }],
+        );
+
+        wal.append(&record).await.expect("append typed record");
+
+        assert_eq!(
+            wal.read_all().await.expect("read typed record"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_appends_and_reads_typed_values_insert_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(8),
+            LogicalTimestamp(17),
+            vec![Mutation::InsertRow {
+                table: "typed_events".to_owned(),
+                key: "1".to_owned(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Int64(1),
+                    },
+                    ColumnValue {
+                        column: "completed".to_owned(),
+                        value: Value::Bool(true),
+                    },
+                    ColumnValue {
+                        column: "ratio".to_owned(),
+                        value: Value::Float64(0.5),
+                    },
+                    ColumnValue {
+                        column: "created_at".to_owned(),
+                        value: Value::Timestamp(1_700_000_000_000_000),
+                    },
+                    ColumnValue {
+                        column: "note".to_owned(),
+                        value: Value::Null,
+                    },
+                ],
+            }],
+        );
+
+        wal.append(&record).await.expect("append typed insert");
+
+        assert_eq!(
+            wal.read_all().await.expect("read typed insert"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_unknown_field_in_typed_column_definition() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"CreateTable":{"table":"t","columns":[{"name":"id","data_type":"Int64","primary_key":true,"nullable":false,"default":"Now","unexpected":true}]}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject unknown column definition field");
+
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
         );
     }
 
