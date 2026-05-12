@@ -457,6 +457,7 @@ mod tests {
                 last_replayed_ts: Some(2),
                 archive_metadata_replayed: true,
                 latest_recovery_artifact: None,
+                range_catalog: None,
             },
         };
 

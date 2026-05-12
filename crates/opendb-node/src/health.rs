@@ -26,6 +26,15 @@ pub struct RecoveryStatus {
     pub last_replayed_ts: Option<u64>,
     pub archive_metadata_replayed: bool,
     pub latest_recovery_artifact: Option<String>,
+    pub range_catalog: RangeCatalogStatus,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeCatalogStatus {
+    pub active_range_count: usize,
+    pub last_split_tx_id: Option<u64>,
+    pub last_merge_tx_id: Option<u64>,
 }
 
 impl HealthState {
@@ -187,6 +196,11 @@ mod tests {
             last_replayed_ts: Some(2),
             archive_metadata_replayed: true,
             latest_recovery_artifact: None,
+            range_catalog: RangeCatalogStatus {
+                active_range_count: 2,
+                last_split_tx_id: Some(2),
+                last_merge_tx_id: None,
+            },
         });
 
         let response = response_for_path("/status", &state);
@@ -201,6 +215,11 @@ mod tests {
                 "lastReplayedTs": 2,
                 "archiveMetadataReplayed": true,
                 "latestRecoveryArtifact": null,
+                "rangeCatalog": {
+                    "activeRangeCount": 2,
+                    "lastSplitTxId": 2,
+                    "lastMergeTxId": null,
+                },
             })
         );
         assert!(
@@ -220,6 +239,7 @@ mod tests {
             last_replayed_ts: Some(0),
             archive_metadata_replayed: true,
             latest_recovery_artifact: None,
+            range_catalog: RangeCatalogStatus::default(),
         });
 
         assert_eq!(response_for_path("/status", &state).status_code, 200);

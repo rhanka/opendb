@@ -56,6 +56,40 @@ pub struct DatabaseRecoveryStatus {
     pub last_replayed_tx_id: Option<u64>,
     pub last_replayed_ts: Option<u64>,
     pub archive_metadata_replayed: bool,
+    pub range_catalog: RangeCatalogStatusSnapshot,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RangeCatalogStatusSnapshot {
+    pub active_range_count: usize,
+    pub last_split_tx_id: Option<u64>,
+    pub last_merge_tx_id: Option<u64>,
+}
+
+impl RangeCatalogStatusSnapshot {
+    fn from_replayed_records(records: &[CommitRecord]) -> Self {
+        let mut last_split_tx_id = None;
+        let mut last_merge_tx_id = None;
+        for record in records {
+            for mutation in &record.mutations {
+                match mutation {
+                    Mutation::SplitRange { .. } => {
+                        last_split_tx_id = Some(record.tx_id.0);
+                    }
+                    Mutation::MergeRanges { .. } => {
+                        last_merge_tx_id = Some(record.tx_id.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let catalog = RangeCatalog::rebuild(records).unwrap_or_default();
+        Self {
+            active_range_count: catalog.active_range_ids().len(),
+            last_split_tx_id,
+            last_merge_tx_id,
+        }
+    }
 }
 
 impl Database {
@@ -389,6 +423,7 @@ impl DatabaseRecoveryStatus {
             last_replayed_tx_id: records.last().map(|record| record.tx_id.0),
             last_replayed_ts: records.last().map(|record| record.ts.0),
             archive_metadata_replayed: true,
+            range_catalog: RangeCatalogStatusSnapshot::from_replayed_records(records),
         }
     }
 }
@@ -472,6 +507,11 @@ mod tests {
                 last_replayed_tx_id: Some(0),
                 last_replayed_ts: Some(0),
                 archive_metadata_replayed: true,
+                range_catalog: super::RangeCatalogStatusSnapshot {
+                    active_range_count: 1,
+                    last_split_tx_id: None,
+                    last_merge_tx_id: None,
+                },
             }
         );
     }
@@ -548,6 +588,7 @@ mod tests {
                 last_replayed_tx_id: None,
                 last_replayed_ts: None,
                 archive_metadata_replayed: true,
+                range_catalog: super::RangeCatalogStatusSnapshot::default(),
             }
         );
 

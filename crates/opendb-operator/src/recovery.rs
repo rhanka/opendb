@@ -14,6 +14,18 @@ pub struct PodRecoveryStatus {
     pub last_replayed_ts: Option<u64>,
     pub archive_metadata_replayed: bool,
     pub latest_recovery_artifact: Option<String>,
+    #[serde(default)]
+    pub range_catalog: Option<PodRangeCatalogStatus>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PodRangeCatalogStatus {
+    pub active_range_count: usize,
+    #[serde(default)]
+    pub last_split_tx_id: Option<u64>,
+    #[serde(default)]
+    pub last_merge_tx_id: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -277,6 +289,43 @@ mod fetcher_tests {
 
         assert!(matches!(error, FetchError::Decode(_)));
     }
+
+    #[tokio::test]
+    async fn http_fetcher_accepts_legacy_status_without_range_catalog() {
+        let port = spawn_fake_status_server(
+            r#"{"rootDescriptorKnown":true,"walReplayCompleted":true,"lastReplayedTxId":1,"lastReplayedTs":1,"archiveMetadataReplayed":true,"latestRecoveryArtifact":null}"#,
+            200,
+        )
+        .await;
+
+        let fetcher = HttpRecoveryStatusFetcher::new(Duration::from_secs(2));
+        let status = fetcher
+            .fetch("opendb-0", "127.0.0.1", port)
+            .await
+            .expect("legacy status payload must decode");
+
+        assert!(status.range_catalog.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_fetcher_parses_new_range_catalog_block() {
+        let port = spawn_fake_status_server(
+            r#"{"rootDescriptorKnown":true,"walReplayCompleted":true,"lastReplayedTxId":2,"lastReplayedTs":2,"archiveMetadataReplayed":true,"latestRecoveryArtifact":null,"rangeCatalog":{"activeRangeCount":2,"lastSplitTxId":2,"lastMergeTxId":null}}"#,
+            200,
+        )
+        .await;
+
+        let fetcher = HttpRecoveryStatusFetcher::new(Duration::from_secs(2));
+        let status = fetcher
+            .fetch("opendb-0", "127.0.0.1", port)
+            .await
+            .expect("range catalog payload must decode");
+
+        let catalog = status.range_catalog.expect("range catalog populated");
+        assert_eq!(catalog.active_range_count, 2);
+        assert_eq!(catalog.last_split_tx_id, Some(2));
+        assert!(catalog.last_merge_tx_id.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +343,7 @@ mod aggregate_tests {
                 last_replayed_ts: Some(tx),
                 archive_metadata_replayed: true,
                 latest_recovery_artifact: None,
+                range_catalog: None,
             }),
         }
     }

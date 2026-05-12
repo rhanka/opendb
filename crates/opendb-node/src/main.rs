@@ -223,6 +223,11 @@ impl From<DatabaseRecoveryStatus> for health::RecoveryStatus {
             last_replayed_ts: status.last_replayed_ts,
             archive_metadata_replayed: status.archive_metadata_replayed,
             latest_recovery_artifact: None,
+            range_catalog: health::RangeCatalogStatus {
+                active_range_count: status.range_catalog.active_range_count,
+                last_split_tx_id: status.range_catalog.last_split_tx_id,
+                last_merge_tx_id: status.range_catalog.last_merge_tx_id,
+            },
         }
     }
 }
