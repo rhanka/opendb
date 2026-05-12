@@ -104,6 +104,20 @@ impl RangeCatalog {
     pub fn merge_history(&self) -> &[RangeMerge] {
         &self.merge_history
     }
+
+    pub fn active_range_ids(&self) -> &BTreeSet<RangeId> {
+        &self.active_range_ids
+    }
+
+    pub fn allocate_range_id(&self) -> RangeId {
+        let max_id = self
+            .descriptors
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(RangeId::ROOT);
+        RangeId(max_id.0 + 1)
+    }
 }
 
 fn apply_descriptor(
@@ -667,6 +681,35 @@ mod tests {
                 },
             }],
         )
+    }
+
+    #[test]
+    fn allocate_range_id_returns_next_after_max_known_descriptor() {
+        let catalog = RangeCatalog::rebuild(&[
+            CommitRecord::root_bootstrap(vec![0, 1, 2]),
+            split_root_record(),
+        ])
+        .expect("rebuild");
+
+        assert_eq!(catalog.allocate_range_id(), RangeId(4));
+    }
+
+    #[test]
+    fn allocate_range_id_skips_ids_retired_by_merge() {
+        let catalog = RangeCatalog::rebuild(&[
+            CommitRecord::root_bootstrap(vec![0, 1, 2]),
+            split_root_record(),
+            merge_ranges_record(3),
+        ])
+        .expect("rebuild");
+
+        assert_eq!(catalog.allocate_range_id(), RangeId(5));
+    }
+
+    #[test]
+    fn allocate_range_id_on_empty_catalog_returns_root_plus_one() {
+        let catalog = RangeCatalog::default();
+        assert_eq!(catalog.allocate_range_id(), RangeId(RangeId::ROOT.0 + 1));
     }
 
     #[test]
