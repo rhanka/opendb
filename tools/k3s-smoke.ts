@@ -34,6 +34,7 @@ export type K3sSmokePlanOptions = {
   localPgwirePort: number;
   namespace: string;
   withRestartRecovery: boolean;
+  withRangeSplit: boolean;
 };
 
 export type PodSummary = {
@@ -48,10 +49,12 @@ type SmokeOptions = {
   expectedReplicas: number;
   kubectl: string;
   localPgwirePort: number;
+  localAdminPort: number;
   namespace: string;
   printPlan: boolean;
   timeoutMs: number;
   withRestartRecovery: boolean;
+  withRangeSplit: boolean;
 };
 
 type PortForwardProcess = ChildProcessByStdio<null, Readable, Readable>;
@@ -154,6 +157,11 @@ export function buildK3sSmokePlan(options: K3sSmokePlanOptions): K3sSmokePlanSte
     },
     {
       description: "no object storage service is required"
+    },
+    {
+      description: options.withRangeSplit
+        ? "split the root range through the leader admin endpoint and verify RangeCatalogStable"
+        : "skip range split exercise (pass --with-range-split to execute)"
     }
   ];
 }
@@ -293,6 +301,10 @@ async function runK3sSmoke(options: SmokeOptions): Promise<void> {
     await runRestartRecovery(options);
   }
 
+  if (options.withRangeSplit) {
+    await runRangeSplit(options);
+  }
+
   console.log("k3s smoke passed");
 }
 
@@ -345,6 +357,180 @@ async function runRestartRecovery(options: SmokeOptions): Promise<void> {
   );
 
   console.log("restart-recovery passed");
+}
+
+async function runRangeSplit(options: SmokeOptions): Promise<void> {
+  console.log("range-split: waiting for RangeCatalogStable=True before split");
+  await waitForRangeCatalogCondition(options, (summary) => {
+    return summary.active_range_count === 1;
+  });
+
+  const leaderPod = await readLeaderPod(options);
+  if (leaderPod === undefined) {
+    throw new Error("range-split: no leader pod observed");
+  }
+  console.log(`range-split: posting split to ${leaderPod}`);
+
+  const table = `range_split_smoke_${Date.now()}_${process.pid}`;
+  await withPgwirePortForward(options, async () => {
+    await pgwireExec(options, [
+      `CREATE TABLE ${table} (id INT PRIMARY KEY, name TEXT)`,
+      `INSERT INTO ${table} VALUES (1, 'pre-split')`
+    ]);
+  });
+
+  const splitResponse = await postAdminToLeader(options, leaderPod, "/admin/ranges/split", {
+    sourceRangeId: 1,
+    splitKey: `${table}/2`
+  });
+  const rangeIds = arrayField(splitResponse, "rangeIds");
+  if (rangeIds.length !== 2) {
+    throw new Error(`expected rangeIds length 2, got ${JSON.stringify(splitResponse)}`);
+  }
+  const txId = numberField(splitResponse, "txId");
+  console.log(`range-split: split committed at txId=${txId} into ranges ${JSON.stringify(rangeIds)}`);
+
+  console.log("range-split: waiting for RangeCatalogStable=True with active_range_count=2");
+  await waitForRangeCatalogCondition(options, (summary) => {
+    return summary.active_range_count === 2 && summary.last_split_tx_id !== null;
+  });
+
+  await withPgwirePortForward(options, async () => {
+    const inserts = await pgwireExec(options, [
+      `INSERT INTO ${table} VALUES (2, 'post-split-left')`,
+      `INSERT INTO ${table} VALUES (9, 'post-split-right')`,
+      `SELECT * FROM ${table}`
+    ]);
+    if (inserts.length !== 3) {
+      throw new Error(`range-split: pgwire-exec returned ${inserts.length} results, expected 3`);
+    }
+    const select = inserts[2];
+    if (select === undefined || select.rows.length !== 3) {
+      throw new Error(`range-split: expected 3 rows after split, got ${JSON.stringify(select?.rows)}`);
+    }
+  });
+
+  console.log("range-split passed");
+}
+
+type RangeCatalogSummary = {
+  reporting_replicas: number;
+  active_range_count: number | null;
+  last_split_tx_id: number | null;
+  last_merge_tx_id: number | null;
+};
+
+async function waitForRangeCatalogCondition(
+  options: SmokeOptions,
+  predicate: (summary: RangeCatalogSummary) => boolean
+): Promise<void> {
+  await poll("RangeCatalogStable summary", options.timeoutMs, async () => {
+    const output = await captureCommand(
+      options.kubectl,
+      ["get", "opendbcluster", options.clusterName, "-n", options.namespace, "-o", "json"],
+      { timeoutMs: options.timeoutMs }
+    );
+    const value = JSON.parse(output.stdout) as unknown;
+    if (!isRecord(value) || !isRecord(value.status)) {
+      throw new Error("opendbcluster missing status");
+    }
+    const conditions = optionalArray(value.status.conditions);
+    const stable = conditions.find((c) => isRecord(c) && c.type === "RangeCatalogStable");
+    if (!isRecord(stable) || stable.status !== "True") {
+      throw new Error(`RangeCatalogStable not True yet: ${JSON.stringify(stable)}`);
+    }
+    const recovery = value.status.recovery;
+    if (!isRecord(recovery) || !isRecord(recovery.rangeCatalog)) {
+      throw new Error("recovery.rangeCatalog missing");
+    }
+    const summary: RangeCatalogSummary = {
+      reporting_replicas:
+        typeof recovery.rangeCatalog.reportingReplicas === "number"
+          ? recovery.rangeCatalog.reportingReplicas
+          : 0,
+      active_range_count:
+        typeof recovery.rangeCatalog.activeRangeCount === "number"
+          ? recovery.rangeCatalog.activeRangeCount
+          : null,
+      last_split_tx_id:
+        typeof recovery.rangeCatalog.lastSplitTxId === "number"
+          ? recovery.rangeCatalog.lastSplitTxId
+          : null,
+      last_merge_tx_id:
+        typeof recovery.rangeCatalog.lastMergeTxId === "number"
+          ? recovery.rangeCatalog.lastMergeTxId
+          : null
+    };
+    if (!predicate(summary)) {
+      throw new Error(`RangeCatalogStable summary did not match predicate yet: ${JSON.stringify(summary)}`);
+    }
+  });
+}
+
+async function postAdminToLeader(
+  options: SmokeOptions,
+  leaderPod: string,
+  path: string,
+  body: unknown
+): Promise<unknown> {
+  const child = spawn(
+    options.kubectl,
+    ["port-forward", `pod/${leaderPod}`, `${options.localAdminPort}:7300`, "-n", options.namespace],
+    { cwd: repoRoot, env: process.env, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  try {
+    await waitForPortForwardReady(child, options.localAdminPort, options.timeoutMs);
+    const payload = JSON.stringify(body);
+    const result = await captureCommand(
+      "curl",
+      [
+        "-sS",
+        "-X",
+        "POST",
+        "-H",
+        "content-type: application/json",
+        "-d",
+        payload,
+        "-w",
+        "\\n%{http_code}",
+        `http://127.0.0.1:${options.localAdminPort}${path}`
+      ],
+      { timeoutMs: options.timeoutMs }
+    );
+    const trimmed = result.stdout.trimEnd();
+    const lastNewline = trimmed.lastIndexOf("\n");
+    const statusText = lastNewline >= 0 ? trimmed.slice(lastNewline + 1) : trimmed;
+    const bodyText = lastNewline >= 0 ? trimmed.slice(0, lastNewline) : "";
+    const status = Number.parseInt(statusText, 10);
+    if (status !== 202) {
+      throw new Error(`admin POST ${path} returned ${status}: ${bodyText}`);
+    }
+    return JSON.parse(bodyText) as unknown;
+  } finally {
+    await stopPortForward(child);
+  }
+}
+
+function arrayField(value: unknown, key: string): unknown[] {
+  if (!isRecord(value)) {
+    throw new Error(`expected object, got ${typeof value}`);
+  }
+  const inner = value[key];
+  if (!Array.isArray(inner)) {
+    throw new Error(`expected array at .${key}`);
+  }
+  return inner;
+}
+
+function numberField(value: unknown, key: string): number {
+  if (!isRecord(value)) {
+    throw new Error(`expected object, got ${typeof value}`);
+  }
+  const inner = value[key];
+  if (typeof inner !== "number") {
+    throw new Error(`expected number at .${key}`);
+  }
+  return inner;
 }
 
 async function withPgwirePortForward(
@@ -701,10 +887,12 @@ export function parseSmokeOptions(args: string[]): SmokeOptions {
     expectedReplicas: defaultExpectedReplicas,
     kubectl: envString("KUBECTL", "kubectl"),
     localPgwirePort: envNumber("OPENDB_LOCAL_PGWIRE_PORT", 15432),
+    localAdminPort: envNumber("OPENDB_LOCAL_ADMIN_PORT", 17300),
     namespace: defaultNamespace,
     printPlan: false,
     timeoutMs: envNumber("OPENDB_K3S_SMOKE_TIMEOUT_MS", defaultTimeoutMs),
-    withRestartRecovery: process.env.OPENDB_K3S_WITH_RESTART_RECOVERY === "1"
+    withRestartRecovery: process.env.OPENDB_K3S_WITH_RESTART_RECOVERY === "1",
+    withRangeSplit: process.env.OPENDB_K3S_WITH_RANGE_SPLIT === "1"
   };
   rejectStaticManifestEnvOverride("OPENDB_CLUSTER_NAME", defaultClusterName);
   rejectStaticManifestEnvOverride("OPENDB_NAMESPACE", defaultNamespace);
@@ -736,6 +924,9 @@ export function parseSmokeOptions(args: string[]): SmokeOptions {
         break;
       case "--with-restart-recovery":
         options.withRestartRecovery = true;
+        break;
+      case "--with-range-split":
+        options.withRangeSplit = true;
         break;
       default:
         throw new Error(`unknown argument: ${arg}`);

@@ -55,6 +55,8 @@ spec:
               containerPort: 5432
             - name: health
               containerPort: 8080
+            - name: admin
+              containerPort: 7300
             - name: internal
               containerPort: 7000
           readinessProbe:

@@ -61,6 +61,27 @@ test("k3s smoke plan with --with-restart-recovery attaches kubectl delete pod an
   expect(deleteStep?.command?.args).toEqual(["delete", "pod", "<leader>", "-n", "opendb-system"]);
 });
 
+test("k3s smoke plan default does not exercise the admin range split endpoint", () => {
+  const plan = buildK3sSmokePlan(parseSmokeOptions([]));
+  const output = plan
+    .map((step, index) => `${index + 1}. ${step.description}${step.command === undefined ? "" : `: ${commandText(step.command)}`}`)
+    .join("\n");
+
+  expect(output).toContain("skip range split exercise");
+  expect(output).not.toContain("/admin/ranges/split");
+});
+
+test("k3s smoke plan with --with-range-split documents the split exercise without inlining curl", () => {
+  const plan = buildK3sSmokePlan(parseSmokeOptions(["--with-range-split"]));
+  const output = plan
+    .map((step, index) => `${index + 1}. ${step.description}${step.command === undefined ? "" : `: ${commandText(step.command)}`}`)
+    .join("\n");
+
+  expect(output).toContain("split the root range through the leader admin endpoint");
+  expect(output).toContain("RangeCatalogStable");
+  expect(output).not.toContain("kubectl delete pod");
+});
+
 test("pod summary counts running DB containers and ignores terminating pods", () => {
   const summary = summarizeOpenDbPods({
     items: [
