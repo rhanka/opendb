@@ -49,6 +49,12 @@ impl RangeCatalog {
                 | Mutation::InsertRow { .. }
                 | Mutation::PutArchiveObjectPointer { .. }
                 | Mutation::PutRecoveryArtifactPointer { .. } => {}
+                Mutation::SplitRange { .. } | Mutation::MergeRanges { .. } => {
+                    return Err(OpenDbError::InvalidInput(
+                        "range split/merge metadata requires active range catalog support"
+                            .to_string(),
+                    ));
+                }
             }
         }
         validate_parent_graph(&candidate)?;
@@ -269,7 +275,7 @@ mod tests {
         ArchiveBackendKind, ArchiveObjectPointer, CompressionKind, RecoveryArtifactKind,
         RecoveryArtifactPointer,
     };
-    use crate::commit_stream::{CommitRecord, Mutation};
+    use crate::commit_stream::{CommitRecord, Mutation, RangeMerge, RangeSplit};
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     fn root_descriptor() -> RangeDescriptor {
@@ -341,6 +347,34 @@ mod tests {
                     record_count: 0,
                     byte_len: 0,
                     compression: CompressionKind::None,
+                },
+            }],
+        )
+    }
+
+    fn split_range_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "orders/".to_owned(),
+                    left: child_descriptor(RangeId(2), None, Some("orders/")),
+                    right: child_descriptor(RangeId(3), Some("orders/"), None),
+                },
+            }],
+        )
+    }
+
+    fn merge_ranges_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::MergeRanges {
+                merge: RangeMerge {
+                    source_range_ids: vec![RangeId(2), RangeId(3)],
+                    merged: child_descriptor(RangeId(4), None, None),
                 },
             }],
         )
@@ -691,5 +725,29 @@ mod tests {
             RangeCatalog::rebuild(&[root_record, recovery_artifact_record(2)]).expect("rebuild");
 
         assert_eq!(catalog.descriptor(RangeId::ROOT), Some(&root));
+    }
+
+    #[test]
+    fn range_catalog_rejects_split_merge_until_active_catalog_support() {
+        let root = root_descriptor();
+        let root_record = CommitRecord::new(
+            TransactionId(1),
+            LogicalTimestamp(1),
+            vec![Mutation::PutRangeDescriptor {
+                descriptor: root.clone(),
+            }],
+        );
+
+        for metadata_record in [split_range_record(2), merge_ranges_record(3)] {
+            let error = RangeCatalog::rebuild(&[root_record.clone(), metadata_record])
+                .expect_err("reject unsupported range metadata");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("range split/merge metadata requires active range catalog support"),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

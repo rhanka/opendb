@@ -52,6 +52,22 @@ pub struct ColumnValue {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RangeSplit {
+    pub source_range_id: RangeId,
+    pub split_key: String,
+    pub left: RangeDescriptor,
+    pub right: RangeDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RangeMerge {
+    pub source_range_ids: Vec<RangeId>,
+    pub merged: RangeDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Mutation {
     CreateTable {
         table: String,
@@ -64,6 +80,12 @@ pub enum Mutation {
     },
     PutRangeDescriptor {
         descriptor: RangeDescriptor,
+    },
+    SplitRange {
+        split: RangeSplit,
+    },
+    MergeRanges {
+        merge: RangeMerge,
     },
     PutArchiveObjectPointer {
         pointer: ArchiveObjectPointer,
@@ -98,10 +120,20 @@ impl CommitRecord {
         actor: impl Into<String>,
         mutations: Vec<Mutation>,
     ) -> Self {
+        Self::new_for_range(RangeId::ROOT, tx_id, ts, actor, mutations)
+    }
+
+    pub fn new_for_range(
+        range_id: RangeId,
+        tx_id: TransactionId,
+        ts: LogicalTimestamp,
+        actor: impl Into<String>,
+        mutations: Vec<Mutation>,
+    ) -> Self {
         Self {
             version: Self::VERSION,
             tx_id,
-            range_id: RangeId::ROOT,
+            range_id,
             ts,
             actor: actor.into(),
             mutations,
@@ -279,6 +311,94 @@ mod tests {
             record.mutations,
             vec![Mutation::PutRecoveryArtifactPointer { artifact }]
         );
+    }
+
+    #[test]
+    fn commit_record_serializes_range_split_metadata_mutation() {
+        let split = RangeSplit {
+            source_range_id: RangeId::ROOT,
+            split_key: "orders/".to_owned(),
+            left: RangeDescriptor {
+                range_id: RangeId(2),
+                parent_range_id: Some(RangeId::ROOT),
+                key_start: None,
+                key_end: Some("orders/".to_owned()),
+                replica_node_ids: vec![0, 1, 2],
+            },
+            right: RangeDescriptor {
+                range_id: RangeId(3),
+                parent_range_id: Some(RangeId::ROOT),
+                key_start: Some("orders/".to_owned()),
+                key_end: None,
+                replica_node_ids: vec![0, 1, 2],
+            },
+        };
+        let record = CommitRecord::new(
+            TransactionId(51),
+            LogicalTimestamp(16),
+            vec![Mutation::SplitRange {
+                split: split.clone(),
+            }],
+        );
+
+        let encoded = serde_json::to_string(&record).expect("serialize split record");
+        let decoded: CommitRecord = serde_json::from_str(&encoded).expect("decode split record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(CommitRecord::VERSION, 2);
+        assert_eq!(record.mutations, vec![Mutation::SplitRange { split }]);
+    }
+
+    #[test]
+    fn commit_record_serializes_range_merge_metadata_mutation() {
+        let merge = RangeMerge {
+            source_range_ids: vec![RangeId(2), RangeId(3)],
+            merged: RangeDescriptor {
+                range_id: RangeId(4),
+                parent_range_id: Some(RangeId::ROOT),
+                key_start: None,
+                key_end: None,
+                replica_node_ids: vec![0, 1, 2],
+            },
+        };
+        let record = CommitRecord::new(
+            TransactionId(52),
+            LogicalTimestamp(17),
+            vec![Mutation::MergeRanges {
+                merge: merge.clone(),
+            }],
+        );
+
+        let encoded = serde_json::to_string(&record).expect("serialize merge record");
+        let decoded: CommitRecord = serde_json::from_str(&encoded).expect("decode merge record");
+
+        assert_eq!(decoded, record);
+        assert_eq!(record.version, CommitRecord::VERSION);
+        assert_eq!(CommitRecord::VERSION, 2);
+        assert_eq!(record.mutations, vec![Mutation::MergeRanges { merge }]);
+    }
+
+    #[test]
+    fn commit_record_builds_record_for_logical_range() {
+        let record = CommitRecord::new_for_range(
+            RangeId(2),
+            TransactionId(53),
+            LogicalTimestamp(18),
+            CommitRecord::BOOTSTRAP_ACTOR,
+            vec![Mutation::InsertRow {
+                table: "accounts".to_owned(),
+                key: "1".to_owned(),
+                values: vec![ColumnValue {
+                    column: "id".to_owned(),
+                    value: Value::Int64(1),
+                }],
+            }],
+        );
+
+        assert_eq!(record.range_id, RangeId(2));
+        assert_eq!(record.tx_id, TransactionId(53));
+        assert_eq!(record.ts, LogicalTimestamp(18));
     }
 
     #[test]

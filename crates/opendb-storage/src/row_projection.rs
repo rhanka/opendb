@@ -152,6 +152,8 @@ impl RowProjection {
                     table_state.rows.insert(key.clone(), row);
                 }
                 Mutation::PutRangeDescriptor { .. }
+                | Mutation::SplitRange { .. }
+                | Mutation::MergeRanges { .. }
                 | Mutation::PutArchiveObjectPointer { .. }
                 | Mutation::PutRecoveryArtifactPointer { .. } => {}
             }
@@ -194,8 +196,10 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use crate::commit_stream::{
-        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
+        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, RangeMerge, RangeSplit,
+        Value,
     };
+    use crate::range_catalog::RangeDescriptor;
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     fn create_accounts_record(tx_id: u64) -> CommitRecord {
@@ -267,6 +271,52 @@ mod tests {
                     record_count: 0,
                     byte_len: 0,
                     compression: CompressionKind::None,
+                },
+            }],
+        )
+    }
+
+    fn split_range_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "orders/".to_owned(),
+                    left: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: Some("orders/".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                    right: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: Some("orders/".to_owned()),
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
+                },
+            }],
+        )
+    }
+
+    fn merge_ranges_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::MergeRanges {
+                merge: RangeMerge {
+                    source_range_ids: vec![RangeId(2), RangeId(3)],
+                    merged: RangeDescriptor {
+                        range_id: RangeId(4),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
                 },
             }],
         )
@@ -542,6 +592,24 @@ mod tests {
             create_accounts_record(1),
             recovery_artifact_record(2),
             insert_account_record(3, "1"),
+        ])
+        .expect("rebuild projection");
+        let accounts = projection.table("accounts").expect("accounts table");
+
+        assert_eq!(accounts.rows.len(), 1);
+        assert_eq!(
+            accounts.rows.get("1").and_then(|row| row.get("name")),
+            Some(&Value::Text("Ada".to_owned()))
+        );
+    }
+
+    #[test]
+    fn row_projection_ignores_range_split_merge_metadata() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            split_range_record(2),
+            merge_ranges_record(3),
+            insert_account_record(4, "1"),
         ])
         .expect("rebuild projection");
         let accounts = projection.table("accounts").expect("accounts table");

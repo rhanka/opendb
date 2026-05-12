@@ -105,7 +105,9 @@ impl ArchiveManifest {
                 }
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
-                | Mutation::PutRangeDescriptor { .. } => {}
+                | Mutation::PutRangeDescriptor { .. }
+                | Mutation::SplitRange { .. }
+                | Mutation::MergeRanges { .. } => {}
             }
         }
         Ok(())
@@ -266,7 +268,8 @@ fn backend_name(backend: &ArchiveBackendKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit_stream::{CommitRecord, Mutation};
+    use crate::commit_stream::{CommitRecord, Mutation, RangeMerge, RangeSplit};
+    use crate::range_catalog::RangeDescriptor;
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
 
     fn pointer() -> ArchiveObjectPointer {
@@ -310,6 +313,52 @@ mod tests {
         )
     }
 
+    fn split_range_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "orders/".to_owned(),
+                    left: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: Some("orders/".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                    right: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: Some("orders/".to_owned()),
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
+                },
+            }],
+        )
+    }
+
+    fn merge_ranges_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::MergeRanges {
+                merge: RangeMerge {
+                    source_range_ids: vec![RangeId(2), RangeId(3)],
+                    merged: RangeDescriptor {
+                        range_id: RangeId(4),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
+                },
+            }],
+        )
+    }
+
     #[test]
     fn archive_manifest_rebuilds_object_pointers_from_commit_stream() {
         let pointer = pointer();
@@ -340,6 +389,28 @@ mod tests {
         let manifest = ArchiveManifest::rebuild(&[record]).expect("rebuild manifest");
 
         assert_eq!(manifest.recovery_artifacts(), &[artifact]);
+    }
+
+    #[test]
+    fn archive_manifest_ignores_range_split_merge_metadata() {
+        let pointer = pointer();
+        let pointer_record = CommitRecord::new(
+            TransactionId(49),
+            LogicalTimestamp(14),
+            vec![Mutation::PutArchiveObjectPointer {
+                pointer: pointer.clone(),
+            }],
+        );
+
+        let manifest = ArchiveManifest::rebuild(&[
+            split_range_record(47),
+            pointer_record,
+            merge_ranges_record(50),
+        ])
+        .expect("rebuild archive manifest");
+
+        assert_eq!(manifest.object_pointers(), &[pointer]);
+        assert!(manifest.recovery_artifacts().is_empty());
     }
 
     #[test]
