@@ -1,6 +1,6 @@
 use crate::ast::{Predicate, Statement};
 use opendb_common::{OpenDbError, OpenDbResult};
-use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Value};
+use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, DefaultExpr, Value};
 
 pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     let trimmed = sql.trim();
@@ -57,47 +57,136 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
 }
 
 fn parse_column_definition(raw: &str) -> OpenDbResult<ColumnDefinition> {
-    let tokens = raw.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() != 2 && tokens.len() != 4 {
+    let trimmed = raw.trim();
+    let tokens = split_definition_tokens(trimmed)?;
+    if tokens.len() < 2 {
         return Err(OpenDbError::Sql(format!(
-            "invalid column definition: {}",
-            raw.trim()
+            "invalid column definition: {trimmed}"
         )));
     }
-    let name = tokens[0];
+    let name = &tokens[0];
     if name.is_empty() {
         return Err(OpenDbError::Sql("column name is required".to_owned()));
     }
-    let data_type = parse_column_type(tokens[1])?;
-    let primary_key = if tokens.len() == 4 {
-        if tokens[2].eq_ignore_ascii_case("PRIMARY") && tokens[3].eq_ignore_ascii_case("KEY") {
-            true
-        } else {
-            return Err(OpenDbError::Sql(format!(
-                "unsupported column constraint on {name}"
-            )));
-        }
-    } else {
-        false
-    };
 
-    Ok(if primary_key {
-        ColumnDefinition::primary_key(name, data_type)
+    let (data_type, type_token_count) = parse_column_type_tokens(&tokens[1..])?;
+    let mut index = 1 + type_token_count;
+    let mut primary_key = false;
+    let mut not_null = false;
+    let mut default: Option<DefaultExpr> = None;
+
+    while index < tokens.len() {
+        let token = tokens[index].to_ascii_uppercase();
+        match token.as_str() {
+            "PRIMARY" => {
+                if index + 1 >= tokens.len() || !tokens[index + 1].eq_ignore_ascii_case("KEY") {
+                    return Err(OpenDbError::Sql(format!(
+                        "unsupported column constraint on {name}"
+                    )));
+                }
+                primary_key = true;
+                index += 2;
+            }
+            "NOT" => {
+                if index + 1 >= tokens.len() || !tokens[index + 1].eq_ignore_ascii_case("NULL") {
+                    return Err(OpenDbError::Sql(format!(
+                        "unsupported column constraint on {name}"
+                    )));
+                }
+                not_null = true;
+                index += 2;
+            }
+            "DEFAULT" => {
+                if index + 1 >= tokens.len() {
+                    return Err(OpenDbError::Sql(format!(
+                        "DEFAULT requires an expression on {name}"
+                    )));
+                }
+                let candidate = &tokens[index + 1];
+                if candidate.eq_ignore_ascii_case("NOW()") {
+                    default = Some(DefaultExpr::Now);
+                    index += 2;
+                } else {
+                    default = Some(DefaultExpr::Const(parse_value(candidate)?));
+                    index += 2;
+                }
+            }
+            _ => {
+                return Err(OpenDbError::Sql(format!(
+                    "unsupported column constraint on {name}"
+                )));
+            }
+        }
+    }
+
+    let definition = if primary_key {
+        let mut pk = ColumnDefinition::primary_key(name, data_type);
+        pk.default = default;
+        pk
     } else {
-        ColumnDefinition::new(name, data_type)
-    })
+        ColumnDefinition {
+            name: name.clone(),
+            data_type,
+            primary_key: false,
+            nullable: !not_null,
+            default,
+        }
+    };
+    Ok(definition)
 }
 
-fn parse_column_type(raw: &str) -> OpenDbResult<ColumnType> {
-    if raw.eq_ignore_ascii_case("INT")
-        || raw.eq_ignore_ascii_case("INT64")
-        || raw.eq_ignore_ascii_case("BIGINT")
-    {
-        Ok(ColumnType::Int64)
-    } else if raw.eq_ignore_ascii_case("TEXT") {
-        Ok(ColumnType::Text)
-    } else {
-        Err(OpenDbError::Sql(format!("unsupported column type: {raw}")))
+fn split_definition_tokens(raw: &str) -> OpenDbResult<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in raw.chars() {
+        match ch {
+            '\'' => {
+                current.push(ch);
+                in_quote = !in_quote;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if in_quote {
+        return Err(OpenDbError::Sql("unterminated quoted literal".to_owned()));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn parse_column_type_tokens(tokens: &[String]) -> OpenDbResult<(ColumnType, usize)> {
+    if tokens.is_empty() {
+        return Err(OpenDbError::Sql("column type is required".to_owned()));
+    }
+    let first = tokens[0].to_ascii_uppercase();
+    match first.as_str() {
+        "INT" | "INTEGER" | "INT64" | "BIGINT" => Ok((ColumnType::Int64, 1)),
+        "TEXT" => Ok((ColumnType::Text, 1)),
+        "BOOL" | "BOOLEAN" => Ok((ColumnType::Bool, 1)),
+        "FLOAT8" | "FLOAT64" => Ok((ColumnType::Float64, 1)),
+        "DOUBLE" => {
+            if tokens.len() >= 2 && tokens[1].eq_ignore_ascii_case("PRECISION") {
+                Ok((ColumnType::Float64, 2))
+            } else {
+                Err(OpenDbError::Sql(format!(
+                    "unsupported column type: {}",
+                    tokens[0]
+                )))
+            }
+        }
+        "TIMESTAMP" => Ok((ColumnType::Timestamp, 1)),
+        _ => Err(OpenDbError::Sql(format!(
+            "unsupported column type: {}",
+            tokens[0]
+        ))),
     }
 }
 
@@ -107,10 +196,47 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
     let values_pos = upper
         .find(values_marker)
         .ok_or_else(|| OpenDbError::Sql("INSERT requires VALUES".to_owned()))?;
-    let table = strip_keyword_prefix(&sql[..values_pos], "INSERT INTO ")
+    let header = strip_keyword_prefix(&sql[..values_pos], "INSERT INTO ")
         .ok_or_else(|| OpenDbError::Sql("invalid INSERT".to_owned()))?
-        .trim()
-        .to_owned();
+        .trim();
+    if header.is_empty() {
+        return Err(OpenDbError::Sql("INSERT requires table".to_owned()));
+    }
+    let (table, columns) = if let Some(open) = header.find('(') {
+        let close = header
+            .rfind(')')
+            .ok_or_else(|| OpenDbError::Sql("missing INSERT column list close paren".to_owned()))?;
+        if open >= close {
+            return Err(OpenDbError::Sql("malformed INSERT column list".to_owned()));
+        }
+        if !header[close + 1..].trim().is_empty() {
+            return Err(OpenDbError::Sql(
+                "trailing input between INSERT column list and VALUES".to_owned(),
+            ));
+        }
+        let table = header[..open].trim().to_owned();
+        let columns = split_values(&header[open + 1..close])?
+            .into_iter()
+            .map(|c| {
+                let trimmed = c.trim();
+                if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+                    Err(OpenDbError::Sql(format!(
+                        "invalid INSERT column name: {trimmed}"
+                    )))
+                } else {
+                    Ok(trimmed.to_owned())
+                }
+            })
+            .collect::<OpenDbResult<Vec<String>>>()?;
+        if columns.is_empty() {
+            return Err(OpenDbError::Sql(
+                "INSERT column list must not be empty".to_owned(),
+            ));
+        }
+        (table, Some(columns))
+    } else {
+        (header.to_owned(), None)
+    };
     if table.is_empty() {
         return Err(OpenDbError::Sql("INSERT requires table".to_owned()));
     }
@@ -133,7 +259,7 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
         .collect::<OpenDbResult<Vec<_>>>()?;
     Ok(Statement::Insert {
         table,
-        columns: None,
+        columns,
         values,
     })
 }
@@ -163,13 +289,29 @@ fn split_values(raw: &str) -> OpenDbResult<Vec<&str>> {
 }
 
 fn parse_value(value: &str) -> OpenDbResult<Value> {
-    if let Some(text) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return Ok(Value::Null);
+    }
+    if trimmed.eq_ignore_ascii_case("TRUE") {
+        return Ok(Value::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("FALSE") {
+        return Ok(Value::Bool(false));
+    }
+    if let Some(text) = trimmed
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+    {
         return Ok(Value::Text(text.to_owned()));
     }
-    value
-        .parse::<i64>()
-        .map(Value::Int64)
-        .map_err(|_| OpenDbError::Sql(format!("unsupported literal: {value}")))
+    if let Ok(int_value) = trimmed.parse::<i64>() {
+        return Ok(Value::Int64(int_value));
+    }
+    if let Ok(float_value) = trimmed.parse::<f64>() {
+        return Ok(Value::Float64(float_value));
+    }
+    Err(OpenDbError::Sql(format!("unsupported literal: {trimmed}")))
 }
 
 fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
@@ -420,6 +562,97 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn parses_extended_column_types_with_not_null_and_default() {
+        let stmt = parse(
+            "CREATE TABLE typed (id INT PRIMARY KEY, completed BOOL DEFAULT false, ratio FLOAT8, label TEXT NOT NULL DEFAULT 'completed', created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+        )
+        .expect("create typed");
+        let Statement::CreateTable { table, columns } = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(table, "typed");
+        assert_eq!(columns[0].name, "id");
+        assert!(columns[0].primary_key);
+        assert!(!columns[0].nullable);
+        assert!(columns[0].default.is_none());
+
+        assert_eq!(columns[1].name, "completed");
+        assert!(matches!(columns[1].data_type, ColumnType::Bool));
+        assert!(columns[1].nullable);
+        assert_eq!(
+            columns[1].default,
+            Some(DefaultExpr::Const(Value::Bool(false)))
+        );
+
+        assert_eq!(columns[2].name, "ratio");
+        assert!(matches!(columns[2].data_type, ColumnType::Float64));
+
+        assert_eq!(columns[3].name, "label");
+        assert!(!columns[3].nullable);
+        assert_eq!(
+            columns[3].default,
+            Some(DefaultExpr::Const(Value::Text("completed".to_owned())))
+        );
+
+        assert_eq!(columns[4].name, "created_at");
+        assert!(matches!(columns[4].data_type, ColumnType::Timestamp));
+        assert!(!columns[4].nullable);
+        assert_eq!(columns[4].default, Some(DefaultExpr::Now));
+    }
+
+    #[test]
+    fn parses_double_precision_alias() {
+        let stmt =
+            parse("CREATE TABLE t (id INT PRIMARY KEY, ratio DOUBLE PRECISION)").expect("create");
+        let Statement::CreateTable { columns, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(matches!(columns[1].data_type, ColumnType::Float64));
+    }
+
+    #[test]
+    fn parses_insert_with_named_columns() {
+        let stmt = parse("INSERT INTO accounts (id, name) VALUES (1, 'Ada')").expect("insert");
+        assert_eq!(
+            stmt,
+            Statement::Insert {
+                table: "accounts".to_owned(),
+                columns: Some(vec!["id".to_owned(), "name".to_owned()]),
+                values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_insert_with_empty_named_column_list() {
+        assert!(matches!(
+            parse("INSERT INTO accounts () VALUES (1)"),
+            Err(OpenDbError::Sql(_))
+        ));
+    }
+
+    #[test]
+    fn parses_null_and_boolean_literals() {
+        let stmt = parse("INSERT INTO t VALUES (NULL, TRUE, FALSE)").expect("insert");
+        let Statement::Insert { values, .. } = stmt else {
+            panic!("expected Insert");
+        };
+        assert_eq!(
+            values,
+            vec![Value::Null, Value::Bool(true), Value::Bool(false)]
+        );
+    }
+
+    #[test]
+    fn parses_float_literal() {
+        let stmt = parse("INSERT INTO t VALUES (1, 3.5)").expect("insert");
+        let Statement::Insert { values, .. } = stmt else {
+            panic!("expected Insert");
+        };
+        assert_eq!(values, vec![Value::Int64(1), Value::Float64(3.5)]);
     }
 
     #[test]
