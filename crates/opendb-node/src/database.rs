@@ -1,16 +1,17 @@
-use opendb_common::{OpenDbError, OpenDbResult};
+use opendb_common::{OpenDbError, OpenDbResult, RangeId};
 use opendb_consensus::root_range::{RootRange, RootRangeCommand, RootRangePeerServer};
 use opendb_sql::{
     ast::{QueryResult, Statement},
-    executor::{PreparedQuery, SqlEngine},
+    executor::{PreparedQuery, RouteIntent, SqlEngine},
 };
-use opendb_storage::commit_stream::CommitRecord;
+use opendb_storage::{commit_stream::CommitRecord, range_catalog::RangeCatalog};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct Database {
     root_range: RootRange,
     engine: SqlEngine,
+    range_catalog: RangeCatalog,
     peer_server: Option<Arc<RootRangePeerServer>>,
     recovery_status: DatabaseRecoveryStatus,
 }
@@ -33,11 +34,13 @@ impl Database {
         }
         let records = root_range.replay().await?;
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
+        let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
 
         Ok(Self {
             root_range,
             engine,
+            range_catalog,
             peer_server: None,
             recovery_status,
         })
@@ -54,11 +57,13 @@ impl Database {
         }
         let records = root_range.replay().await?;
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
+        let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
 
         Ok(Self {
             root_range,
             engine,
+            range_catalog,
             peer_server: Some(peer_server),
             recovery_status,
         })
@@ -78,9 +83,17 @@ impl Database {
         }
 
         match self.engine.prepare(statement)? {
-            PreparedQuery::Read { result, .. } => Ok(result),
-            PreparedQuery::Write { record, tag, .. } => {
+            PreparedQuery::Read { result, route } => {
+                let _target_range_id = self.resolve_route(&route)?;
+                Ok(result)
+            }
+            PreparedQuery::Write {
+                mut record,
+                tag,
+                route,
+            } => {
                 self.ensure_leader_for_client_query().await?;
+                record.range_id = self.resolve_route(&route)?;
                 self.root_range
                     .submit(RootRangeCommand {
                         record: record.clone(),
@@ -92,11 +105,23 @@ impl Database {
         }
     }
 
+    fn resolve_route(&self, route: &RouteIntent) -> OpenDbResult<RangeId> {
+        match route {
+            RouteIntent::Root | RouteIntent::Scan { .. } => Ok(RangeId::ROOT),
+            RouteIntent::Key { key, .. } => self
+                .range_catalog
+                .route_key(key)
+                .map(|descriptor| descriptor.range_id)
+                .ok_or_else(|| OpenDbError::Storage(format!("no range route for key {key}"))),
+        }
+    }
+
     /// Rebuilds the in-memory SQL engine from the canonical commit stream.
     /// Used before every `execute` so that records committed via OpenRaft
     /// replication (which bypass `Database::execute`) are observed on reads.
     async fn refresh_engine_from_wal(&mut self) -> OpenDbResult<()> {
         let records = self.root_range.replay().await?;
+        self.range_catalog = RangeCatalog::rebuild(&records)?;
         self.engine = SqlEngine::from_commits(records)?;
         Ok(())
     }
@@ -145,13 +170,14 @@ impl DatabaseRecoveryStatus {
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use opendb_common::OpenDbError;
-    use opendb_consensus::root_range::{RootRange, RootRangeAuthority};
+    use opendb_common::{LogicalTimestamp, OpenDbError, RangeId, TransactionId};
+    use opendb_consensus::root_range::{RootRange, RootRangeAuthority, RootRangeCommand};
     use opendb_sql::{
         ast::{QueryResult, Statement},
         parser::parse,
     };
-    use opendb_storage::commit_stream::Value;
+    use opendb_storage::commit_stream::{CommitRecord, Mutation, RangeSplit, Value};
+    use opendb_storage::range_catalog::RangeDescriptor;
 
     #[tokio::test]
     async fn execute_persists_writes_through_root_range_and_replays_on_reopen() {
@@ -344,6 +370,61 @@ mod tests {
                 .exists(),
             "invalid write must not create a local WAL"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_stamps_insert_with_catalog_routed_range() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        let mut database = Database::open_with_root_range(root_range)
+            .await
+            .expect("open database");
+
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+
+        let split_record = CommitRecord::new(
+            TransactionId(2),
+            LogicalTimestamp(2),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "accounts/2".to_owned(),
+                    left: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: Some("accounts/2".to_owned()),
+                        replica_node_ids: vec![0],
+                    },
+                    right: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: Some("accounts/2".to_owned()),
+                        key_end: None,
+                        replica_node_ids: vec![0],
+                    },
+                },
+            }],
+        );
+        let split_command = RootRangeCommand {
+            record: split_record,
+        };
+        let local_root_range = RootRange::new(temp_dir.path());
+        local_root_range
+            .submit(split_command)
+            .await
+            .expect("append split metadata");
+
+        database
+            .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
+            .await
+            .expect("insert");
+
+        let records = local_root_range.replay().await.expect("replay");
+        assert_eq!(records.last().expect("last record").range_id, RangeId(2));
     }
 
     #[tokio::test]
