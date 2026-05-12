@@ -1,3 +1,4 @@
+mod admin;
 mod config;
 mod database;
 mod health;
@@ -8,6 +9,7 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::admin::AdminState;
 use crate::config::NodeConfig;
 use crate::database::{Database, DatabaseRecoveryStatus};
 use crate::health::HealthState;
@@ -33,11 +35,15 @@ async fn main() -> anyhow::Result<()> {
         node_id = config.node_id,
         pgwire_addr = %config.pgwire_addr,
         health_addr = %config.health_addr,
+        admin_addr = %config.admin_addr,
         internal_addr = %config.internal_addr,
         advertise_addr = %config.advertise_addr,
         bootstrap_node_id = config.bootstrap_node_id,
         "starting opendb node"
     );
+    let admin_state = AdminState {
+        database: Arc::clone(&database),
+    };
 
     let recovery_refresh = maintain_recovery_status(
         Arc::clone(&database),
@@ -55,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
             maintain_root_range_bootstrap(Arc::clone(&database), std::time::Duration::from_secs(1));
         tokio::try_join!(
             health::serve(config.health_addr, health_state),
+            admin::serve(config.admin_addr, admin_state),
             pgwire::serve(config.pgwire_addr, database),
             readiness,
             recovery_refresh,
@@ -69,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tokio::try_join!(
             health::serve(config.health_addr, health_state),
+            admin::serve(config.admin_addr, admin_state),
             pgwire::serve(config.pgwire_addr, database),
             recovery_refresh,
         )?;

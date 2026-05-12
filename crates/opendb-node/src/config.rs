@@ -20,6 +20,9 @@ pub struct NodeConfig {
     #[arg(long, env = "OPENDB_HEALTH_ADDR", default_value = "0.0.0.0:8080")]
     pub health_addr: SocketAddr,
 
+    #[arg(long, env = "OPENDB_ADMIN_ADDR", default_value = "0.0.0.0:7300")]
+    pub admin_addr: SocketAddr,
+
     #[arg(long, env = "OPENDB_INTERNAL_ADDR", default_value = "0.0.0.0:7000")]
     pub internal_addr: SocketAddr,
 
