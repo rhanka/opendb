@@ -65,6 +65,8 @@ The operator-lite consumes each node's `/status` endpoint and reflects the recov
 
 A condition is `Unknown` while any running pod is unreachable, `False` only when at least one running pod explicitly reports it as false. `OpenDbCluster.status.phase` semantics are unchanged: `phase=Ready` continues to report kube readiness, not database recovery.
 
+Sprint 4 range split/merge metadata is replayed from the canonical WAL only; it does not add object storage, extra pods, or a destructive smoke default.
+
 ### Known limitation surfaced by `--with-restart-recovery`
 
 After a leader-pod delete, the existing recovery contract does not yet propagate the root bootstrap descriptor to a follower that comes back with an empty local WAL. Such a follower replays zero records, reports `rootDescriptorKnown=false`, and the cluster-wide `Recovered` condition stays `False` with reason `RootDescriptorMissing`. This is a true reflection of cluster state, not a Sprint 3 regression: Sprint 3 only adds visibility. The propagation gap will be addressed in a later sprint (split/merge metadata or Raft snapshot install). Use `npm run smoke:k3s -- --with-restart-recovery` as a diagnostic in the meantime — it will fail loudly on this open issue rather than masking it.
