@@ -313,7 +313,7 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use crate::commit_stream::{
-        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, Value,
+        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, Mutation, RangeSplit, Value,
     };
     use crate::range_catalog::RangeDescriptor;
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
@@ -386,6 +386,63 @@ mod tests {
         assert_eq!(
             wal.read_all().await.expect("read range descriptor record"),
             vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_appends_and_reads_range_split_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(6),
+            LogicalTimestamp(15),
+            vec![Mutation::SplitRange {
+                split: RangeSplit {
+                    source_range_id: RangeId::ROOT,
+                    split_key: "orders/".to_owned(),
+                    left: RangeDescriptor {
+                        range_id: RangeId(2),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: None,
+                        key_end: Some("orders/".to_owned()),
+                        replica_node_ids: vec![0, 1, 2],
+                    },
+                    right: RangeDescriptor {
+                        range_id: RangeId(3),
+                        parent_range_id: Some(RangeId::ROOT),
+                        key_start: Some("orders/".to_owned()),
+                        key_end: None,
+                        replica_node_ids: vec![0, 1, 2],
+                    },
+                },
+            }],
+        );
+
+        wal.append(&record).await.expect("append split record");
+
+        assert_eq!(
+            wal.read_all().await.expect("read split record"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_rejects_unknown_field_in_range_split_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("commit.wal");
+        let payload = br#"{"version":2,"tx_id":1,"range_id":1,"ts":1,"actor":"system","mutations":[{"SplitRange":{"split":{"source_range_id":1,"split_key":"orders/","left":{"range_id":2,"parent_range_id":1,"key_start":null,"key_end":"orders/","replica_node_ids":[0]},"right":{"range_id":3,"parent_range_id":1,"key_start":"orders/","key_end":null,"replica_node_ids":[0]},"unexpected":true}}}]}"#;
+        fs::write(&wal_path, encode_raw_payload_frame(payload))
+            .await
+            .expect("write fixture");
+
+        let error = Wal::new(&wal_path)
+            .read_all()
+            .await
+            .expect_err("reject unknown split field");
+
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error: {error}"
         );
     }
 
