@@ -323,7 +323,9 @@ fn range_catalog_condition(
             r#type: CONDITION_RANGE_CATALOG_STABLE.to_string(),
             status: CONDITION_TRUE.to_string(),
             reason: REASON_ACTIVE_RANGE_COUNT_AGREES.to_string(),
-            message: format!("active ranges={count} (lastSplit txId={split}, lastMerge txId={merge})"),
+            message: format!(
+                "active ranges={count} (lastSplit txId={split}, lastMerge txId={merge})"
+            ),
             last_transition_time: Some(now),
         }
     } else {
@@ -336,7 +338,10 @@ fn range_catalog_condition(
             r#type: CONDITION_RANGE_CATALOG_STABLE.to_string(),
             status: CONDITION_FALSE.to_string(),
             reason: REASON_DIVERGENT_CATALOG.to_string(),
-            message: format!("active_range_count diverges across pods: [{}]", counts.join(",")),
+            message: format!(
+                "active_range_count diverges across pods: [{}]",
+                counts.join(",")
+            ),
             last_transition_time: Some(now),
         }
     }
@@ -908,13 +913,20 @@ mod tests {
 
             let by_type = condition_map(&status.conditions);
             assert_eq!(by_type["RangeCatalogStable"].status, "True");
-            assert_eq!(by_type["RangeCatalogStable"].reason, "ActiveRangeCountAgrees");
-            assert!(by_type["RangeCatalogStable"]
-                .message
-                .contains("active ranges=2"));
-            assert!(by_type["RangeCatalogStable"]
-                .message
-                .contains("lastSplit txId=5"));
+            assert_eq!(
+                by_type["RangeCatalogStable"].reason,
+                "ActiveRangeCountAgrees"
+            );
+            assert!(
+                by_type["RangeCatalogStable"]
+                    .message
+                    .contains("active ranges=2")
+            );
+            assert!(
+                by_type["RangeCatalogStable"]
+                    .message
+                    .contains("lastSplit txId=5")
+            );
             let json = serde_json::to_value(&status).expect("serialize");
             let summary = &json["recovery"]["rangeCatalog"];
             assert_eq!(summary["reportingReplicas"], 3);
@@ -927,9 +939,7 @@ mod tests {
         fn range_catalog_condition_unknown_when_any_pod_unreachable() {
             let status = compute_open_db_cluster_status_with_recovery(
                 snapshot(3, Some("opendb-0")),
-                Some(aggregate_with_catalog(
-                    3, 3, 3, 3, 1, 2, &[2], None, None,
-                )),
+                Some(aggregate_with_catalog(3, 3, 3, 3, 1, 2, &[2], None, None)),
             );
 
             let by_type = condition_map(&status.conditions);
@@ -957,9 +967,11 @@ mod tests {
             let by_type = condition_map(&status.conditions);
             assert_eq!(by_type["RangeCatalogStable"].status, "False");
             assert_eq!(by_type["RangeCatalogStable"].reason, "DivergentCatalog");
-            assert!(by_type["RangeCatalogStable"]
-                .message
-                .contains("active_range_count diverges"));
+            assert!(
+                by_type["RangeCatalogStable"]
+                    .message
+                    .contains("active_range_count diverges")
+            );
             let json = serde_json::to_value(&status).expect("serialize");
             assert!(json["recovery"]["rangeCatalog"]["activeRangeCount"].is_null());
         }

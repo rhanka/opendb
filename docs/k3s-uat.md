@@ -67,6 +67,8 @@ A condition is `Unknown` while any running pod is unreachable, `False` only when
 
 Sprint 4 range split/merge metadata is replayed from the canonical WAL only; it does not add object storage, extra pods, or a destructive smoke default.
 
+Sprint 5 adds an opt-in `--with-range-split` flag that exercises the runtime split admin endpoint on the leader (`POST /admin/ranges/split` on container port 7300, reached through `kubectl port-forward`) and verifies the new `RangeCatalogStable` condition flips to `True` with `activeRangeCount=2` after the split. The default smoke does not call any admin endpoint and remains non-destructive. Set `OPENDB_K3S_WITH_RANGE_SPLIT=1` or pass `--with-range-split` to enable it.
+
 ### Known limitation surfaced by `--with-restart-recovery`
 
 After a leader-pod delete, the existing recovery contract does not yet propagate the root bootstrap descriptor to a follower that comes back with an empty local WAL. Such a follower replays zero records, reports `rootDescriptorKnown=false`, and the cluster-wide `Recovered` condition stays `False` with reason `RootDescriptorMissing`. This is a true reflection of cluster state, not a Sprint 3 regression: Sprint 3 only adds visibility. The propagation gap will be addressed in a later sprint (split/merge metadata or Raft snapshot install). Use `npm run smoke:k3s -- --with-restart-recovery` as a diagnostic in the meantime — it will fail loudly on this open issue rather than masking it.
