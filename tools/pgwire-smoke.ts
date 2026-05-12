@@ -188,6 +188,36 @@ try {
     throw new Error(`duplicate primary key was not rejected as expected: ${duplicateError}`);
   }
 
+  // Sprint 6: extended types (BOOL, FLOAT8, TIMESTAMP), NOT NULL, DEFAULT,
+  // and the named-column INSERT form must round-trip through pgwire.
+  const typedTable = `typed_smoke_${tableName}`;
+  await exec(
+    `CREATE TABLE ${typedTable} (id INT PRIMARY KEY, label TEXT NOT NULL DEFAULT 'completed', done BOOL DEFAULT false, ratio FLOAT8, created_at TIMESTAMP NOT NULL DEFAULT NOW())`
+  );
+  await exec(`INSERT INTO ${typedTable} (id, ratio) VALUES (1, 0.5)`);
+  await exec(`INSERT INTO ${typedTable} (id, label, done, ratio, created_at) VALUES (2, 'manual', TRUE, 1.5, 42)`);
+  const typedRows = await exec(`SELECT * FROM ${typedTable}`);
+  if (typedRows.length !== 2) {
+    throw new Error(`typed smoke expected 2 rows, got ${typedRows.length}`);
+  }
+  const firstRow = typedRows[0];
+  const secondRow = typedRows[1];
+  if (firstRow === undefined || secondRow === undefined) {
+    throw new Error("typed smoke missing rows");
+  }
+  const firstText = rowText(firstRow);
+  const secondText = rowText(secondRow);
+  if (!firstText.includes("completed") || !firstText.includes("f") || !firstText.includes("0.5")) {
+    throw new Error(`typed smoke first row missing default values: ${firstText}`);
+  }
+  if (!secondText.includes("manual") || !secondText.includes("t") || !secondText.includes("1.5")) {
+    throw new Error(`typed smoke second row missing explicit values: ${secondText}`);
+  }
+  const filteredTypedRows = await exec(`SELECT * FROM ${typedTable} WHERE id = 1`);
+  if (filteredTypedRows.length !== 1) {
+    throw new Error(`typed smoke filtered select expected 1 row, got ${filteredTypedRows.length}`);
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {
