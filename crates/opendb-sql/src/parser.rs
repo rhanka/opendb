@@ -1,4 +1,4 @@
-use crate::ast::{Predicate, Statement};
+use crate::ast::{OrderBy, OrderDirection, Predicate, Statement};
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
     AlterTableOp, ColumnDefinition, ColumnType, ConstraintKind, DefaultExpr, IndexDescriptor,
@@ -689,13 +689,20 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     let rest = strip_keyword_prefix(sql, "SELECT * FROM ")
         .ok_or_else(|| OpenDbError::Sql("invalid SELECT".to_owned()))?
         .trim();
+
+    // Sprint 10: split off trailing OFFSET / LIMIT / ORDER BY clauses
+    // before the predicate parsing so the existing logic is reused.
+    let (rest, offset) = take_trailing_keyword_value(rest, " OFFSET ")?;
+    let (rest, limit) = take_trailing_keyword_value(&rest, " LIMIT ")?;
+    let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
+
     let upper_rest = rest.to_ascii_uppercase();
     let (table, predicate) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
         let table = rest[..where_pos].trim();
         let predicate = parse_predicate(rest[where_pos + " WHERE ".len()..].trim())?;
         (table, Some(predicate))
     } else {
-        (rest, None)
+        (rest.trim(), None)
     };
     if table.is_empty() {
         return Err(OpenDbError::Sql("SELECT requires table".to_owned()));
@@ -705,10 +712,60 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
             "SELECT only supports a table name after FROM".to_owned(),
         ));
     }
+    let order_by = match order_by_text.as_deref() {
+        Some(text) => Some(parse_order_by(text)?),
+        None => None,
+    };
     Ok(Statement::SelectAll {
         table: table.to_owned(),
         predicate,
+        order_by,
+        limit,
+        offset,
     })
+}
+
+fn take_trailing_keyword(input: &str, keyword: &str) -> (String, Option<String>) {
+    let upper = input.to_ascii_uppercase();
+    if let Some(pos) = upper.rfind(keyword) {
+        let head = input[..pos].trim_end().to_owned();
+        let tail = input[pos + keyword.len()..].trim().to_owned();
+        return (head, Some(tail));
+    }
+    (input.to_owned(), None)
+}
+
+fn take_trailing_keyword_value(input: &str, keyword: &str) -> OpenDbResult<(String, Option<u64>)> {
+    let (rest, value_text) = take_trailing_keyword(input, keyword);
+    match value_text {
+        Some(text) => {
+            let value = text.parse::<u64>().map_err(|_| {
+                OpenDbError::Sql(format!("invalid value for {}: {text}", keyword.trim()))
+            })?;
+            Ok((rest, Some(value)))
+        }
+        None => Ok((rest, None)),
+    }
+}
+
+fn parse_order_by(text: &str) -> OpenDbResult<OrderBy> {
+    let trimmed = text.trim();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let (column, direction) = match parts.as_slice() {
+        [column] => (column.to_string(), OrderDirection::Asc),
+        [column, direction] if direction.eq_ignore_ascii_case("ASC") => {
+            (column.to_string(), OrderDirection::Asc)
+        }
+        [column, direction] if direction.eq_ignore_ascii_case("DESC") => {
+            (column.to_string(), OrderDirection::Desc)
+        }
+        _ => {
+            return Err(OpenDbError::Sql(format!(
+                "invalid ORDER BY clause: {trimmed}"
+            )));
+        }
+    };
+    Ok(OrderBy { column, direction })
 }
 
 fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
@@ -789,10 +846,7 @@ mod tests {
         );
         assert_eq!(
             parse("SELECT * FROM accounts").expect("select"),
-            Statement::SelectAll {
-                table: "accounts".to_owned(),
-                predicate: None,
-            }
+            Statement::select_all_legacy("accounts".to_owned(), None)
         );
     }
 
@@ -818,10 +872,7 @@ mod tests {
         );
         assert_eq!(
             parse("sElEcT * fRoM accounts").expect("select"),
-            Statement::SelectAll {
-                table: "accounts".to_owned(),
-                predicate: None,
-            }
+            Statement::select_all_legacy("accounts".to_owned(), None)
         );
     }
 
@@ -915,23 +966,23 @@ mod tests {
     fn parses_primary_key_equality_predicate() {
         assert_eq!(
             parse("SELECT * FROM accounts WHERE id = 1").expect("select where"),
-            Statement::SelectAll {
-                table: "accounts".to_owned(),
-                predicate: Some(Predicate {
+            Statement::select_all_legacy(
+                "accounts".to_owned(),
+                Some(Predicate {
                     column: "id".to_owned(),
                     value: Value::Int64(1),
                 }),
-            }
+            )
         );
         assert_eq!(
             parse("select * from accounts where name = 'Ada'").expect("select where text"),
-            Statement::SelectAll {
-                table: "accounts".to_owned(),
-                predicate: Some(Predicate {
+            Statement::select_all_legacy(
+                "accounts".to_owned(),
+                Some(Predicate {
                     column: "name".to_owned(),
                     value: Value::Text("Ada".to_owned()),
                 }),
-            }
+            )
         );
     }
 
@@ -1015,6 +1066,46 @@ mod tests {
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
         );
+    }
+
+    #[test]
+    fn parses_select_with_order_by_limit_offset() {
+        let stmt = parse("SELECT * FROM accounts ORDER BY name DESC LIMIT 10 OFFSET 20")
+            .expect("select with order by limit offset");
+        let Statement::SelectAll {
+            order_by,
+            limit,
+            offset,
+            ..
+        } = stmt
+        else {
+            panic!("expected SelectAll");
+        };
+        let order_by = order_by.expect("order_by");
+        assert_eq!(order_by.column, "name");
+        assert!(matches!(order_by.direction, OrderDirection::Desc));
+        assert_eq!(limit, Some(10));
+        assert_eq!(offset, Some(20));
+    }
+
+    #[test]
+    fn parses_select_with_where_then_order_by() {
+        let stmt = parse("SELECT * FROM accounts WHERE id = 1 ORDER BY id ASC LIMIT 5")
+            .expect("select where order by");
+        let Statement::SelectAll {
+            predicate,
+            order_by,
+            limit,
+            ..
+        } = stmt
+        else {
+            panic!("expected SelectAll");
+        };
+        assert!(predicate.is_some());
+        let order_by = order_by.expect("order_by");
+        assert_eq!(order_by.column, "id");
+        assert!(matches!(order_by.direction, OrderDirection::Asc));
+        assert_eq!(limit, Some(5));
     }
 
     #[test]
@@ -1202,13 +1293,13 @@ mod tests {
     fn parses_equality_predicate_with_equals_inside_quoted_literal() {
         assert_eq!(
             parse("SELECT * FROM sessions WHERE token = 'a=b'").expect("select where text pk"),
-            Statement::SelectAll {
-                table: "sessions".to_owned(),
-                predicate: Some(Predicate {
+            Statement::select_all_legacy(
+                "sessions".to_owned(),
+                Some(Predicate {
                     column: "token".to_owned(),
                     value: Value::Text("a=b".to_owned()),
                 }),
-            }
+            )
         );
     }
 }

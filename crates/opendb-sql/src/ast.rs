@@ -17,6 +17,18 @@ pub struct Predicate {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct OrderBy {
+    pub column: String,
+    pub direction: OrderDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
     CreateTable {
         table: String,
@@ -30,6 +42,12 @@ pub enum Statement {
     SelectAll {
         table: String,
         predicate: Option<Predicate>,
+        #[doc = "Sprint 10: optional ORDER BY clause."]
+        order_by: Option<OrderBy>,
+        #[doc = "Sprint 10: optional LIMIT clause."]
+        limit: Option<u64>,
+        #[doc = "Sprint 10: optional OFFSET clause."]
+        offset: Option<u64>,
     },
     AlterTable {
         table: String,
@@ -52,6 +70,19 @@ pub enum Statement {
 impl Statement {
     pub fn is_read(&self) -> bool {
         matches!(self, Self::SelectAll { .. })
+    }
+
+    /// Sprint 10: convenience constructor that mirrors the pre-Sprint-10
+    /// `SelectAll { table, predicate }` shape and fills the new optional
+    /// clauses with `None`. Keeps the test suites readable.
+    pub fn select_all_legacy(table: String, predicate: Option<Predicate>) -> Self {
+        Self::SelectAll {
+            table,
+            predicate,
+            order_by: None,
+            limit: None,
+            offset: None,
+        }
     }
 }
 

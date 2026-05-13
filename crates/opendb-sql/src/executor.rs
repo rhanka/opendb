@@ -126,8 +126,20 @@ impl SqlEngine {
                     route,
                 )
             }
-            Statement::SelectAll { table, predicate } => self
-                .select_all(&table, predicate.as_ref())
+            Statement::SelectAll {
+                table,
+                predicate,
+                order_by,
+                limit,
+                offset,
+            } => self
+                .select_all(
+                    &table,
+                    predicate.as_ref(),
+                    order_by.as_ref(),
+                    limit,
+                    offset,
+                )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
             Statement::AlterTable { table, op } => self.prepare_write(
                 vec![Mutation::AlterTable { table, op }],
@@ -206,6 +218,9 @@ impl SqlEngine {
         &self,
         table: &str,
         predicate: Option<&Predicate>,
+        order_by: Option<&crate::ast::OrderBy>,
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let table_state = self
             .projection
@@ -256,14 +271,54 @@ impl SqlEngine {
                 )
             }
         };
+        let mut rows = rows;
+        if let Some(order_by) = order_by {
+            let position = column_names
+                .iter()
+                .position(|name| name == &order_by.column)
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!(
+                        "ORDER BY column {} not in projection",
+                        order_by.column
+                    ))
+                })?;
+            rows.sort_by(|left, right| {
+                let l = left.get(position).cloned().unwrap_or(Value::Null);
+                let r = right.get(position).cloned().unwrap_or(Value::Null);
+                let ordering = compare_values(&l, &r);
+                match order_by.direction {
+                    crate::ast::OrderDirection::Asc => ordering,
+                    crate::ast::OrderDirection::Desc => ordering.reverse(),
+                }
+            });
+        }
+        let offset_count = offset.unwrap_or(0) as usize;
+        let limit_count = limit.unwrap_or(u64::MAX) as usize;
+        let final_rows: Vec<_> = rows.into_iter().skip(offset_count).take(limit_count).collect();
         Ok((
             QueryResult::Rows {
                 columns: column_names,
                 column_types: Vec::new(),
-                rows,
+                rows: final_rows,
             },
             route,
         ))
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Json(a), Value::Json(b)) => a.to_string().cmp(&b.to_string()),
+        (a, b) => format!("{a:?}").cmp(&format!("{b:?}")),
     }
 }
 
@@ -1034,6 +1089,37 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn select_with_order_by_limit_offset_returns_sorted_slice() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        for i in 1..=5 {
+            engine
+                .execute(parse(&format!("INSERT INTO t (id, name) VALUES ({i}, 'r{i}')")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(parse("SELECT * FROM t ORDER BY id DESC LIMIT 2 OFFSET 1").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+        // ORDER BY id DESC → 5, 4, 3, 2, 1; OFFSET 1 → 4, 3, 2, 1; LIMIT 2 → 4, 3
+        let first_id = match rows[0][0] {
+            Value::Int64(v) => v,
+            _ => panic!("expected Int64 id"),
+        };
+        let second_id = match rows[1][0] {
+            Value::Int64(v) => v,
+            _ => panic!("expected Int64 id"),
+        };
+        assert_eq!(first_id, 4);
+        assert_eq!(second_id, 3);
     }
 
     #[test]

@@ -849,10 +849,7 @@ mod tests {
             .expect("open database");
 
         let result = database
-            .execute(Statement::SelectAll {
-                table: "accounts".to_string(),
-                predicate: None,
-            })
+            .execute(Statement::select_all_legacy("accounts".to_string(), None))
             .await;
 
         assert!(matches!(
