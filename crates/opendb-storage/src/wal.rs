@@ -313,8 +313,8 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use crate::commit_stream::{
-        ColumnDefinition, ColumnType, ColumnValue, CommitRecord, DefaultExpr, Mutation, RangeSplit,
-        Value,
+        AlterTableOp, ColumnDefinition, ColumnType, ColumnValue, CommitRecord, DefaultExpr,
+        Mutation, RangeSplit, Value,
     };
     use crate::range_catalog::RangeDescriptor;
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
@@ -460,6 +460,28 @@ mod tests {
             wal.read_all().await.expect("read typed insert"),
             vec![record]
         );
+    }
+
+    #[tokio::test]
+    async fn wal_appends_and_reads_alter_table_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(10),
+            LogicalTimestamp(19),
+            vec![Mutation::AlterTable {
+                table: "accounts".to_owned(),
+                op: AlterTableOp::AddColumn(
+                    ColumnDefinition::new("status", ColumnType::Text).with_default(
+                        DefaultExpr::Const(Value::Text("active".to_owned())),
+                    ),
+                ),
+            }],
+        );
+
+        wal.append(&record).await.expect("append alter");
+
+        assert_eq!(wal.read_all().await.expect("read alter"), vec![record]);
     }
 
     #[tokio::test]
