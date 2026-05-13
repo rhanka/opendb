@@ -327,6 +327,38 @@ try {
     throw new Error(`order smoke expected id=4 first, got ${firstOrderedText}`);
   }
 
+  // Sprint 10.5: INNER + LEFT JOIN through pgwire.
+  const joinA = `join_a_${tableName}`;
+  const joinB = `join_b_${tableName}`;
+  await exec(`CREATE TABLE ${joinA} (id INT PRIMARY KEY, label TEXT)`);
+  await exec(`CREATE TABLE ${joinB} (id INT PRIMARY KEY, a_id INT)`);
+  await exec(`INSERT INTO ${joinA} (id, label) VALUES (1, 'a1')`);
+  await exec(`INSERT INTO ${joinA} (id, label) VALUES (2, 'a2')`);
+  await exec(`INSERT INTO ${joinB} (id, a_id) VALUES (10, 1)`);
+  const innerRows = await exec(
+    `SELECT * FROM ${joinA} INNER JOIN ${joinB} ON ${joinA}.id = ${joinB}.a_id`
+  );
+  if (innerRows.length !== 1) {
+    throw new Error(`inner join expected 1 row, got ${innerRows.length}`);
+  }
+  const leftRows = await exec(
+    `SELECT * FROM ${joinA} LEFT JOIN ${joinB} ON ${joinA}.id = ${joinB}.a_id ORDER BY ${joinA}.id ASC`
+  );
+  if (leftRows.length !== 2) {
+    throw new Error(`left join expected 2 rows, got ${leftRows.length}`);
+  }
+
+  // Sprint 11: BEGIN / COMMIT / ROLLBACK no-op skeleton.
+  await exec(`BEGIN`);
+  await exec(`INSERT INTO ${joinA} (id, label) VALUES (3, 'a3')`);
+  await exec(`COMMIT`);
+  await exec(`BEGIN`);
+  await exec(`ROLLBACK`);
+  const finalA = await exec(`SELECT * FROM ${joinA}`);
+  if (finalA.length !== 3) {
+    throw new Error(`expected 3 rows after BEGIN/COMMIT, got ${finalA.length}`);
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {
