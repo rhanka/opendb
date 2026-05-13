@@ -11,6 +11,7 @@ pub enum Value {
     Bool(bool),
     Float64(f64),
     Timestamp(i64),
+    Json(serde_json::Value),
     Null,
 }
 
@@ -28,6 +29,7 @@ pub enum ColumnType {
     Bool,
     Float64,
     Timestamp,
+    Json,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -236,6 +238,9 @@ mod tests {
             Value::Bool(false),
             Value::Float64(3.5),
             Value::Timestamp(1_700_000_000_000_000),
+            Value::Json(serde_json::json!({"k": "v", "n": 7, "arr": [1, 2, 3]})),
+            Value::Json(serde_json::json!([])),
+            Value::Json(serde_json::Value::Null),
             Value::Null,
         ] {
             let json = serde_json::to_string(&value).expect("serialize");

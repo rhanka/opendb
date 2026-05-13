@@ -228,6 +228,7 @@ fn oid_for_column_type(column_type: &opendb_storage::commit_stream::ColumnType) 
         ColumnType::Bool => 16,        // BOOL
         ColumnType::Float64 => 701,    // FLOAT8
         ColumnType::Timestamp => 1114, // TIMESTAMP
+        ColumnType::Json => 3802,      // JSONB
     }
 }
 
@@ -249,6 +250,7 @@ fn resolve_row_description_types(
                 Value::Bool(_) => ColumnType::Bool,
                 Value::Float64(_) => ColumnType::Float64,
                 Value::Timestamp(_) => ColumnType::Timestamp,
+                Value::Json(_) => ColumnType::Json,
                 Value::Null => ColumnType::Text,
             };
         }
@@ -283,6 +285,7 @@ fn value_to_text(value: &Value) -> String {
         Value::Bool(false) => "f".to_string(),
         Value::Float64(value) => format!("{value}"),
         Value::Timestamp(value) => format_timestamp_micros(*value),
+        Value::Json(value) => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
         Value::Null => String::new(),
     }
 }

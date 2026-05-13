@@ -189,6 +189,7 @@ fn value_matches_type(value: &Value, data_type: &ColumnType) -> bool {
             | (Value::Bool(_), ColumnType::Bool)
             | (Value::Float64(_), ColumnType::Float64)
             | (Value::Timestamp(_), ColumnType::Timestamp)
+            | (Value::Json(_), ColumnType::Json)
             | (Value::Null, _)
     )
 }
@@ -200,6 +201,7 @@ fn value_to_key(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::Float64(value) => value.to_string(),
         Value::Timestamp(value) => value.to_string(),
+        Value::Json(value) => value.to_string(),
         Value::Null => "null".to_string(),
     }
 }
