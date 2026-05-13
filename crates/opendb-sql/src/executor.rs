@@ -145,6 +145,20 @@ impl SqlEngine {
             Statement::DoBlock { .. } => Err(OpenDbError::Sql(
                 "DO blocks must be executed via SqlEngine::execute".to_owned(),
             )),
+            Statement::DeleteRow { table, key } => {
+                let route_key_value = route_key(&table, &key);
+                self.prepare_write(
+                    vec![Mutation::DeleteRow {
+                        table: table.clone(),
+                        key: key.clone(),
+                    }],
+                    "DELETE 1",
+                    RouteIntent::Key {
+                        table,
+                        key: route_key_value,
+                    },
+                )
+            }
         }
     }
 
@@ -1020,6 +1034,33 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn delete_row_executes_end_to_end() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id, name) VALUES (1, 'Ada')").expect("parse"))
+            .expect("insert");
+        let result = engine
+            .execute(parse("DELETE FROM t WHERE id = 1").expect("parse"))
+            .expect("delete");
+        assert_eq!(
+            result,
+            QueryResult::Command {
+                tag: "DELETE 1".to_owned()
+            }
+        );
+        let select = engine
+            .execute(parse("SELECT * FROM t").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = select else {
+            panic!("expected Rows");
+        };
+        assert!(rows.is_empty());
     }
 
     #[test]

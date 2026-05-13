@@ -43,6 +43,10 @@ pub enum Statement {
         inner: Vec<Statement>,
         swallow_duplicate: bool,
     },
+    DeleteRow {
+        table: String,
+        key: String,
+    },
 }
 
 impl Statement {

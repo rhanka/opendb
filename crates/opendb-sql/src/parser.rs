@@ -28,11 +28,43 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         parse_select_all(normalized)
     } else if upper.starts_with("ALTER TABLE ") {
         parse_alter_table(normalized)
+    } else if upper.starts_with("DELETE FROM ") {
+        parse_delete(normalized)
     } else if upper.starts_with("DO ") || upper.starts_with("DO$") {
         parse_do_block(normalized)
     } else {
         Err(OpenDbError::Sql(format!("unsupported SQL: {normalized}")))
     }
+}
+
+fn parse_delete(sql: &str) -> OpenDbResult<Statement> {
+    let rest = strip_keyword_prefix(sql, "DELETE FROM ")
+        .ok_or_else(|| OpenDbError::Sql("invalid DELETE".to_owned()))?
+        .trim();
+    let upper_rest = rest.to_ascii_uppercase();
+    let where_pos = upper_rest
+        .find(" WHERE ")
+        .ok_or_else(|| OpenDbError::Sql("DELETE requires WHERE primary-key equality".to_owned()))?;
+    let table = rest[..where_pos].trim().to_owned();
+    let predicate_text = rest[where_pos + " WHERE ".len()..].trim();
+    let predicate = parse_predicate(predicate_text)?;
+    let key = match predicate.value {
+        Value::Int64(v) => v.to_string(),
+        Value::Text(v) => v,
+        Value::Bool(v) => v.to_string(),
+        Value::Float64(v) => v.to_string(),
+        Value::Timestamp(v) => v.to_string(),
+        Value::Json(v) => v.to_string(),
+        Value::Null => {
+            return Err(OpenDbError::Sql(
+                "DELETE WHERE primary key cannot be NULL".to_owned(),
+            ));
+        }
+    };
+    Ok(Statement::DeleteRow {
+        table: unquote_identifier(&table),
+        key,
+    })
 }
 
 fn parse_alter_table(sql: &str) -> OpenDbResult<Statement> {
@@ -983,6 +1015,24 @@ mod tests {
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
         );
+    }
+
+    #[test]
+    fn parses_delete_from_where_primary_key_equality() {
+        let stmt = parse("DELETE FROM accounts WHERE id = 1").expect("delete");
+        let Statement::DeleteRow { table, key } = stmt else {
+            panic!("expected DeleteRow");
+        };
+        assert_eq!(table, "accounts");
+        assert_eq!(key, "1");
+    }
+
+    #[test]
+    fn rejects_delete_without_where_predicate() {
+        assert!(matches!(
+            parse("DELETE FROM accounts"),
+            Err(OpenDbError::Sql(_))
+        ));
     }
 
     #[test]

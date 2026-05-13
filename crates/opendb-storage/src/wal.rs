@@ -463,6 +463,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wal_appends_and_reads_delete_row_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(11),
+            LogicalTimestamp(20),
+            vec![Mutation::DeleteRow {
+                table: "accounts".to_owned(),
+                key: "1".to_owned(),
+            }],
+        );
+        wal.append(&record).await.expect("append delete");
+        assert_eq!(wal.read_all().await.expect("read delete"), vec![record]);
+    }
+
+    #[tokio::test]
     async fn wal_appends_and_reads_alter_table_record() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
