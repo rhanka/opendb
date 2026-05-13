@@ -242,6 +242,10 @@ fn coerce_value(value: Value, target: &ColumnType) -> Value {
     match (value, target) {
         (Value::Int64(v), ColumnType::Float64) => Value::Float64(v as f64),
         (Value::Int64(v), ColumnType::Timestamp) => Value::Timestamp(v),
+        (Value::Text(text), ColumnType::Json) => match serde_json::from_str(&text) {
+            Ok(json) => Value::Json(json),
+            Err(_) => Value::Text(text),
+        },
         (other, _) => other,
     }
 }
@@ -356,13 +360,14 @@ fn default_value_for_column(
                     column.name
                 )));
             }
-            if !value.is_null() && !value_matches_type(value, &column.data_type) {
+            let coerced = coerce_value(value.clone(), &column.data_type);
+            if !coerced.is_null() && !value_matches_type(&coerced, &column.data_type) {
                 return Err(OpenDbError::InvalidInput(format!(
                     "DEFAULT for column {} on table {table} does not match {:?}",
                     column.name, column.data_type
                 )));
             }
-            Ok(value.clone())
+            Ok(coerced)
         }
         Some(DefaultExpr::Now) => {
             if !matches!(column.data_type, ColumnType::Timestamp) {
@@ -914,6 +919,56 @@ mod tests {
             .expect("create");
 
         let result = engine.execute(parse("INSERT INTO t VALUES (1, NULL)").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn named_insert_coerces_text_literal_into_jsonb_value() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}'::jsonb)")
+                    .expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)").expect("parse"))
+            .expect("insert");
+        engine
+            .execute(parse("INSERT INTO t (id) VALUES (2)").expect("parse"))
+            .expect("insert default");
+
+        let last_two = &engine.commits()[engine.commits().len() - 2..];
+        let first_insert = &last_two[0];
+        let second_insert = &last_two[1];
+        let Mutation::InsertRow { values, .. } = &first_insert.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let data = values.iter().find(|cv| cv.column == "data").expect("data");
+        match &data.value {
+            Value::Json(value) => assert_eq!(value, &serde_json::json!({"k":"v"})),
+            other => panic!("expected Json, got {other:?}"),
+        }
+        let Mutation::InsertRow { values: vals2, .. } = &second_insert.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let data2 = vals2.iter().find(|cv| cv.column == "data").expect("data");
+        match &data2.value {
+            Value::Json(value) => assert_eq!(value, &serde_json::json!({})),
+            other => panic!("expected Json default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_insert_rejects_invalid_jsonb_literal() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, data JSONB)").expect("parse"))
+            .expect("create");
+
+        let result = engine.execute(
+            parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
+        );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
     }
 
