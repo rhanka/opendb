@@ -65,6 +65,42 @@ pub enum Statement {
         table: String,
         key: String,
     },
+    Select {
+        left: String,
+        join: JoinClause,
+        where_clause: Option<JoinedPredicate>,
+        order_by: Option<JoinedOrderBy>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub right: String,
+    pub left_column: String,
+    pub right_column: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinedPredicate {
+    pub qualifier: Option<String>,
+    pub column: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinedOrderBy {
+    pub qualifier: Option<String>,
+    pub column: String,
+    pub direction: OrderDirection,
 }
 
 impl Statement {

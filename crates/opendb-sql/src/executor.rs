@@ -171,6 +171,16 @@ impl SqlEngine {
                     },
                 )
             }
+            Statement::Select {
+                left,
+                join,
+                where_clause,
+                order_by,
+                limit,
+                offset,
+            } => self
+                .select_joined(left, join, where_clause, order_by, limit, offset)
+                .map(|(result, route)| PreparedQuery::Read { result, route }),
         }
     }
 
@@ -304,6 +314,183 @@ impl SqlEngine {
             route,
         ))
     }
+}
+
+impl SqlEngine {
+    #[allow(clippy::too_many_arguments)]
+    fn select_joined(
+        &self,
+        left_table: String,
+        join: crate::ast::JoinClause,
+        where_clause: Option<crate::ast::JoinedPredicate>,
+        order_by: Option<crate::ast::JoinedOrderBy>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> OpenDbResult<(QueryResult, RouteIntent)> {
+        let left_state = self
+            .projection
+            .table(&left_table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {left_table}")))?;
+        let right_state = self
+            .projection
+            .table(&join.right)
+            .ok_or_else(|| {
+                OpenDbError::NotFound(format!("table not found: {}", join.right))
+            })?;
+
+        let mut output_columns: Vec<String> = left_state
+            .columns
+            .iter()
+            .map(|column| format!("{left_table}.{}", column.name))
+            .collect();
+        output_columns.extend(
+            right_state
+                .columns
+                .iter()
+                .map(|column| format!("{}.{}", join.right, column.name)),
+        );
+
+        let left_columns = left_state.column_names();
+        let right_columns = right_state.column_names();
+
+        let mut joined_rows: Vec<Vec<Value>> = Vec::new();
+        for (_left_key, left_row) in left_state.rows.iter() {
+            let left_join_value = left_row
+                .get(&join.left_column)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let mut matched = false;
+            for (_right_key, right_row) in right_state.rows.iter() {
+                let right_join_value = right_row
+                    .get(&join.right_column)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if values_join_match(&left_join_value, &right_join_value) {
+                    matched = true;
+                    let projected = project_joined_row(
+                        &left_columns,
+                        left_row,
+                        &right_columns,
+                        Some(right_row),
+                    );
+                    joined_rows.push(projected);
+                }
+            }
+            if !matched && matches!(join.kind, crate::ast::JoinKind::Left) {
+                let projected =
+                    project_joined_row(&left_columns, left_row, &right_columns, None);
+                joined_rows.push(projected);
+            }
+        }
+
+        // WHERE
+        if let Some(predicate) = &where_clause {
+            let index = find_qualified_column_position(
+                &output_columns,
+                predicate.qualifier.as_deref(),
+                &predicate.column,
+            )?;
+            joined_rows.retain(|row| {
+                row.get(index)
+                    .map(|value| values_join_match(value, &predicate.value))
+                    .unwrap_or(false)
+            });
+        }
+
+        // ORDER BY
+        if let Some(order_by) = &order_by {
+            let index = find_qualified_column_position(
+                &output_columns,
+                order_by.qualifier.as_deref(),
+                &order_by.column,
+            )?;
+            joined_rows.sort_by(|left, right| {
+                let l = left.get(index).cloned().unwrap_or(Value::Null);
+                let r = right.get(index).cloned().unwrap_or(Value::Null);
+                let ordering = compare_values(&l, &r);
+                match order_by.direction {
+                    crate::ast::OrderDirection::Asc => ordering,
+                    crate::ast::OrderDirection::Desc => ordering.reverse(),
+                }
+            });
+        }
+
+        let offset_count = offset.unwrap_or(0) as usize;
+        let limit_count = limit.unwrap_or(u64::MAX) as usize;
+        let final_rows: Vec<_> = joined_rows
+            .into_iter()
+            .skip(offset_count)
+            .take(limit_count)
+            .collect();
+
+        let route = RouteIntent::Scan { table: left_table };
+        Ok((
+            QueryResult::Rows {
+                columns: output_columns,
+                column_types: Vec::new(),
+                rows: final_rows,
+            },
+            route,
+        ))
+    }
+}
+
+fn project_joined_row(
+    left_columns: &[String],
+    left_row: &std::collections::BTreeMap<String, Value>,
+    right_columns: &[String],
+    right_row: Option<&std::collections::BTreeMap<String, Value>>,
+) -> Vec<Value> {
+    let mut row = Vec::with_capacity(left_columns.len() + right_columns.len());
+    for column in left_columns {
+        row.push(left_row.get(column).cloned().unwrap_or(Value::Null));
+    }
+    for column in right_columns {
+        let value = match right_row {
+            Some(r) => r.get(column).cloned().unwrap_or(Value::Null),
+            None => Value::Null,
+        };
+        row.push(value);
+    }
+    row
+}
+
+fn values_join_match(left: &Value, right: &Value) -> bool {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return false;
+    }
+    left == right
+}
+
+fn find_qualified_column_position(
+    columns: &[String],
+    qualifier: Option<&str>,
+    column: &str,
+) -> OpenDbResult<usize> {
+    if let Some(qualifier) = qualifier {
+        let target = format!("{qualifier}.{column}");
+        return columns
+            .iter()
+            .position(|name| name == &target)
+            .ok_or_else(|| OpenDbError::Sql(format!("column {target} not in projection")));
+    }
+    // Without qualifier: try suffix match.
+    let suffix = format!(".{column}");
+    let mut matches: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.ends_with(&suffix) || *name == &column.to_owned())
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        return Err(OpenDbError::Sql(format!("column {column} not in projection")));
+    }
+    if matches.len() > 1 {
+        return Err(OpenDbError::Sql(format!(
+            "column {column} is ambiguous across joined tables (qualify with table.column)"
+        )));
+    }
+    Ok(matches.remove(0))
 }
 
 fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
@@ -1089,6 +1276,72 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn select_inner_join_returns_matching_rows() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create a");
+        engine
+            .execute(parse("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").expect("parse"))
+            .expect("create b");
+        engine
+            .execute(parse("INSERT INTO a (id, name) VALUES (1, 'one')").expect("parse"))
+            .expect("insert a1");
+        engine
+            .execute(parse("INSERT INTO a (id, name) VALUES (2, 'two')").expect("parse"))
+            .expect("insert a2");
+        engine
+            .execute(parse("INSERT INTO b (id, a_id) VALUES (10, 1)").expect("parse"))
+            .expect("insert b");
+        let result = engine
+            .execute(parse("SELECT * FROM a INNER JOIN b ON a.id = b.a_id").expect("parse"))
+            .expect("join");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["a.id", "a.name", "b.id", "b.a_id"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(1));
+        assert_eq!(rows[0][2], Value::Int64(10));
+    }
+
+    #[test]
+    fn select_left_join_pads_null_for_missing_right() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create a");
+        engine
+            .execute(parse("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").expect("parse"))
+            .expect("create b");
+        engine
+            .execute(parse("INSERT INTO a (id, name) VALUES (1, 'one')").expect("parse"))
+            .expect("insert a1");
+        engine
+            .execute(parse("INSERT INTO a (id, name) VALUES (2, 'two')").expect("parse"))
+            .expect("insert a2");
+        engine
+            .execute(parse("INSERT INTO b (id, a_id) VALUES (10, 1)").expect("parse"))
+            .expect("insert b");
+        let result = engine
+            .execute(
+                parse(
+                    "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id ASC",
+                )
+                .expect("parse"),
+            )
+            .expect("left join");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int64(1));
+        assert_eq!(rows[0][2], Value::Int64(10));
+        assert_eq!(rows[1][0], Value::Int64(2));
+        assert_eq!(rows[1][2], Value::Null);
     }
 
     #[test]

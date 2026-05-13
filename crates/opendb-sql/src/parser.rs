@@ -1,4 +1,7 @@
-use crate::ast::{OrderBy, OrderDirection, Predicate, Statement};
+use crate::ast::{
+    JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate, OrderBy, OrderDirection, Predicate,
+    Statement,
+};
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
     AlterTableOp, ColumnDefinition, ColumnType, ConstraintKind, DefaultExpr, IndexDescriptor,
@@ -689,6 +692,14 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     let rest = strip_keyword_prefix(sql, "SELECT * FROM ")
         .ok_or_else(|| OpenDbError::Sql("invalid SELECT".to_owned()))?
         .trim();
+    // Sprint 10.5: detect JOIN clauses and route to a separate parser.
+    let upper_rest_for_join = rest.to_ascii_uppercase();
+    if upper_rest_for_join.contains(" INNER JOIN ")
+        || upper_rest_for_join.contains(" LEFT JOIN ")
+        || upper_rest_for_join.contains(" JOIN ")
+    {
+        return parse_select_with_join(rest);
+    }
 
     // Sprint 10: split off trailing OFFSET / LIMIT / ORDER BY clauses
     // before the predicate parsing so the existing logic is reused.
@@ -722,6 +733,176 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         order_by,
         limit,
         offset,
+    })
+}
+
+fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
+    // Strip trailing OFFSET/LIMIT/ORDER BY first (same approach as the
+    // simple-select parser).
+    let (rest, offset) = take_trailing_keyword_value(rest, " OFFSET ")?;
+    let (rest, limit) = take_trailing_keyword_value(&rest, " LIMIT ")?;
+    let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
+    let upper_rest = rest.to_ascii_uppercase();
+    let (rest, where_text) = if let Some(pos) = upper_rest.find(" WHERE ") {
+        let head = rest[..pos].trim_end().to_owned();
+        let tail = rest[pos + " WHERE ".len()..].trim().to_owned();
+        (head, Some(tail))
+    } else {
+        (rest, None)
+    };
+
+    let (join_kind, join_keyword) = if rest.to_ascii_uppercase().contains(" INNER JOIN ") {
+        (JoinKind::Inner, " INNER JOIN ")
+    } else if rest.to_ascii_uppercase().contains(" LEFT JOIN ") {
+        (JoinKind::Left, " LEFT JOIN ")
+    } else if rest.to_ascii_uppercase().contains(" JOIN ") {
+        (JoinKind::Inner, " JOIN ")
+    } else {
+        return Err(OpenDbError::Sql("expected JOIN clause".to_owned()));
+    };
+
+    let upper_rest = rest.to_ascii_uppercase();
+    let join_pos = upper_rest
+        .find(join_keyword)
+        .ok_or_else(|| OpenDbError::Sql("join keyword".to_owned()))?;
+    let left_table = rest[..join_pos].trim().to_owned();
+    let right_clause = rest[join_pos + join_keyword.len()..].trim();
+    let upper_right = right_clause.to_ascii_uppercase();
+    let on_pos = upper_right
+        .find(" ON ")
+        .ok_or_else(|| OpenDbError::Sql("join requires ON".to_owned()))?;
+    let right_table = right_clause[..on_pos].trim().to_owned();
+    let on_expr = right_clause[on_pos + " ON ".len()..].trim();
+
+    let (left_qualified, right_qualified) = parse_join_equality(on_expr)?;
+    if left_qualified.qualifier.as_deref() != Some(left_table.as_str())
+        && right_qualified.qualifier.as_deref() != Some(left_table.as_str())
+    {
+        return Err(OpenDbError::Sql(format!(
+            "JOIN ON clause must reference the left table {left_table}"
+        )));
+    }
+    // Normalize so left_column comes from left_table.
+    let (left_column, right_column) = if left_qualified.qualifier.as_deref() == Some(left_table.as_str()) {
+        (left_qualified.column, right_qualified.column)
+    } else {
+        (right_qualified.column, left_qualified.column)
+    };
+
+    let join = JoinClause {
+        kind: join_kind,
+        right: right_table,
+        left_column,
+        right_column,
+    };
+
+    let where_clause = match where_text {
+        Some(text) => Some(parse_joined_predicate(&text)?),
+        None => None,
+    };
+    let order_by = match order_by_text {
+        Some(text) => Some(parse_joined_order_by(&text)?),
+        None => None,
+    };
+
+    Ok(Statement::Select {
+        left: left_table,
+        join,
+        where_clause,
+        order_by,
+        limit,
+        offset,
+    })
+}
+
+#[derive(Debug)]
+struct QualifiedColumn {
+    qualifier: Option<String>,
+    column: String,
+}
+
+fn parse_join_equality(expr: &str) -> OpenDbResult<(QualifiedColumn, QualifiedColumn)> {
+    let parts: Vec<&str> = expr.split('=').collect();
+    if parts.len() != 2 {
+        return Err(OpenDbError::Sql(format!(
+            "invalid ON expression: {expr}"
+        )));
+    }
+    Ok((parse_qualified_column(parts[0])?, parse_qualified_column(parts[1])?))
+}
+
+fn parse_qualified_column(raw: &str) -> OpenDbResult<QualifiedColumn> {
+    let trimmed = raw.trim();
+    if let Some((qualifier, column)) = trimmed.split_once('.') {
+        Ok(QualifiedColumn {
+            qualifier: Some(qualifier.trim().to_owned()),
+            column: column.trim().to_owned(),
+        })
+    } else {
+        Ok(QualifiedColumn {
+            qualifier: None,
+            column: trimmed.to_owned(),
+        })
+    }
+}
+
+fn parse_joined_predicate(raw: &str) -> OpenDbResult<JoinedPredicate> {
+    let equals_positions = equality_positions_outside_quotes(raw)?;
+    let Some(equals_pos) = equals_positions.first().copied() else {
+        return Err(OpenDbError::Sql(
+            "joined SELECT WHERE only supports equality predicates".to_owned(),
+        ));
+    };
+    if equals_positions.len() != 1 {
+        return Err(OpenDbError::Sql(
+            "joined SELECT WHERE only supports one equality predicate".to_owned(),
+        ));
+    }
+    let column = raw[..equals_pos].trim();
+    let value = raw[equals_pos + 1..].trim();
+    if column.is_empty() || value.is_empty() {
+        return Err(OpenDbError::Sql(
+            "joined SELECT WHERE requires column and literal".to_owned(),
+        ));
+    }
+    let qualified = parse_qualified_column(column)?;
+    Ok(JoinedPredicate {
+        qualifier: qualified.qualifier,
+        column: qualified.column,
+        value: parse_value(value)?,
+    })
+}
+
+fn parse_joined_order_by(raw: &str) -> OpenDbResult<JoinedOrderBy> {
+    let trimmed = raw.trim();
+    let mut parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(OpenDbError::Sql("empty ORDER BY clause".to_owned()));
+    }
+    let direction = if parts.len() >= 2 {
+        let last = parts.last().expect("non-empty");
+        if last.eq_ignore_ascii_case("ASC") {
+            parts.pop();
+            OrderDirection::Asc
+        } else if last.eq_ignore_ascii_case("DESC") {
+            parts.pop();
+            OrderDirection::Desc
+        } else {
+            OrderDirection::Asc
+        }
+    } else {
+        OrderDirection::Asc
+    };
+    if parts.len() != 1 {
+        return Err(OpenDbError::Sql(format!(
+            "invalid joined ORDER BY clause: {trimmed}"
+        )));
+    }
+    let qualified = parse_qualified_column(parts[0])?;
+    Ok(JoinedOrderBy {
+        qualifier: qualified.qualifier,
+        column: qualified.column,
+        direction,
     })
 }
 
