@@ -73,6 +73,9 @@ pub enum Statement {
         limit: Option<u64>,
         offset: Option<u64>,
     },
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,7 +108,14 @@ pub struct JoinedOrderBy {
 
 impl Statement {
     pub fn is_read(&self) -> bool {
-        matches!(self, Self::SelectAll { .. })
+        matches!(
+            self,
+            Self::SelectAll { .. }
+                | Self::Select { .. }
+                | Self::Begin
+                | Self::Commit
+                | Self::Rollback
+        )
     }
 
     /// Sprint 10: convenience constructor that mirrors the pre-Sprint-10

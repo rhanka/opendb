@@ -21,6 +21,18 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         trimmed
     };
     let upper = normalized.to_ascii_uppercase();
+    if upper == "BEGIN"
+        || upper == "BEGIN TRANSACTION"
+        || upper == "START TRANSACTION"
+    {
+        return Ok(Statement::Begin);
+    }
+    if upper == "COMMIT" || upper == "COMMIT TRANSACTION" || upper == "END" {
+        return Ok(Statement::Commit);
+    }
+    if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" || upper == "ABORT" {
+        return Ok(Statement::Rollback);
+    }
     if upper.starts_with("CREATE TABLE ") {
         parse_create_table(normalized)
     } else if upper.starts_with("CREATE UNIQUE INDEX ") || upper.starts_with("CREATE INDEX ") {
@@ -1247,6 +1259,23 @@ mod tests {
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
         );
+    }
+
+    #[test]
+    fn parses_begin_commit_rollback_in_all_synonyms() {
+        for sql in [
+            "BEGIN",
+            "begin transaction",
+            "START TRANSACTION",
+        ] {
+            assert!(matches!(parse(sql).expect("begin"), Statement::Begin));
+        }
+        for sql in ["COMMIT", "commit transaction", "END"] {
+            assert!(matches!(parse(sql).expect("commit"), Statement::Commit));
+        }
+        for sql in ["ROLLBACK", "rollback transaction", "ABORT"] {
+            assert!(matches!(parse(sql).expect("rollback"), Statement::Rollback));
+        }
     }
 
     #[test]

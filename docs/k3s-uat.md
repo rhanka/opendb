@@ -79,6 +79,10 @@ Sprint 9 enforces UNIQUE and FOREIGN KEY constraints at INSERT time and adds a m
 
 Sprint 10 (minimal) adds `ORDER BY <column> [ASC|DESC]`, `LIMIT <n>` and `OFFSET <n>` to `SELECT *`. The sort is stable, NULL sorts first ascending, and the slice happens after the ORDER BY. JOINs (INNER/LEFT) plus `GROUP BY` are reserved for Sprint 10.5 — they would extend the surface but were too large to fit Sprint 10's drumbeat budget without delaying transaction work.
 
+Sprint 10.5 adds `INNER JOIN` and `LEFT JOIN` (single hop) with an `ON <left>.<col> = <right>.<col>` clause. Result columns are returned as `<table>.<column>`. WHERE / ORDER BY / LIMIT / OFFSET apply to the joined row set; nested-loop only (no index acceleration).
+
+Sprint 11 (no-op skeleton) accepts `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` and emits the matching PostgreSQL command tags. No isolation, no rollback semantics: any mutations inside the transaction are still applied immediately to the commit stream. Sprint 11.5 will replace this with a buffered transaction that fans out at COMMIT and discards on ROLLBACK.
+
 ### Known limitation surfaced by `--with-restart-recovery`
 
 After a leader-pod delete, the existing recovery contract does not yet propagate the root bootstrap descriptor to a follower that comes back with an empty local WAL. Such a follower replays zero records, reports `rootDescriptorKnown=false`, and the cluster-wide `Recovered` condition stays `False` with reason `RootDescriptorMissing`. This is a true reflection of cluster state, not a Sprint 3 regression: Sprint 3 only adds visibility. The propagation gap will be addressed in a later sprint (split/merge metadata or Raft snapshot install). Use `npm run smoke:k3s -- --with-restart-recovery` as a diagnostic in the meantime — it will fail loudly on this open issue rather than masking it.

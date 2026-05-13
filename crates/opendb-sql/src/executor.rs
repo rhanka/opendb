@@ -181,6 +181,24 @@ impl SqlEngine {
             } => self
                 .select_joined(left, join, where_clause, order_by, limit, offset)
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
+            Statement::Begin => Ok(PreparedQuery::Read {
+                result: QueryResult::Command {
+                    tag: "BEGIN".to_owned(),
+                },
+                route: RouteIntent::Root,
+            }),
+            Statement::Commit => Ok(PreparedQuery::Read {
+                result: QueryResult::Command {
+                    tag: "COMMIT".to_owned(),
+                },
+                route: RouteIntent::Root,
+            }),
+            Statement::Rollback => Ok(PreparedQuery::Read {
+                result: QueryResult::Command {
+                    tag: "ROLLBACK".to_owned(),
+                },
+                route: RouteIntent::Root,
+            }),
         }
     }
 
@@ -1276,6 +1294,41 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn begin_insert_commit_emits_tags_and_applies_insert() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
+            .expect("create");
+
+        let begin = engine.execute(parse("BEGIN").expect("parse")).expect("begin");
+        assert_eq!(
+            begin,
+            QueryResult::Command {
+                tag: "BEGIN".to_owned()
+            }
+        );
+        engine
+            .execute(parse("INSERT INTO t (id) VALUES (1)").expect("parse"))
+            .expect("insert");
+        let commit = engine
+            .execute(parse("COMMIT").expect("parse"))
+            .expect("commit");
+        assert_eq!(
+            commit,
+            QueryResult::Command {
+                tag: "COMMIT".to_owned()
+            }
+        );
+        let rows = engine
+            .execute(parse("SELECT * FROM t").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = rows else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
