@@ -84,6 +84,39 @@ async fn wal_reads_frame_v1_record_v2_range_split_fixture() {
 }
 
 #[tokio::test]
+async fn wal_reads_frame_v1_record_v2_jsonb_insert_fixture() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("commit.wal");
+    let bytes = decode_hex(include_str!(
+        "fixtures/wal/frame-v1-record-v2-jsonb-insert.hex"
+    ));
+    assert_frame(&bytes);
+
+    tokio::fs::write(&path, bytes)
+        .await
+        .expect("write wal fixture");
+
+    let records = Wal::new(&path).read_all().await.expect("read fixture");
+
+    assert_eq!(records.len(), 1);
+    let Mutation::InsertRow { table, values, .. } = &records[0].mutations[0] else {
+        panic!("expected InsertRow mutation");
+    };
+    assert_eq!(table, "documents");
+    let data = values
+        .iter()
+        .find(|cv| cv.column == "data")
+        .expect("data column");
+    match &data.value {
+        opendb_storage::commit_stream::Value::Json(value) => {
+            assert_eq!(value["k"], "v");
+            assert_eq!(value["arr"], serde_json::json!([1, 2, 3]));
+        }
+        other => panic!("expected Json value, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn wal_reads_frame_v1_record_v2_typed_defaults_fixture() {
     use opendb_storage::commit_stream::{ColumnType, DefaultExpr};
 

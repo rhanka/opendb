@@ -463,6 +463,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wal_appends_and_reads_jsonb_insert_record() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal = Wal::new(temp_dir.path().join("root-range").join("commit.wal"));
+        let record = CommitRecord::new(
+            TransactionId(9),
+            LogicalTimestamp(18),
+            vec![Mutation::InsertRow {
+                table: "documents".to_owned(),
+                key: "1".to_owned(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Int64(1),
+                    },
+                    ColumnValue {
+                        column: "data".to_owned(),
+                        value: Value::Json(serde_json::json!({"k":"v","arr":[1,2,3]})),
+                    },
+                ],
+            }],
+        );
+
+        wal.append(&record).await.expect("append jsonb insert");
+
+        assert_eq!(
+            wal.read_all().await.expect("read jsonb insert"),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
     async fn wal_rejects_unknown_field_in_typed_column_definition() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let wal_path = temp_dir.path().join("commit.wal");
