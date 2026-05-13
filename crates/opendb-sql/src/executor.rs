@@ -258,6 +258,10 @@ fn route_key(table: &str, row_key: &str) -> String {
 }
 
 fn is_duplicate_object_error(error: &OpenDbError) -> bool {
+    is_duplicate_object_error_for_do_block(error)
+}
+
+pub fn is_duplicate_object_error_for_do_block(error: &OpenDbError) -> bool {
     let message = match error {
         OpenDbError::InvalidInput(message) => message,
         OpenDbError::Sql(message) => message,

@@ -245,6 +245,34 @@ try {
     throw new Error(`jsonb smoke default row missing empty object: ${defaultRowText}`);
   }
 
+  // Sprint 8: ALTER TABLE ADD COLUMN + CREATE INDEX IF NOT EXISTS +
+  // DO $$ ... EXCEPTION WHEN duplicate_object idempotence must round-trip
+  // through pgwire and emit the expected command tags.
+  const alterTable = `alter_smoke_${tableName}`;
+  await exec(`CREATE TABLE ${alterTable} (id INT PRIMARY KEY, name TEXT)`);
+  await exec(`INSERT INTO ${alterTable} (id, name) VALUES (1, 'Ada')`);
+  await exec(
+    `ALTER TABLE ${alterTable} ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`
+  );
+  await exec(
+    `CREATE INDEX IF NOT EXISTS ${alterTable}_name_idx ON ${alterTable} USING btree (name)`
+  );
+  await exec(
+    `DO $$ BEGIN ALTER TABLE ${alterTable} ADD COLUMN status TEXT DEFAULT 'x'; EXCEPTION WHEN duplicate_object THEN null; END $$`
+  );
+  const alterRows = await exec(`SELECT * FROM ${alterTable}`);
+  if (alterRows.length !== 1) {
+    throw new Error(`alter smoke expected 1 row, got ${alterRows.length}`);
+  }
+  const alterRow = alterRows[0];
+  if (alterRow === undefined) {
+    throw new Error("alter smoke missing row");
+  }
+  const alterRowText = rowText(alterRow).join("|");
+  if (!alterRowText.includes("active")) {
+    throw new Error(`alter smoke missing default backfill: ${alterRowText}`);
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {

@@ -145,6 +145,29 @@ impl Database {
         // election to be able to read records the previous leader committed.
         self.refresh_engine_from_wal().await?;
 
+        if let Statement::DoBlock {
+            inner,
+            swallow_duplicate,
+        } = statement
+        {
+            for inner_statement in inner {
+                match Box::pin(self.execute(inner_statement)).await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if swallow_duplicate
+                            && opendb_sql::executor::is_duplicate_object_error_for_do_block(&error)
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(QueryResult::Command {
+                tag: "DO".to_owned(),
+            });
+        }
+
         if statement.is_read() {
             self.ensure_leader_for_client_query().await?;
         }
