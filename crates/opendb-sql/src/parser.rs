@@ -183,6 +183,7 @@ fn parse_column_type_tokens(tokens: &[String]) -> OpenDbResult<(ColumnType, usiz
             }
         }
         "TIMESTAMP" => Ok((ColumnType::Timestamp, 1)),
+        "JSON" | "JSONB" => Ok((ColumnType::Json, 1)),
         _ => Err(OpenDbError::Sql(format!(
             "unsupported column type: {}",
             tokens[0]
@@ -289,7 +290,7 @@ fn split_values(raw: &str) -> OpenDbResult<Vec<&str>> {
 }
 
 fn parse_value(value: &str) -> OpenDbResult<Value> {
-    let trimmed = value.trim();
+    let trimmed = strip_cast_suffix(value.trim());
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Ok(Value::Null);
     }
@@ -312,6 +313,25 @@ fn parse_value(value: &str) -> OpenDbResult<Value> {
         return Ok(Value::Float64(float_value));
     }
     Err(OpenDbError::Sql(format!("unsupported literal: {trimmed}")))
+}
+
+/// Strips a trailing PostgreSQL cast suffix (`::jsonb`, `::json`) from a
+/// literal. Other casts pass through unchanged so unsupported forms surface
+/// as parse errors and demand explicit support.
+fn strip_cast_suffix(value: &str) -> &str {
+    for suffix in [
+        "::jsonb",
+        "::JSONB",
+        "::Jsonb",
+        "::json",
+        "::JSON",
+        "::Json",
+    ] {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            return stripped.trim_end();
+        }
+    }
+    value
 }
 
 fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
@@ -643,6 +663,50 @@ mod tests {
         assert_eq!(
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
+        );
+    }
+
+    #[test]
+    fn parses_jsonb_type_and_default_cast() {
+        let stmt = parse("CREATE TABLE t (id INT PRIMARY KEY, data JSONB DEFAULT '{}'::jsonb)")
+            .expect("create");
+        let Statement::CreateTable { columns, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(matches!(columns[1].data_type, ColumnType::Json));
+        assert_eq!(
+            columns[1].default,
+            Some(DefaultExpr::Const(Value::Text("{}".to_owned())))
+        );
+    }
+
+    #[test]
+    fn parses_jsonb_alias_as_json() {
+        let stmt =
+            parse("CREATE TABLE t (id INT PRIMARY KEY, data JSON)").expect("create json column");
+        let Statement::CreateTable { columns, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        assert!(matches!(columns[1].data_type, ColumnType::Json));
+    }
+
+    #[test]
+    fn parses_jsonb_literal_in_named_insert() {
+        let stmt = parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)")
+            .expect("insert");
+        let Statement::Insert {
+            values, columns, ..
+        } = stmt
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(columns, Some(vec!["id".to_owned(), "data".to_owned()]));
+        assert_eq!(
+            values,
+            vec![
+                Value::Int64(1),
+                Value::Text("{\"k\":\"v\"}".to_owned()),
+            ]
         );
     }
 
