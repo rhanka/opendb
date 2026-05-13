@@ -273,6 +273,39 @@ try {
     throw new Error(`alter smoke missing default backfill: ${alterRowText}`);
   }
 
+  // Sprint 9: UNIQUE / FK enforcement and DELETE through pgwire.
+  const parents = `parents_smoke_${tableName}`;
+  const children = `children_smoke_${tableName}`;
+  await exec(`CREATE TABLE ${parents} (id INT PRIMARY KEY, name TEXT)`);
+  await exec(`CREATE TABLE ${children} (id INT PRIMARY KEY, parent_id INT)`);
+  await exec(
+    `ALTER TABLE ${children} ADD CONSTRAINT ${children}_fk FOREIGN KEY (parent_id) REFERENCES ${parents} (id) ON DELETE CASCADE`
+  );
+  await exec(
+    `ALTER TABLE ${parents} ADD CONSTRAINT ${parents}_unique_name UNIQUE (name)`
+  );
+  await exec(`INSERT INTO ${parents} (id, name) VALUES (1, 'p1')`);
+  await exec(`INSERT INTO ${children} (id, parent_id) VALUES (10, 1)`);
+  const duplicateUniqueError = await execExpectError(
+    `INSERT INTO ${parents} (id, name) VALUES (2, 'p1')`
+  );
+  if (!duplicateUniqueError.includes("UNIQUE")) {
+    throw new Error(`UNIQUE constraint not rejected: ${duplicateUniqueError}`);
+  }
+  const fkError = await execExpectError(
+    `INSERT INTO ${children} (id, parent_id) VALUES (11, 99)`
+  );
+  if (!fkError.includes("FK")) {
+    throw new Error(`FK not enforced: ${fkError}`);
+  }
+  await exec(`DELETE FROM ${parents} WHERE id = 1`);
+  const remainingChildren = await exec(`SELECT * FROM ${children}`);
+  if (remainingChildren.length !== 0) {
+    throw new Error(
+      `expected cascade delete to drop children, got ${remainingChildren.length} rows`
+    );
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {

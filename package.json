@@ -16,7 +16,8 @@
     "k3s:up": "tsx tools/k3d-up.ts",
     "k3s:down": "tsx tools/k3d-down.ts",
     "bench:jsonb": "tsx tools/bench/jsonb.ts",
-    "bench:alter": "tsx tools/bench/alter-then-select.ts"
+    "bench:alter": "tsx tools/bench/alter-then-select.ts",
+    "bench:fk": "tsx tools/bench/fk-insert-delete.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
