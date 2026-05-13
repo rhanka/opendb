@@ -59,7 +59,8 @@ impl RangeCatalog {
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
                 | Mutation::PutArchiveObjectPointer { .. }
-                | Mutation::PutRecoveryArtifactPointer { .. } => {}
+                | Mutation::PutRecoveryArtifactPointer { .. }
+                | Mutation::AlterTable { .. } => {}
             }
         }
         validate_parent_graph(&candidate_descriptors)?;

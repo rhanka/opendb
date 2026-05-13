@@ -1,11 +1,16 @@
-use crate::commit_stream::{ColumnDefinition, ColumnType, CommitRecord, Mutation, Value};
+use crate::commit_stream::{
+    AlterTableOp, ColumnDefinition, ColumnType, CommitRecord, IndexDescriptor, Mutation,
+    NamedConstraint, Value,
+};
 use opendb_common::{OpenDbError, OpenDbResult};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Table {
     pub columns: Vec<ColumnDefinition>,
     pub rows: BTreeMap<String, BTreeMap<String, Value>>,
+    pub constraints: Vec<NamedConstraint>,
+    pub indexes: Vec<IndexDescriptor>,
 }
 
 impl Table {
@@ -88,6 +93,8 @@ impl RowProjection {
                         Table {
                             columns: columns.clone(),
                             rows: BTreeMap::new(),
+                            constraints: Vec::new(),
+                            indexes: Vec::new(),
                         },
                     );
                 }
@@ -163,6 +170,130 @@ impl RowProjection {
                 | Mutation::MergeRanges { .. }
                 | Mutation::PutArchiveObjectPointer { .. }
                 | Mutation::PutRecoveryArtifactPointer { .. } => {}
+                Mutation::AlterTable { table, op } => {
+                    self.apply_alter_table(table, op)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_alter_table(&mut self, table: &str, op: &AlterTableOp) -> OpenDbResult<()> {
+        let table_state = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        match op {
+            AlterTableOp::AddColumn(column) => {
+                if column.name.trim().is_empty() {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "ALTER TABLE {table} ADD COLUMN requires a name"
+                    )));
+                }
+                if table_state
+                    .columns
+                    .iter()
+                    .any(|existing| existing.name == column.name)
+                {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "column {} already exists on table {table}",
+                        column.name
+                    )));
+                }
+                if column.primary_key {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "ALTER TABLE {table} cannot add a new primary key column"
+                    )));
+                }
+                let backfill = match &column.default {
+                    Some(crate::commit_stream::DefaultExpr::Const(value)) => value.clone(),
+                    _ if column.nullable => Value::Null,
+                    _ => {
+                        return Err(OpenDbError::InvalidInput(format!(
+                            "ALTER TABLE {table} ADD COLUMN {} requires DEFAULT or NULL allowance",
+                            column.name
+                        )));
+                    }
+                };
+                table_state.columns.push(column.clone());
+                for row in table_state.rows.values_mut() {
+                    row.entry(column.name.clone()).or_insert_with(|| backfill.clone());
+                }
+            }
+            AlterTableOp::DropColumn { column } => {
+                let position = table_state
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == column)
+                    .ok_or_else(|| {
+                        OpenDbError::NotFound(format!("column {column} not found on table {table}"))
+                    })?;
+                if table_state
+                    .columns
+                    .get(position)
+                    .is_some_and(|c| c.primary_key)
+                {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "cannot drop primary key column {column} on table {table}"
+                    )));
+                }
+                table_state.columns.remove(position);
+                for row in table_state.rows.values_mut() {
+                    row.remove(column);
+                }
+            }
+            AlterTableOp::RenameColumn { from, to } => {
+                if table_state.columns.iter().any(|c| &c.name == to) {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "rename target {to} already exists on table {table}"
+                    )));
+                }
+                let column = table_state
+                    .columns
+                    .iter_mut()
+                    .find(|c| &c.name == from)
+                    .ok_or_else(|| {
+                        OpenDbError::NotFound(format!("column {from} not found on table {table}"))
+                    })?;
+                column.name = to.clone();
+                for row in table_state.rows.values_mut() {
+                    if let Some(value) = row.remove(from) {
+                        row.insert(to.clone(), value);
+                    }
+                }
+            }
+            AlterTableOp::AddConstraint(constraint) => {
+                if table_state
+                    .constraints
+                    .iter()
+                    .any(|existing| existing.name == constraint.name)
+                {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "constraint {} already exists on table {table}",
+                        constraint.name
+                    )));
+                }
+                table_state.constraints.push(constraint.clone());
+            }
+            AlterTableOp::AddIndex(index) => {
+                if let Some(existing) = table_state.indexes.iter().find(|i| i.name == index.name) {
+                    if index.if_not_exists {
+                        return Ok(());
+                    }
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "index {} already exists on table {table} (current columns: {:?})",
+                        index.name, existing.columns
+                    )));
+                }
+                for column in &index.columns {
+                    if !table_state.columns.iter().any(|c| &c.name == column) {
+                        return Err(OpenDbError::InvalidInput(format!(
+                            "index {} references unknown column {column} on table {table}",
+                            index.name
+                        )));
+                    }
+                }
+                table_state.indexes.push(index.clone());
             }
         }
         Ok(())
@@ -637,5 +768,131 @@ mod tests {
             accounts.rows.get("1").and_then(|row| row.get("name")),
             Some(&Value::Text("Ada".to_owned()))
         );
+    }
+
+    fn alter_record(tx_id: u64, op: AlterTableOp) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::AlterTable {
+                table: "accounts".to_owned(),
+                op,
+            }],
+        )
+    }
+
+    #[test]
+    fn alter_table_add_column_backfills_existing_rows_with_default() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            insert_account_record(2, "1"),
+            alter_record(
+                3,
+                AlterTableOp::AddColumn(
+                    ColumnDefinition::new("status", ColumnType::Text)
+                        .with_default(crate::commit_stream::DefaultExpr::Const(
+                            Value::Text("active".to_owned()),
+                        )),
+                ),
+            ),
+        ])
+        .expect("rebuild");
+        let accounts = projection.table("accounts").expect("accounts");
+        assert_eq!(accounts.columns.last().unwrap().name, "status");
+        assert_eq!(
+            accounts.rows.get("1").and_then(|row| row.get("status")),
+            Some(&Value::Text("active".to_owned()))
+        );
+    }
+
+    #[test]
+    fn alter_table_drop_column_removes_values() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            insert_account_record(2, "1"),
+            alter_record(
+                3,
+                AlterTableOp::DropColumn {
+                    column: "name".to_owned(),
+                },
+            ),
+        ])
+        .expect("rebuild");
+        let accounts = projection.table("accounts").expect("accounts");
+        assert!(accounts.columns.iter().all(|c| c.name != "name"));
+        assert!(
+            accounts
+                .rows
+                .get("1")
+                .map(|row| !row.contains_key("name"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn alter_table_drop_column_rejects_primary_key() {
+        let result = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            alter_record(
+                2,
+                AlterTableOp::DropColumn {
+                    column: "id".to_owned(),
+                },
+            ),
+        ]);
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn alter_table_rename_column_updates_schema_and_rows() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            insert_account_record(2, "1"),
+            alter_record(
+                3,
+                AlterTableOp::RenameColumn {
+                    from: "name".to_owned(),
+                    to: "display_name".to_owned(),
+                },
+            ),
+        ])
+        .expect("rebuild");
+        let accounts = projection.table("accounts").expect("accounts");
+        assert!(accounts.columns.iter().any(|c| c.name == "display_name"));
+        assert!(accounts.columns.iter().all(|c| c.name != "name"));
+        assert_eq!(
+            accounts.rows.get("1").and_then(|row| row.get("display_name")),
+            Some(&Value::Text("Ada".to_owned()))
+        );
+    }
+
+    #[test]
+    fn alter_table_add_constraint_and_index_record_metadata() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            alter_record(
+                2,
+                AlterTableOp::AddConstraint(NamedConstraint {
+                    name: "accounts_unique_name".to_owned(),
+                    kind: crate::commit_stream::ConstraintKind::Unique {
+                        columns: vec!["name".to_owned()],
+                    },
+                }),
+            ),
+            alter_record(
+                3,
+                AlterTableOp::AddIndex(IndexDescriptor {
+                    name: "accounts_name_idx".to_owned(),
+                    columns: vec!["name".to_owned()],
+                    unique: false,
+                    if_not_exists: true,
+                }),
+            ),
+        ])
+        .expect("rebuild");
+        let accounts = projection.table("accounts").expect("accounts");
+        assert_eq!(accounts.constraints.len(), 1);
+        assert_eq!(accounts.indexes.len(), 1);
+        assert_eq!(accounts.indexes[0].name, "accounts_name_idx");
     }
 }

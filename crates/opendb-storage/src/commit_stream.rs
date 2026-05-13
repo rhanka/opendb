@@ -137,6 +137,63 @@ pub enum Mutation {
     PutRecoveryArtifactPointer {
         artifact: RecoveryArtifactPointer,
     },
+    AlterTable {
+        table: String,
+        op: AlterTableOp,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum AlterTableOp {
+    AddColumn(ColumnDefinition),
+    DropColumn { column: String },
+    RenameColumn { from: String, to: String },
+    AddConstraint(NamedConstraint),
+    AddIndex(IndexDescriptor),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedConstraint {
+    pub name: String,
+    pub kind: ConstraintKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ConstraintKind {
+    ForeignKey {
+        columns: Vec<String>,
+        references_table: String,
+        references_columns: Vec<String>,
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
+    },
+    Unique {
+        columns: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReferentialAction {
+    NoAction,
+    Cascade,
+    SetNull,
+    SetDefault,
+    Restrict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexDescriptor {
+    pub name: String,
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub if_not_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +285,59 @@ mod tests {
         RecoveryArtifactPointer,
     };
     use opendb_common::{LogicalTimestamp, RangeId, TransactionId};
+
+    #[test]
+    fn alter_table_mutation_round_trips_through_serde() {
+        let cases = vec![
+            Mutation::AlterTable {
+                table: "users".to_owned(),
+                op: AlterTableOp::AddColumn(ColumnDefinition::new(
+                    "email",
+                    ColumnType::Text,
+                )),
+            },
+            Mutation::AlterTable {
+                table: "users".to_owned(),
+                op: AlterTableOp::DropColumn {
+                    column: "legacy".to_owned(),
+                },
+            },
+            Mutation::AlterTable {
+                table: "users".to_owned(),
+                op: AlterTableOp::RenameColumn {
+                    from: "old".to_owned(),
+                    to: "new".to_owned(),
+                },
+            },
+            Mutation::AlterTable {
+                table: "users".to_owned(),
+                op: AlterTableOp::AddConstraint(NamedConstraint {
+                    name: "users_org_fk".to_owned(),
+                    kind: ConstraintKind::ForeignKey {
+                        columns: vec!["org_id".to_owned()],
+                        references_table: "orgs".to_owned(),
+                        references_columns: vec!["id".to_owned()],
+                        on_delete: ReferentialAction::Cascade,
+                        on_update: ReferentialAction::NoAction,
+                    },
+                }),
+            },
+            Mutation::AlterTable {
+                table: "users".to_owned(),
+                op: AlterTableOp::AddIndex(IndexDescriptor {
+                    name: "users_org_idx".to_owned(),
+                    columns: vec!["org_id".to_owned()],
+                    unique: false,
+                    if_not_exists: true,
+                }),
+            },
+        ];
+        for value in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            let parsed: Mutation = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, value);
+        }
+    }
 
     #[test]
     fn value_round_trips_through_serde_for_every_variant() {
