@@ -1,6 +1,9 @@
 use crate::ast::{Predicate, Statement};
 use opendb_common::{OpenDbError, OpenDbResult};
-use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, DefaultExpr, Value};
+use opendb_storage::commit_stream::{
+    AlterTableOp, ColumnDefinition, ColumnType, ConstraintKind, DefaultExpr, IndexDescriptor,
+    NamedConstraint, ReferentialAction, Value,
+};
 
 pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     let trimmed = sql.trim();
@@ -17,13 +20,329 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     let upper = normalized.to_ascii_uppercase();
     if upper.starts_with("CREATE TABLE ") {
         parse_create_table(normalized)
+    } else if upper.starts_with("CREATE UNIQUE INDEX ") || upper.starts_with("CREATE INDEX ") {
+        parse_create_index(normalized)
     } else if upper.starts_with("INSERT INTO ") {
         parse_insert(normalized)
     } else if upper.starts_with("SELECT * FROM ") {
         parse_select_all(normalized)
+    } else if upper.starts_with("ALTER TABLE ") {
+        parse_alter_table(normalized)
+    } else if upper.starts_with("DO ") || upper.starts_with("DO$") {
+        parse_do_block(normalized)
     } else {
         Err(OpenDbError::Sql(format!("unsupported SQL: {normalized}")))
     }
+}
+
+fn parse_alter_table(sql: &str) -> OpenDbResult<Statement> {
+    let rest = strip_keyword_prefix(sql, "ALTER TABLE ")
+        .ok_or_else(|| OpenDbError::Sql("invalid ALTER TABLE".to_owned()))?
+        .trim();
+    let (table_name, remainder) = split_first_word(rest)?;
+    let upper_remainder = remainder.to_ascii_uppercase();
+    if let Some(after) = strip_keyword(remainder, &upper_remainder, "ADD COLUMN ") {
+        let column = parse_column_definition(after.trim())?;
+        return Ok(Statement::AlterTable {
+            table: unquote_identifier(table_name),
+            op: AlterTableOp::AddColumn(column),
+        });
+    }
+    if let Some(after) = strip_keyword(remainder, &upper_remainder, "DROP COLUMN ") {
+        let column = strip_optional_terminators(after.trim());
+        return Ok(Statement::AlterTable {
+            table: unquote_identifier(table_name),
+            op: AlterTableOp::DropColumn {
+                column: unquote_identifier(column),
+            },
+        });
+    }
+    if let Some(after) = strip_keyword(remainder, &upper_remainder, "RENAME COLUMN ") {
+        let parts: Vec<&str> = after.split_whitespace().collect();
+        if parts.len() != 3 || !parts[1].eq_ignore_ascii_case("TO") {
+            return Err(OpenDbError::Sql(format!(
+                "invalid RENAME COLUMN clause: {after}"
+            )));
+        }
+        return Ok(Statement::AlterTable {
+            table: unquote_identifier(table_name),
+            op: AlterTableOp::RenameColumn {
+                from: unquote_identifier(parts[0]),
+                to: unquote_identifier(parts[2]),
+            },
+        });
+    }
+    if let Some(after) = strip_keyword(remainder, &upper_remainder, "ADD CONSTRAINT ") {
+        let constraint = parse_add_constraint(after.trim())?;
+        return Ok(Statement::AlterTable {
+            table: unquote_identifier(table_name),
+            op: AlterTableOp::AddConstraint(constraint),
+        });
+    }
+    Err(OpenDbError::Sql(format!(
+        "unsupported ALTER TABLE clause: {remainder}"
+    )))
+}
+
+fn split_first_word(input: &str) -> OpenDbResult<(&str, &str)> {
+    let trimmed = input.trim_start();
+    let mut end = 0;
+    let mut in_quote = false;
+    for (index, ch) in trimmed.char_indices() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            c if c.is_whitespace() && !in_quote => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return Err(OpenDbError::Sql(format!("expected identifier in {input}")));
+    }
+    Ok((trimmed[..end].trim(), trimmed[end..].trim_start()))
+}
+
+fn strip_keyword<'a>(original: &'a str, upper: &str, keyword: &str) -> Option<&'a str> {
+    if let Some(stripped_upper) = upper.strip_prefix(keyword) {
+        let consumed = upper.len() - stripped_upper.len();
+        Some(&original[consumed..])
+    } else {
+        None
+    }
+}
+
+fn parse_add_constraint(input: &str) -> OpenDbResult<NamedConstraint> {
+    let (name, rest) = split_first_word(input)?;
+    let upper_rest = rest.to_ascii_uppercase();
+    if let Some(after) = strip_keyword(rest, &upper_rest, "FOREIGN KEY") {
+        let after = after.trim_start();
+        let (columns_text, after_cols) =
+            extract_parenthesized(after).ok_or_else(|| OpenDbError::Sql("FK columns".to_owned()))?;
+        let after_cols_trimmed = after_cols.trim_start();
+        let upper_after_cols = after_cols_trimmed.to_ascii_uppercase();
+        let after_refs = strip_keyword(after_cols_trimmed, &upper_after_cols, "REFERENCES")
+            .ok_or_else(|| OpenDbError::Sql("missing REFERENCES".to_owned()))?
+            .trim_start();
+        let (ref_table, after_ref_table) = split_first_word(after_refs)?;
+        let (ref_cols_text, tail) = extract_parenthesized(after_ref_table)
+            .ok_or_else(|| OpenDbError::Sql("REFERENCES columns".to_owned()))?;
+        let (on_delete, on_update) = parse_referential_actions(tail)?;
+        Ok(NamedConstraint {
+            name: unquote_identifier(name),
+            kind: ConstraintKind::ForeignKey {
+                columns: parse_identifier_list(columns_text),
+                references_table: unquote_identifier(ref_table),
+                references_columns: parse_identifier_list(ref_cols_text),
+                on_delete,
+                on_update,
+            },
+        })
+    } else if let Some(after) = strip_keyword(rest, &upper_rest, "UNIQUE") {
+        let after = after.trim_start();
+        let (columns_text, _tail) = extract_parenthesized(after)
+            .ok_or_else(|| OpenDbError::Sql("UNIQUE columns".to_owned()))?;
+        Ok(NamedConstraint {
+            name: unquote_identifier(name),
+            kind: ConstraintKind::Unique {
+                columns: parse_identifier_list(columns_text),
+            },
+        })
+    } else {
+        Err(OpenDbError::Sql(format!(
+            "unsupported constraint kind in {rest}"
+        )))
+    }
+}
+
+fn extract_parenthesized(input: &str) -> Option<(&str, &str)> {
+    let open = input.find('(')?;
+    let mut depth = 0;
+    for (index, ch) in input[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let close = open + index;
+                    return Some((&input[open + 1..close], &input[close + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_identifier_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|part| unquote_identifier(part.trim()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn unquote_identifier(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        stripped.to_owned()
+    } else {
+        trimmed.trim_end_matches(';').trim().to_owned()
+    }
+}
+
+fn parse_referential_actions(tail: &str) -> OpenDbResult<(ReferentialAction, ReferentialAction)> {
+    let upper = tail.to_ascii_uppercase();
+    let mut on_delete = ReferentialAction::NoAction;
+    let mut on_update = ReferentialAction::NoAction;
+    let mut cursor = upper.as_str();
+    let mut original = tail;
+    loop {
+        let trimmed_upper = cursor.trim_start();
+        let advanced = cursor.len() - trimmed_upper.len();
+        original = &original[advanced..];
+        cursor = trimmed_upper;
+        if let Some(rest_upper) = cursor.strip_prefix("ON DELETE ") {
+            let (action, after) = take_referential_action(rest_upper)?;
+            on_delete = action;
+            let consumed = cursor.len() - after.len();
+            cursor = after;
+            original = &original[consumed..];
+        } else if let Some(rest_upper) = cursor.strip_prefix("ON UPDATE ") {
+            let (action, after) = take_referential_action(rest_upper)?;
+            on_update = action;
+            let consumed = cursor.len() - after.len();
+            cursor = after;
+            original = &original[consumed..];
+        } else {
+            break;
+        }
+    }
+    Ok((on_delete, on_update))
+}
+
+fn take_referential_action(input: &str) -> OpenDbResult<(ReferentialAction, &str)> {
+    let trimmed = input.trim_start();
+    let upper = trimmed;
+    if let Some(rest) = upper.strip_prefix("NO ACTION") {
+        Ok((ReferentialAction::NoAction, rest))
+    } else if let Some(rest) = upper.strip_prefix("CASCADE") {
+        Ok((ReferentialAction::Cascade, rest))
+    } else if let Some(rest) = upper.strip_prefix("SET NULL") {
+        Ok((ReferentialAction::SetNull, rest))
+    } else if let Some(rest) = upper.strip_prefix("SET DEFAULT") {
+        Ok((ReferentialAction::SetDefault, rest))
+    } else if let Some(rest) = upper.strip_prefix("RESTRICT") {
+        Ok((ReferentialAction::Restrict, rest))
+    } else {
+        Err(OpenDbError::Sql(format!(
+            "unsupported referential action: {input}"
+        )))
+    }
+}
+
+fn parse_create_index(sql: &str) -> OpenDbResult<Statement> {
+    let upper = sql.to_ascii_uppercase();
+    let (unique, rest_after_unique) = if let Some(rest) = strip_keyword(sql, &upper, "CREATE UNIQUE INDEX ") {
+        (true, rest)
+    } else {
+        let rest = strip_keyword(sql, &upper, "CREATE INDEX ")
+            .ok_or_else(|| OpenDbError::Sql("invalid CREATE INDEX".to_owned()))?;
+        (false, rest)
+    };
+    let rest_upper = rest_after_unique.to_ascii_uppercase();
+    let (if_not_exists, remainder) =
+        if let Some(rest) = strip_keyword(rest_after_unique, &rest_upper, "IF NOT EXISTS ") {
+            (true, rest)
+        } else {
+            (false, rest_after_unique)
+        };
+    let (name, after_name) = split_first_word(remainder)?;
+    let upper_after_name = after_name.to_ascii_uppercase();
+    let after_on = strip_keyword(after_name, &upper_after_name, "ON ")
+        .ok_or_else(|| OpenDbError::Sql("CREATE INDEX requires ON".to_owned()))?;
+    let (table, after_table) = split_first_word(after_on)?;
+    let after_table_upper = after_table.to_ascii_uppercase();
+    let columns_input =
+        if let Some(after_using) = strip_keyword(after_table, &after_table_upper, "USING ") {
+            // skip the index method name (btree, hash, ...) and resume at its tail
+            let (_method, after_method) = split_first_word(after_using)?;
+            after_method
+        } else {
+            after_table
+        };
+    let (columns_text, _) = extract_parenthesized(columns_input)
+        .ok_or_else(|| OpenDbError::Sql("CREATE INDEX columns".to_owned()))?;
+    let columns = parse_identifier_list(columns_text);
+    Ok(Statement::CreateIndex {
+        table: unquote_identifier(table),
+        index: IndexDescriptor {
+            name: unquote_identifier(name),
+            columns,
+            unique,
+            if_not_exists,
+        },
+    })
+}
+
+fn parse_do_block(sql: &str) -> OpenDbResult<Statement> {
+    let trimmed = sql.trim();
+    let after_do = trimmed[2..].trim_start();
+    let body = after_do
+        .strip_prefix("$$")
+        .ok_or_else(|| OpenDbError::Sql("DO block must use $$ delimiter".to_owned()))?;
+    let inner_text = body
+        .strip_suffix(";")
+        .unwrap_or(body)
+        .trim()
+        .strip_suffix("$$")
+        .ok_or_else(|| OpenDbError::Sql("DO block must close with $$".to_owned()))?;
+    let inner_text = inner_text.trim();
+    let upper_inner = inner_text.to_ascii_uppercase();
+    let body_after_begin = strip_keyword(inner_text, &upper_inner, "BEGIN")
+        .unwrap_or(inner_text)
+        .trim();
+    let end_index = body_after_begin
+        .to_ascii_uppercase()
+        .rfind("END")
+        .ok_or_else(|| OpenDbError::Sql("DO block missing END".to_owned()))?;
+    let body_text = &body_after_begin[..end_index];
+    let mut swallow_duplicate = false;
+    let inner_statements_text = if let Some(exception_pos) = body_text
+        .to_ascii_uppercase()
+        .find("EXCEPTION")
+    {
+        let main_body = &body_text[..exception_pos];
+        let exception_body = &body_text[exception_pos..];
+        if exception_body
+            .to_ascii_uppercase()
+            .contains("DUPLICATE_OBJECT")
+        {
+            swallow_duplicate = true;
+        }
+        main_body
+    } else {
+        body_text
+    };
+    let inner = split_statements(inner_statements_text)
+        .into_iter()
+        .map(|stmt| parse(&stmt))
+        .collect::<OpenDbResult<Vec<_>>>()?;
+    Ok(Statement::DoBlock {
+        inner,
+        swallow_duplicate,
+    })
+}
+
+fn split_statements(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn strip_optional_terminators(input: &str) -> &str {
+    input.trim_end_matches(';').trim()
 }
 
 fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
@@ -664,6 +983,116 @@ mod tests {
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
         );
+    }
+
+    #[test]
+    fn parses_alter_table_add_column_with_default() {
+        let stmt = parse(
+            "ALTER TABLE accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        )
+        .expect("alter add");
+        let Statement::AlterTable { table, op } = stmt else {
+            panic!("expected AlterTable");
+        };
+        assert_eq!(table, "accounts");
+        match op {
+            AlterTableOp::AddColumn(column) => {
+                assert_eq!(column.name, "status");
+                assert!(!column.nullable);
+                assert_eq!(
+                    column.default,
+                    Some(DefaultExpr::Const(Value::Text("active".to_owned())))
+                );
+            }
+            other => panic!("expected AddColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_alter_table_drop_and_rename_column() {
+        let drop_stmt =
+            parse("ALTER TABLE accounts DROP COLUMN legacy").expect("alter drop");
+        let Statement::AlterTable { op, .. } = drop_stmt else {
+            panic!("expected AlterTable");
+        };
+        assert!(matches!(op, AlterTableOp::DropColumn { column } if column == "legacy"));
+
+        let rename_stmt =
+            parse("ALTER TABLE accounts RENAME COLUMN old TO renamed").expect("alter rename");
+        let Statement::AlterTable { op, .. } = rename_stmt else {
+            panic!("expected AlterTable");
+        };
+        match op {
+            AlterTableOp::RenameColumn { from, to } => {
+                assert_eq!(from, "old");
+                assert_eq!(to, "renamed");
+            }
+            _ => panic!("expected RenameColumn"),
+        }
+    }
+
+    #[test]
+    fn parses_alter_table_add_foreign_key_constraint() {
+        let stmt = parse(
+            "ALTER TABLE users ADD CONSTRAINT users_org_fk FOREIGN KEY (org_id) REFERENCES orgs (id) ON DELETE CASCADE",
+        )
+        .expect("alter fk");
+        let Statement::AlterTable { op, .. } = stmt else {
+            panic!("expected AlterTable");
+        };
+        let AlterTableOp::AddConstraint(constraint) = op else {
+            panic!("expected AddConstraint");
+        };
+        assert_eq!(constraint.name, "users_org_fk");
+        let ConstraintKind::ForeignKey {
+            columns,
+            references_table,
+            references_columns,
+            on_delete,
+            on_update,
+        } = constraint.kind
+        else {
+            panic!("expected ForeignKey");
+        };
+        assert_eq!(columns, vec!["org_id".to_owned()]);
+        assert_eq!(references_table, "orgs");
+        assert_eq!(references_columns, vec!["id".to_owned()]);
+        assert!(matches!(on_delete, ReferentialAction::Cascade));
+        assert!(matches!(on_update, ReferentialAction::NoAction));
+    }
+
+    #[test]
+    fn parses_create_index_if_not_exists_with_btree() {
+        let stmt = parse(
+            "CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING btree (name)",
+        )
+        .expect("create index");
+        let Statement::CreateIndex { table, index } = stmt else {
+            panic!("expected CreateIndex");
+        };
+        assert_eq!(table, "accounts");
+        assert_eq!(index.name, "accounts_name_idx");
+        assert_eq!(index.columns, vec!["name".to_owned()]);
+        assert!(index.if_not_exists);
+        assert!(!index.unique);
+    }
+
+    #[test]
+    fn parses_do_block_with_exception_duplicate_object() {
+        let stmt = parse(
+            "DO $$ BEGIN ALTER TABLE accounts ADD COLUMN legacy TEXT; EXCEPTION WHEN duplicate_object THEN null; END $$",
+        )
+        .expect("do block");
+        let Statement::DoBlock {
+            inner,
+            swallow_duplicate,
+        } = stmt
+        else {
+            panic!("expected DoBlock");
+        };
+        assert!(swallow_duplicate);
+        assert_eq!(inner.len(), 1);
+        assert!(matches!(inner[0], Statement::AlterTable { .. }));
     }
 
     #[test]

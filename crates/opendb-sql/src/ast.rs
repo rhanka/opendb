@@ -1,4 +1,6 @@
-use opendb_storage::commit_stream::{ColumnDefinition, ColumnType, Value};
+use opendb_storage::commit_stream::{
+    AlterTableOp, ColumnDefinition, ColumnType, IndexDescriptor, Value,
+};
 
 // `column_types` is currently always emitted as `Vec::new()` by the engine;
 // pgwire derives the row-description OIDs from the first row instead. This
@@ -28,6 +30,18 @@ pub enum Statement {
     SelectAll {
         table: String,
         predicate: Option<Predicate>,
+    },
+    AlterTable {
+        table: String,
+        op: AlterTableOp,
+    },
+    CreateIndex {
+        index: IndexDescriptor,
+        table: String,
+    },
+    DoBlock {
+        inner: Vec<Statement>,
+        swallow_duplicate: bool,
     },
 }
 

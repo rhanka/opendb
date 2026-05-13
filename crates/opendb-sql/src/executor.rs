@@ -34,6 +34,26 @@ pub struct SqlEngine {
 
 impl SqlEngine {
     pub fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
+        if let Statement::DoBlock {
+            inner,
+            swallow_duplicate,
+        } = statement
+        {
+            for inner_statement in inner {
+                match self.execute(inner_statement) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if swallow_duplicate && is_duplicate_object_error(&error) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(QueryResult::Command {
+                tag: "DO".to_owned(),
+            });
+        }
         match self.prepare(statement)? {
             PreparedQuery::Read { result, .. } => Ok(result),
             PreparedQuery::Write { record, tag, .. } => {
@@ -109,6 +129,22 @@ impl SqlEngine {
             Statement::SelectAll { table, predicate } => self
                 .select_all(&table, predicate.as_ref())
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
+            Statement::AlterTable { table, op } => self.prepare_write(
+                vec![Mutation::AlterTable { table, op }],
+                "ALTER TABLE",
+                RouteIntent::Root,
+            ),
+            Statement::CreateIndex { table, index } => self.prepare_write(
+                vec![Mutation::AlterTable {
+                    table,
+                    op: opendb_storage::commit_stream::AlterTableOp::AddIndex(index),
+                }],
+                "CREATE INDEX",
+                RouteIntent::Root,
+            ),
+            Statement::DoBlock { .. } => Err(OpenDbError::Sql(
+                "DO blocks must be executed via SqlEngine::execute".to_owned(),
+            )),
         }
     }
 
@@ -219,6 +255,16 @@ impl SqlEngine {
 
 fn route_key(table: &str, row_key: &str) -> String {
     format!("{table}/{row_key}")
+}
+
+fn is_duplicate_object_error(error: &OpenDbError) -> bool {
+    let message = match error {
+        OpenDbError::InvalidInput(message) => message,
+        OpenDbError::Sql(message) => message,
+        _ => return false,
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("already exists") || lower.contains("duplicate")
 }
 
 fn project_row(
@@ -970,6 +1016,88 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn alter_table_add_column_then_named_insert_uses_default() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id, name) VALUES (1, 'Ada')").expect("parse"))
+            .expect("insert");
+        engine
+            .execute(
+                parse(
+                    "ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+                )
+                .expect("parse"),
+            )
+            .expect("alter");
+        engine
+            .execute(parse("INSERT INTO t (id, name) VALUES (2, 'Grace')").expect("parse"))
+            .expect("insert grace");
+
+        let last = engine.commits().last().expect("commit");
+        let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let status = values
+            .iter()
+            .find(|cv| cv.column == "status")
+            .expect("status column");
+        assert_eq!(status.value, Value::Text("active".to_owned()));
+    }
+
+    #[test]
+    fn create_index_records_metadata_without_acceleration() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        let result = engine
+            .execute(
+                parse(
+                    "CREATE INDEX IF NOT EXISTS t_name_idx ON t USING btree (name)",
+                )
+                .expect("parse"),
+            )
+            .expect("create index");
+        assert_eq!(
+            result,
+            QueryResult::Command {
+                tag: "CREATE INDEX".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn do_block_swallows_duplicate_object_errors() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(
+                parse(
+                    "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'x'",
+                )
+                .expect("parse"),
+            )
+            .expect("alter");
+        // Second ALTER would fail with "already exists", but the DO block
+        // marked WHEN duplicate_object swallows the error.
+        let result = engine.execute(
+            parse(
+                "DO $$ BEGIN ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'x'; EXCEPTION WHEN duplicate_object THEN null; END $$",
+            )
+            .expect("parse"),
+        );
+        assert!(matches!(
+            result,
+            Ok(QueryResult::Command { ref tag }) if tag == "DO"
+        ));
     }
 
     #[test]
