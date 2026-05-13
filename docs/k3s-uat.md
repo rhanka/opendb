@@ -77,6 +77,8 @@ Sprint 8 adds `ALTER TABLE ADD COLUMN`, `ALTER TABLE DROP COLUMN`, `ALTER TABLE 
 
 Sprint 9 enforces UNIQUE and FOREIGN KEY constraints at INSERT time and adds a minimal `DELETE FROM <table> WHERE <pk> = <literal>` statement. ON DELETE actions (`CASCADE`, `NO ACTION`, `RESTRICT`, `SET NULL`, `SET DEFAULT`) are applied one hop deep; multi-hop cascades land later. INSERT verifies that the referenced parent row exists; UNIQUE constraints reject duplicate tuples. `npm run bench:fk -- --rows 100` exercises parent + child INSERTs followed by cascade DELETEs and supports the `--with-pg` opt-in.
 
+Sprint 10 (minimal) adds `ORDER BY <column> [ASC|DESC]`, `LIMIT <n>` and `OFFSET <n>` to `SELECT *`. The sort is stable, NULL sorts first ascending, and the slice happens after the ORDER BY. JOINs (INNER/LEFT) plus `GROUP BY` are reserved for Sprint 10.5 — they would extend the surface but were too large to fit Sprint 10's drumbeat budget without delaying transaction work.
+
 ### Known limitation surfaced by `--with-restart-recovery`
 
 After a leader-pod delete, the existing recovery contract does not yet propagate the root bootstrap descriptor to a follower that comes back with an empty local WAL. Such a follower replays zero records, reports `rootDescriptorKnown=false`, and the cluster-wide `Recovered` condition stays `False` with reason `RootDescriptorMissing`. This is a true reflection of cluster state, not a Sprint 3 regression: Sprint 3 only adds visibility. The propagation gap will be addressed in a later sprint (split/merge metadata or Raft snapshot install). Use `npm run smoke:k3s -- --with-restart-recovery` as a diagnostic in the meantime — it will fail loudly on this open issue rather than masking it.

@@ -306,6 +306,27 @@ try {
     );
   }
 
+  // Sprint 10: ORDER BY + LIMIT + OFFSET smoke.
+  const orderTable = `order_smoke_${tableName}`;
+  await exec(`CREATE TABLE ${orderTable} (id INT PRIMARY KEY, label TEXT)`);
+  for (let i = 1; i <= 5; i += 1) {
+    await exec(`INSERT INTO ${orderTable} (id, label) VALUES (${i}, 'row-${i}')`);
+  }
+  const orderedRows = await exec(
+    `SELECT * FROM ${orderTable} ORDER BY id DESC LIMIT 2 OFFSET 1`
+  );
+  if (orderedRows.length !== 2) {
+    throw new Error(`order smoke expected 2 rows, got ${orderedRows.length}`);
+  }
+  const firstOrdered = orderedRows[0];
+  if (firstOrdered === undefined) {
+    throw new Error("order smoke missing first row");
+  }
+  const firstOrderedText = rowText(firstOrdered).join("|");
+  if (!firstOrderedText.startsWith("4|")) {
+    throw new Error(`order smoke expected id=4 first, got ${firstOrderedText}`);
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {
