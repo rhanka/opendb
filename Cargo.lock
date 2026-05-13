@@ -1370,6 +1370,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "clap",
  "opendb-common",
  "opendb-consensus",
@@ -1411,6 +1412,7 @@ dependencies = [
  "opendb-common",
  "opendb-storage",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
