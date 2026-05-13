@@ -105,6 +105,7 @@ impl ArchiveManifest {
                 }
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
+                | Mutation::DeleteRow { .. }
                 | Mutation::PutRangeDescriptor { .. }
                 | Mutation::SplitRange { .. }
                 | Mutation::MergeRanges { .. }

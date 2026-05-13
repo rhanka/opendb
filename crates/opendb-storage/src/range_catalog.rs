@@ -58,6 +58,7 @@ impl RangeCatalog {
                 }
                 Mutation::CreateTable { .. }
                 | Mutation::InsertRow { .. }
+                | Mutation::DeleteRow { .. }
                 | Mutation::PutArchiveObjectPointer { .. }
                 | Mutation::PutRecoveryArtifactPointer { .. }
                 | Mutation::AlterTable { .. } => {}

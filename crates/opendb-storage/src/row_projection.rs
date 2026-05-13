@@ -1,7 +1,16 @@
 use crate::commit_stream::{
-    AlterTableOp, ColumnDefinition, ColumnType, CommitRecord, IndexDescriptor, Mutation,
-    NamedConstraint, Value,
+    AlterTableOp, ColumnDefinition, ColumnType, CommitRecord, ConstraintKind, IndexDescriptor,
+    Mutation, NamedConstraint, ReferentialAction, Value,
 };
+
+#[derive(Clone, Debug)]
+struct FkDependent {
+    table: String,
+    key: String,
+    columns: Vec<String>,
+    constraint_name: String,
+    action: ReferentialAction,
+}
 use opendb_common::{OpenDbError, OpenDbResult};
 use std::collections::BTreeMap;
 
@@ -163,6 +172,16 @@ impl RowProjection {
                             primary_key.name
                         )));
                     }
+                    // Enforce UNIQUE / FK constraints before insertion.
+                    {
+                        let table_ref = self
+                            .tables
+                            .get(table)
+                            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+                        self.enforce_unique_constraints(table_ref, key, &row)?;
+                        self.enforce_fk_constraints(table_ref, &row)?;
+                    }
+                    let table_state = self.tables.get_mut(table).expect("table existed above");
                     table_state.rows.insert(key.clone(), row);
                 }
                 Mutation::PutRangeDescriptor { .. }
@@ -173,6 +192,250 @@ impl RowProjection {
                 Mutation::AlterTable { table, op } => {
                     self.apply_alter_table(table, op)?;
                 }
+                Mutation::DeleteRow { table, key } => {
+                    self.apply_delete_row(table, key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_delete_row(&mut self, table: &str, key: &str) -> OpenDbResult<()> {
+        let target_row = {
+            let table_state = self
+                .tables
+                .get(table)
+                .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+            table_state.rows.get(key).cloned().ok_or_else(|| {
+                OpenDbError::NotFound(format!("row not found: {table}/{key}"))
+            })?
+        };
+        // Walk every other table looking for FKs that point at this table.
+        // Sprint 9 restricts cascades to one hop and references that map onto
+        // the parent's primary key column.
+        let dependents = self.collect_fk_dependents(table, &target_row)?;
+        for dependent in dependents {
+            match dependent.action {
+                ReferentialAction::Cascade => {
+                    self.apply_delete_row(&dependent.table, &dependent.key)?;
+                }
+                ReferentialAction::NoAction | ReferentialAction::Restrict => {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "DELETE on {table}/{key} violates FK {} on table {}",
+                        dependent.constraint_name, dependent.table
+                    )));
+                }
+                ReferentialAction::SetNull => {
+                    self.apply_set_null(&dependent)?;
+                }
+                ReferentialAction::SetDefault => {
+                    self.apply_set_default(&dependent)?;
+                }
+            }
+        }
+        let table_state = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        table_state.rows.remove(key);
+        Ok(())
+    }
+
+    fn collect_fk_dependents(
+        &self,
+        parent_table: &str,
+        parent_row: &BTreeMap<String, Value>,
+    ) -> OpenDbResult<Vec<FkDependent>> {
+        let mut dependents = Vec::new();
+        for (child_table_name, child_table) in &self.tables {
+            for constraint in &child_table.constraints {
+                let ConstraintKind::ForeignKey {
+                    columns,
+                    references_table,
+                    references_columns,
+                    on_delete,
+                    ..
+                } = &constraint.kind
+                else {
+                    continue;
+                };
+                if references_table != parent_table {
+                    continue;
+                }
+                if columns.len() != references_columns.len() {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "FK {} on {child_table_name} has unbalanced column count",
+                        constraint.name
+                    )));
+                }
+                let parent_values: Vec<&Value> = references_columns
+                    .iter()
+                    .map(|column| parent_row.get(column).unwrap_or(&Value::Null))
+                    .collect();
+                for (child_key, child_row) in &child_table.rows {
+                    let matches = columns.iter().enumerate().all(|(i, column)| {
+                        let parent_value = parent_values[i];
+                        let child_value = child_row.get(column).unwrap_or(&Value::Null);
+                        child_value == parent_value
+                    });
+                    if matches {
+                        dependents.push(FkDependent {
+                            table: child_table_name.clone(),
+                            key: child_key.clone(),
+                            columns: columns.clone(),
+                            constraint_name: constraint.name.clone(),
+                            action: *on_delete,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(dependents)
+    }
+
+    fn apply_set_null(&mut self, dependent: &FkDependent) -> OpenDbResult<()> {
+        let table_state = self
+            .tables
+            .get_mut(&dependent.table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", dependent.table)))?;
+        for column_name in &dependent.columns {
+            let column_def = table_state
+                .columns
+                .iter()
+                .find(|c| &c.name == column_name)
+                .ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!(
+                        "FK column {} missing on {}",
+                        column_name, dependent.table
+                    ))
+                })?;
+            if !column_def.nullable {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "SET NULL on {} violates NOT NULL on {}",
+                    dependent.table, column_name
+                )));
+            }
+        }
+        if let Some(row) = table_state.rows.get_mut(&dependent.key) {
+            for column_name in &dependent.columns {
+                row.insert(column_name.clone(), Value::Null);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_set_default(&mut self, dependent: &FkDependent) -> OpenDbResult<()> {
+        let table_state = self
+            .tables
+            .get_mut(&dependent.table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", dependent.table)))?;
+        let mut updates: Vec<(String, Value)> = Vec::new();
+        for column_name in &dependent.columns {
+            let column_def = table_state
+                .columns
+                .iter()
+                .find(|c| &c.name == column_name)
+                .ok_or_else(|| {
+                    OpenDbError::InvalidInput(format!(
+                        "FK column {} missing on {}",
+                        column_name, dependent.table
+                    ))
+                })?;
+            let value = match &column_def.default {
+                Some(crate::commit_stream::DefaultExpr::Const(value)) => value.clone(),
+                _ if column_def.nullable => Value::Null,
+                _ => {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "SET DEFAULT on {} has no DEFAULT for column {}",
+                        dependent.table, column_name
+                    )));
+                }
+            };
+            updates.push((column_name.clone(), value));
+        }
+        if let Some(row) = table_state.rows.get_mut(&dependent.key) {
+            for (column, value) in updates {
+                row.insert(column, value);
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_unique_constraints(
+        &self,
+        table_state: &Table,
+        key: &str,
+        row: &BTreeMap<String, Value>,
+    ) -> OpenDbResult<()> {
+        for constraint in &table_state.constraints {
+            let ConstraintKind::Unique { columns } = &constraint.kind else {
+                continue;
+            };
+            let candidate: Vec<&Value> = columns
+                .iter()
+                .map(|column| row.get(column).unwrap_or(&Value::Null))
+                .collect();
+            if candidate.iter().all(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            for (existing_key, existing_row) in &table_state.rows {
+                if existing_key == key {
+                    continue;
+                }
+                let existing: Vec<&Value> = columns
+                    .iter()
+                    .map(|column| existing_row.get(column).unwrap_or(&Value::Null))
+                    .collect();
+                if candidate == existing {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "UNIQUE constraint {} violated on table",
+                        constraint.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_fk_constraints(
+        &self,
+        table_state: &Table,
+        row: &BTreeMap<String, Value>,
+    ) -> OpenDbResult<()> {
+        for constraint in &table_state.constraints {
+            let ConstraintKind::ForeignKey {
+                columns,
+                references_table,
+                references_columns,
+                ..
+            } = &constraint.kind
+            else {
+                continue;
+            };
+            let child_values: Vec<&Value> = columns
+                .iter()
+                .map(|column| row.get(column).unwrap_or(&Value::Null))
+                .collect();
+            if child_values.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            let Some(parent_table) = self.tables.get(references_table) else {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "FK {} on table references unknown table {references_table}",
+                    constraint.name
+                )));
+            };
+            let exists = parent_table.rows.values().any(|parent_row| {
+                references_columns.iter().enumerate().all(|(i, column)| {
+                    let parent_value = parent_row.get(column).unwrap_or(&Value::Null);
+                    child_values[i] == parent_value
+                })
+            });
+            if !exists {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "FK {} on table not satisfied: parent row missing in {references_table}",
+                    constraint.name
+                )));
             }
         }
         Ok(())
@@ -864,6 +1127,155 @@ mod tests {
             accounts.rows.get("1").and_then(|row| row.get("display_name")),
             Some(&Value::Text("Ada".to_owned()))
         );
+    }
+
+    #[test]
+    fn unique_constraint_rejects_duplicate_insert() {
+        let projection_result = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            alter_record(
+                2,
+                AlterTableOp::AddConstraint(NamedConstraint {
+                    name: "accounts_name_unique".to_owned(),
+                    kind: crate::commit_stream::ConstraintKind::Unique {
+                        columns: vec!["name".to_owned()],
+                    },
+                }),
+            ),
+            insert_account_record(3, "1"),
+            insert_account_record(4, "2"),
+        ]);
+        assert!(matches!(
+            projection_result,
+            Err(OpenDbError::InvalidInput(_))
+        ));
+    }
+
+    fn create_orders_record(tx_id: u64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::CreateTable {
+                table: "orders".to_owned(),
+                columns: vec![
+                    ColumnDefinition::primary_key("id", ColumnType::Int64),
+                    ColumnDefinition::new("account_id", ColumnType::Int64),
+                ],
+            }],
+        )
+    }
+
+    fn alter_orders_record(tx_id: u64, op: AlterTableOp) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::AlterTable {
+                table: "orders".to_owned(),
+                op,
+            }],
+        )
+    }
+
+    fn insert_order_record(tx_id: u64, id: i64, account_id: i64) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::InsertRow {
+                table: "orders".to_owned(),
+                key: id.to_string(),
+                values: vec![
+                    ColumnValue {
+                        column: "id".to_owned(),
+                        value: Value::Int64(id),
+                    },
+                    ColumnValue {
+                        column: "account_id".to_owned(),
+                        value: Value::Int64(account_id),
+                    },
+                ],
+            }],
+        )
+    }
+
+    fn fk_constraint(name: &str, action: ReferentialAction) -> NamedConstraint {
+        NamedConstraint {
+            name: name.to_owned(),
+            kind: crate::commit_stream::ConstraintKind::ForeignKey {
+                columns: vec!["account_id".to_owned()],
+                references_table: "accounts".to_owned(),
+                references_columns: vec!["id".to_owned()],
+                on_delete: action,
+                on_update: ReferentialAction::NoAction,
+            },
+        }
+    }
+
+    #[test]
+    fn fk_constraint_rejects_insert_without_parent() {
+        let result = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            create_orders_record(2),
+            alter_orders_record(
+                3,
+                AlterTableOp::AddConstraint(fk_constraint(
+                    "orders_account_fk",
+                    ReferentialAction::NoAction,
+                )),
+            ),
+            insert_order_record(4, 1, 99),
+        ]);
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    fn delete_record(tx_id: u64, table: &str, key: &str) -> CommitRecord {
+        CommitRecord::new(
+            TransactionId(tx_id),
+            LogicalTimestamp(tx_id),
+            vec![Mutation::DeleteRow {
+                table: table.to_owned(),
+                key: key.to_owned(),
+            }],
+        )
+    }
+
+    #[test]
+    fn delete_with_cascade_removes_children() {
+        let projection = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            create_orders_record(2),
+            alter_orders_record(
+                3,
+                AlterTableOp::AddConstraint(fk_constraint(
+                    "orders_account_fk",
+                    ReferentialAction::Cascade,
+                )),
+            ),
+            insert_account_record(4, "1"),
+            insert_order_record(5, 10, 1),
+            delete_record(6, "accounts", "1"),
+        ])
+        .expect("cascade delete");
+        assert!(projection.table("accounts").unwrap().rows.is_empty());
+        assert!(projection.table("orders").unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn delete_with_no_action_rejects_when_children_exist() {
+        let result = RowProjection::rebuild(&[
+            create_accounts_record(1),
+            create_orders_record(2),
+            alter_orders_record(
+                3,
+                AlterTableOp::AddConstraint(fk_constraint(
+                    "orders_account_fk",
+                    ReferentialAction::NoAction,
+                )),
+            ),
+            insert_account_record(4, "1"),
+            insert_order_record(5, 10, 1),
+            delete_record(6, "accounts", "1"),
+        ]);
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
     }
 
     #[test]

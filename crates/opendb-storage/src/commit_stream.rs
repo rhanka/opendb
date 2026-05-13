@@ -122,6 +122,10 @@ pub enum Mutation {
         key: String,
         values: Vec<ColumnValue>,
     },
+    DeleteRow {
+        table: String,
+        key: String,
+    },
     PutRangeDescriptor {
         descriptor: RangeDescriptor,
     },
