@@ -218,6 +218,33 @@ try {
     throw new Error(`typed smoke filtered select expected 1 row, got ${filteredTypedRows.length}`);
   }
 
+  // Sprint 7: JSONB column ingest + emit through pgwire (OID 3802).
+  const jsonTable = `jsonb_smoke_${tableName}`;
+  await exec(
+    `CREATE TABLE ${jsonTable} (id INT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}'::jsonb, meta JSONB)`
+  );
+  await exec(
+    `INSERT INTO ${jsonTable} (id, data, meta) VALUES (1, '{"k":"v","n":7}'::jsonb, '[1,2,3]'::jsonb)`
+  );
+  await exec(`INSERT INTO ${jsonTable} (id) VALUES (2)`);
+  const jsonRows = await exec(`SELECT * FROM ${jsonTable}`);
+  if (jsonRows.length !== 2) {
+    throw new Error(`jsonb smoke expected 2 rows, got ${jsonRows.length}`);
+  }
+  const explicitJsonRow = jsonRows[0];
+  const defaultJsonRow = jsonRows[1];
+  if (explicitJsonRow === undefined || defaultJsonRow === undefined) {
+    throw new Error("jsonb smoke missing rows");
+  }
+  const explicitRowText = rowText(explicitJsonRow).join("|");
+  if (!explicitRowText.includes('"k":"v"') || !explicitRowText.includes('"n":7')) {
+    throw new Error(`jsonb smoke explicit row missing values: ${explicitRowText}`);
+  }
+  const defaultRowText = rowText(defaultJsonRow).join("|");
+  if (!defaultRowText.includes("{}")) {
+    throw new Error(`jsonb smoke default row missing empty object: ${defaultRowText}`);
+  }
+
   client.end();
   console.log("pgwire smoke passed");
 } catch (error) {
