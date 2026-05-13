@@ -14,7 +14,8 @@
     "uat:k3s": "tsx tools/k3s-smoke.ts",
     "uat:k3s:plan": "tsx tools/k3s-smoke.ts --print-plan",
     "k3s:up": "tsx tools/k3d-up.ts",
-    "k3s:down": "tsx tools/k3d-down.ts"
+    "k3s:down": "tsx tools/k3d-down.ts",
+    "bench:jsonb": "tsx tools/bench/jsonb.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
