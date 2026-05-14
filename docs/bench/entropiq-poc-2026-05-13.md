@@ -8,21 +8,17 @@ Reproduce: `npm run poc:entropiq:smoke`.
 
 | Probe | Protocol | Outcome | Details |
 |------|----------|---------|---------|
-| A1 | simple | FAIL | error: sql error: unsupported SQL: SELECT 1 AS one |
+| A1 | simple | PASS | rows=[{"one":"1"}] |
 | A2 | simple | PASS | command=CREATE |
-| A3 | simple | FAIL | error: invalid input: value for column created_at on table folders_smoke does not match Timestamp |
-| A4 | simple | PASS | rows=[] |
-| A5 | simple | FAIL | error: sql error: unsupported SQL: SELECT id, name FROM folders_smoke |
-| B1 | extended | FAIL | error: unsupported message tag 80 |
-| C1 | drizzle | FAIL | error: unsupported message tag 80 |
-| C2 | drizzle | FAIL | error: unsupported message tag 80 |
+| A3 | simple | PASS | command=INSERT |
+| A4 | simple | PASS | rows=[{"id":"f1","workspace_id":"admin","name":"root","status":"completed","created_at":"2026-05-13T04:00:00.000Z"}] |
+| A5 | simple | PASS | rows=[{"id":"f1","name":"root"}] |
+| B1 | extended | PASS | rows=[{"id":"f1"}] |
+| C1 | drizzle | PASS | rows=[{"id":"f1","workspaceId":"admin","name":"root","status":"completed","createdAt":"2026-05-13T00:00:00.000Z"}] |
+| C2 | drizzle | PASS | rows=[{"id":"f1","workspaceId":"admin","name":"root","status":"completed","createdAt":"2026-05-13T00:00:00.000Z"}] |
 
 ## Gaps
 
-- **No-FROM `SELECT <expr>` not supported** (probe A1). Drivers and pgwire clients commonly issue `SELECT 1` / `SELECT version()` as health/probe queries on connect.
-- **Explicit column projection `SELECT a, b FROM t` not supported** (probe A5). Only `SELECT *` returns rows; Drizzle and most ORMs emit explicit lists.
-- **TIMESTAMP literal coercion gap** (probe A3): `error: invalid input: value for column created_at on table folders_smoke does not match Timestamp`. Need to align the accepted literal grammar with Postgres ISO-8601 forms.
-- **Extended protocol entirely missing** (probes B1, C1, C2): every `Parse`/`Bind`/`Describe`/`Execute`/`Sync` message returns "unsupported message tag". Drizzle always issues Extended-protocol queries via `pg`, so the simple-query fallback path is unreachable from Drizzle.
 
 ## Verdict
 

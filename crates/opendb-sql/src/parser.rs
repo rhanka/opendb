@@ -232,12 +232,23 @@ fn parse_identifier_list(raw: &str) -> Vec<String> {
 }
 
 fn unquote_identifier(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    // Drizzle (and any pgwire client respecting SQL standards) wraps
+    // identifiers in double quotes — strip them.
     if let Some(stripped) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         stripped.to_owned()
     } else {
-        trimmed.trim_end_matches(';').trim().to_owned()
+        trimmed.to_owned()
     }
+}
+
+/// Strips schema/table qualifiers and quotes from an identifier. Sprint
+/// 12 handles only the single-table read path, so a qualified reference
+/// like `"folders_smoke"."id"` collapses to `id`.
+fn unqualified_column_name(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    let last = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    unquote_identifier(last)
 }
 
 fn parse_referential_actions(tail: &str) -> OpenDbResult<(ReferentialAction, ReferentialAction)> {
@@ -583,7 +594,7 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
                 "trailing input between INSERT column list and VALUES".to_owned(),
             ));
         }
-        let table = header[..open].trim().to_owned();
+        let table = unquote_identifier(header[..open].trim());
         let columns = split_values(&header[open + 1..close])?
             .into_iter()
             .map(|c| {
@@ -593,7 +604,7 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
                         "invalid INSERT column name: {trimmed}"
                     )))
                 } else {
-                    Ok(trimmed.to_owned())
+                    Ok(unqualified_column_name(trimmed))
                 }
             })
             .collect::<OpenDbResult<Vec<String>>>()?;
@@ -604,7 +615,7 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
         }
         (table, Some(columns))
     } else {
-        (header.to_owned(), None)
+        (unquote_identifier(header), None)
     };
     if table.is_empty() {
         return Err(OpenDbError::Sql("INSERT requires table".to_owned()));
@@ -742,7 +753,7 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         None => None,
     };
     Ok(Statement::SelectAll {
-        table: table.to_owned(),
+        table: unquote_identifier(table),
         predicate,
         order_by,
         limit,
@@ -772,7 +783,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
                         "invalid SELECT column: {trimmed}"
                     )))
                 } else {
-                    Ok(trimmed.to_owned())
+                    Ok(unqualified_column_name(trimmed))
                 }
             })
             .collect::<OpenDbResult<Vec<String>>>()?;
@@ -1100,12 +1111,12 @@ fn parse_order_by(text: &str) -> OpenDbResult<OrderBy> {
     let trimmed = text.trim();
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     let (column, direction) = match parts.as_slice() {
-        [column] => (column.to_string(), OrderDirection::Asc),
+        [column] => (unqualified_column_name(column), OrderDirection::Asc),
         [column, direction] if direction.eq_ignore_ascii_case("ASC") => {
-            (column.to_string(), OrderDirection::Asc)
+            (unqualified_column_name(column), OrderDirection::Asc)
         }
         [column, direction] if direction.eq_ignore_ascii_case("DESC") => {
-            (column.to_string(), OrderDirection::Desc)
+            (unqualified_column_name(column), OrderDirection::Desc)
         }
         _ => {
             return Err(OpenDbError::Sql(format!(
@@ -1141,7 +1152,7 @@ fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
         ));
     }
     Ok(Predicate {
-        column: column.to_owned(),
+        column: unqualified_column_name(column),
         value: parse_value(value)?,
     })
 }
