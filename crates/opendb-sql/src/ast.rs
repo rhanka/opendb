@@ -90,6 +90,8 @@ pub enum Statement {
         offset: Option<u64>,
         #[doc = "Sprint 12.1: explicit column projection (`SELECT a, b FROM t`)."]
         columns: SelectColumns,
+        #[doc = "Sprint 15: GROUP BY <col1>[, ...]. Empty vector = no GROUP BY."]
+        group_by: Vec<String>,
     },
     SelectExpr {
         items: Vec<SelectExprItem>,
@@ -171,6 +173,51 @@ pub struct JoinedOrderBy {
 pub enum SelectColumns {
     Star,
     Explicit(Vec<String>),
+    /// Sprint 15: aggregated projection with optional `GROUP BY` partitioning.
+    /// Each item is either a raw column (which must appear in `group_by`) or an
+    /// aggregate expression like `COUNT(*)` / `SUM(amount)`.
+    Aggregated(AggregateProjection),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateProjection {
+    pub items: Vec<AggregateSelectItem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateSelectItem {
+    pub expr: AggregateOrColumn,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggregateOrColumn {
+    /// A bare column reference. Must be present in the enclosing
+    /// `SelectAll.group_by` list (or the query has no aggregates at all).
+    Column(String),
+    Aggregate(AggregateExpr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateExpr {
+    pub func: AggregateFunction,
+    pub arg: AggregateArg,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggregateArg {
+    /// `COUNT(*)` only.
+    Star,
+    Column(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Max,
+    Min,
+    Avg,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +263,7 @@ impl Statement {
             limit: None,
             offset: None,
             columns: SelectColumns::Star,
+            group_by: Vec::new(),
         }
     }
 }

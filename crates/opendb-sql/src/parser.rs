@@ -1,6 +1,8 @@
 use crate::ast::{
-    JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate, OrderBy, OrderDirection, Predicate,
-    SelectColumns, SelectExpr, SelectExprItem, SelectFunction, Statement,
+    AggregateArg, AggregateExpr, AggregateFunction, AggregateOrColumn, AggregateProjection,
+    AggregateSelectItem, JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate, OrderBy,
+    OrderDirection, Predicate, SelectColumns, SelectExpr, SelectExprItem, SelectFunction,
+    Statement,
 };
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
@@ -772,6 +774,8 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     let (rest, offset) = take_trailing_keyword_value(rest, " OFFSET ")?;
     let (rest, limit) = take_trailing_keyword_value(&rest, " LIMIT ")?;
     let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
+    // Sprint 15: extract optional GROUP BY clause sitting between WHERE and ORDER BY.
+    let (rest, group_by_text) = take_trailing_keyword(&rest, " GROUP BY ");
 
     let upper_rest = rest.to_ascii_uppercase();
     let (table, predicates) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
@@ -794,6 +798,10 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         Some(text) => Some(parse_order_by(text)?),
         None => None,
     };
+    let group_by = match group_by_text.as_deref() {
+        Some(text) => parse_group_by(text)?,
+        None => Vec::new(),
+    };
     Ok(Statement::SelectAll {
         table: unquote_identifier(table),
         predicate: predicates,
@@ -801,7 +809,29 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         limit,
         offset,
         columns: SelectColumns::Star,
+        group_by,
     })
+}
+
+/// Sprint 15: parse `GROUP BY <col1>[, <col2> ...]`. Identifiers may be quoted
+/// or qualified (`t.col`) — we strip the qualifier the same way bare projection
+/// columns do.
+fn parse_group_by(text: &str) -> OpenDbResult<Vec<String>> {
+    let tokens = split_top_level_commas(text)?;
+    let mut columns = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(OpenDbError::Sql("empty GROUP BY column".to_owned()));
+        }
+        columns.push(unqualified_column_name(trimmed));
+    }
+    if columns.is_empty() {
+        return Err(OpenDbError::Sql(
+            "GROUP BY requires at least one column".to_owned(),
+        ));
+    }
+    Ok(columns)
 }
 
 /// Sprint 12.1: parser for `SELECT col1, col2 FROM t [...]` and
@@ -816,7 +846,43 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
     if let Some(from_pos) = from_pos {
         let columns_text = rest[..from_pos].trim();
         let after_from = rest[from_pos + " FROM ".len()..].trim();
-        let columns = split_top_level_commas(columns_text)?
+        let tokens = split_top_level_commas(columns_text)?;
+        // Sprint 15: if any token references an aggregate function, parse the
+        // whole projection as an aggregated query. Otherwise fall through to
+        // the legacy column-list path.
+        let aggregated = tokens.iter().any(|token| token_is_aggregate(token));
+        let synthetic = format!("SELECT * FROM {after_from}");
+        let parsed = parse_select_all(&synthetic)?;
+        let Statement::SelectAll {
+            table,
+            predicate,
+            order_by,
+            limit,
+            offset,
+            group_by,
+            ..
+        } = parsed
+        else {
+            return Err(OpenDbError::Sql(
+                "internal: SELECT projection inner parse mismatch".to_owned(),
+            ));
+        };
+        if aggregated {
+            let items = tokens
+                .iter()
+                .map(|token| parse_aggregate_select_item(token))
+                .collect::<OpenDbResult<Vec<AggregateSelectItem>>>()?;
+            return Ok(Statement::SelectAll {
+                table,
+                predicate,
+                order_by,
+                limit,
+                offset,
+                columns: SelectColumns::Aggregated(AggregateProjection { items }),
+                group_by,
+            });
+        }
+        let columns = tokens
             .into_iter()
             .map(|token| {
                 let trimmed = token.trim();
@@ -834,32 +900,15 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
                 "SELECT projection must not be empty".to_owned(),
             ));
         }
-        // Reuse the regular SelectAll plumbing: parse FROM/WHERE/ORDER BY/LIMIT/OFFSET
-        // with the existing helper. We rebuild a normalised string `SELECT * FROM <rest>` so
-        // the existing parser handles the WHERE/ORDER BY/LIMIT/OFFSET grammar.
-        let synthetic = format!("SELECT * FROM {after_from}");
-        let parsed = parse_select_all(&synthetic)?;
-        if let Statement::SelectAll {
+        return Ok(Statement::SelectAll {
             table,
             predicate,
             order_by,
             limit,
             offset,
-            ..
-        } = parsed
-        {
-            return Ok(Statement::SelectAll {
-                table,
-                predicate,
-                order_by,
-                limit,
-                offset,
-                columns: SelectColumns::Explicit(columns),
-            });
-        }
-        return Err(OpenDbError::Sql(
-            "internal: SELECT projection inner parse mismatch".to_owned(),
-        ));
+            columns: SelectColumns::Explicit(columns),
+            group_by,
+        });
     }
 
     // No FROM → SELECT <expr> [AS alias] [, ...]
@@ -874,6 +923,79 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
     }
     let _ = upper_rest; // suppress dead-code warning when items branch taken
     Ok(Statement::SelectExpr { items })
+}
+
+/// Sprint 15: cheap detection of an aggregate token. Strips an optional `AS
+/// <alias>` suffix and checks whether the remaining expression starts with a
+/// recognised aggregate function name followed by `(`.
+fn token_is_aggregate(token: &str) -> bool {
+    let trimmed = token.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    // Strip trailing ` AS <alias>` (or bare alias, but Sprint 15 requires AS).
+    let head = match upper.find(" AS ") {
+        Some(pos) => upper[..pos].trim(),
+        None => upper.as_str(),
+    };
+    for name in ["COUNT(", "SUM(", "MAX(", "MIN(", "AVG("] {
+        if head.starts_with(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sprint 15: parse a single item from an aggregated projection. The item is
+/// either an aggregate expression (`COUNT(*)`, `SUM(amount)`, ...) or a bare
+/// column reference that participates in `GROUP BY`.
+fn parse_aggregate_select_item(raw: &str) -> OpenDbResult<AggregateSelectItem> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let (expr_text, alias) = if let Some(as_pos) = upper.find(" AS ") {
+        let expr_text = trimmed[..as_pos].trim();
+        let alias = trimmed[as_pos + 4..].trim().to_owned();
+        if alias.is_empty() {
+            return Err(OpenDbError::Sql("alias after AS is required".to_owned()));
+        }
+        (expr_text, Some(unquote_identifier(&alias)))
+    } else {
+        (trimmed, None)
+    };
+    let expr = parse_aggregate_or_column(expr_text)?;
+    Ok(AggregateSelectItem { expr, alias })
+}
+
+fn parse_aggregate_or_column(raw: &str) -> OpenDbResult<AggregateOrColumn> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    for (name, func) in [
+        ("COUNT(", AggregateFunction::Count),
+        ("SUM(", AggregateFunction::Sum),
+        ("MAX(", AggregateFunction::Max),
+        ("MIN(", AggregateFunction::Min),
+        ("AVG(", AggregateFunction::Avg),
+    ] {
+        if upper.starts_with(name) && trimmed.ends_with(')') {
+            let inner = trimmed[name.len()..trimmed.len() - 1].trim();
+            let arg = if inner == "*" {
+                if !matches!(func, AggregateFunction::Count) {
+                    return Err(OpenDbError::Sql(format!(
+                        "{name}*) is only valid for COUNT"
+                    )));
+                }
+                AggregateArg::Star
+            } else if inner.is_empty() {
+                return Err(OpenDbError::Sql(format!("{name}) is missing an argument")));
+            } else {
+                AggregateArg::Column(unqualified_column_name(inner))
+            };
+            return Ok(AggregateOrColumn::Aggregate(AggregateExpr { func, arg }));
+        }
+    }
+    // Bare column reference (must be in GROUP BY at execution time).
+    if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+        return Err(OpenDbError::Sql(format!("invalid SELECT item: {trimmed}")));
+    }
+    Ok(AggregateOrColumn::Column(unqualified_column_name(trimmed)))
 }
 
 fn parse_select_expr_item(raw: &str) -> OpenDbResult<SelectExprItem> {

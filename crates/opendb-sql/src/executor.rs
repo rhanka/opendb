@@ -133,6 +133,7 @@ impl SqlEngine {
                 limit,
                 offset,
                 columns,
+                group_by,
             } => self
                 .select_all(
                     &table,
@@ -141,6 +142,7 @@ impl SqlEngine {
                     limit,
                     offset,
                     &columns,
+                    &group_by,
                 )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
             Statement::SelectExpr { items } => {
@@ -429,12 +431,33 @@ impl SqlEngine {
         limit: Option<u64>,
         offset: Option<u64>,
         columns: &crate::ast::SelectColumns,
+        group_by: &[String],
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let table_state = self
             .projection
             .table(table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
         let all_columns = table_state.column_names();
+        // Sprint 15: aggregated projection takes its own code path because the
+        // row shape is determined by the GROUP BY partition, not the table
+        // schema.
+        if let crate::ast::SelectColumns::Aggregated(projection) = columns {
+            return self.select_aggregated(
+                table,
+                table_state,
+                predicates,
+                projection,
+                group_by,
+                order_by,
+                limit,
+                offset,
+            );
+        }
+        if !group_by.is_empty() {
+            return Err(OpenDbError::Sql(
+                "GROUP BY requires an aggregated projection".to_owned(),
+            ));
+        }
         let column_names = match columns {
             crate::ast::SelectColumns::Star => all_columns.clone(),
             crate::ast::SelectColumns::Explicit(requested) => {
@@ -447,6 +470,7 @@ impl SqlEngine {
                 }
                 requested.clone()
             }
+            crate::ast::SelectColumns::Aggregated(_) => unreachable!("handled above"),
         };
         let (rows, route) = if predicates.is_empty() {
             let rows = table_state
@@ -543,6 +567,378 @@ impl SqlEngine {
             },
             route,
         ))
+    }
+
+    /// Sprint 15: aggregated SELECT. Builds one logical group per distinct
+    /// value combination of the `GROUP BY` columns (or a single global group
+    /// when `group_by` is empty) and folds each matching row into the
+    /// per-group aggregate state.
+    #[allow(clippy::too_many_arguments)]
+    fn select_aggregated(
+        &self,
+        table: &str,
+        table_state: &opendb_storage::row_projection::Table,
+        predicates: &[Predicate],
+        projection: &crate::ast::AggregateProjection,
+        group_by: &[String],
+        order_by: Option<&crate::ast::OrderBy>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> OpenDbResult<(QueryResult, RouteIntent)> {
+        use crate::ast::{AggregateArg, AggregateOrColumn};
+        let all_columns = table_state.column_names();
+        // Validate group_by columns + bare projection columns belong to the table
+        // and are listed in GROUP BY.
+        for g in group_by {
+            if !all_columns.iter().any(|c| c == g) {
+                return Err(OpenDbError::Sql(format!(
+                    "GROUP BY column {g} not in table {table}"
+                )));
+            }
+        }
+        for item in &projection.items {
+            if let AggregateOrColumn::Column(name) = &item.expr {
+                if !group_by.iter().any(|g| g == name) {
+                    return Err(OpenDbError::Sql(format!(
+                        "column {name} must appear in GROUP BY"
+                    )));
+                }
+            }
+            if let AggregateOrColumn::Aggregate(expr) = &item.expr {
+                if let AggregateArg::Column(name) = &expr.arg {
+                    if !all_columns.iter().any(|c| c == name) {
+                        return Err(OpenDbError::Sql(format!(
+                            "aggregate column {name} not in table {table}"
+                        )));
+                    }
+                }
+            }
+        }
+        // Predicate type-check (same gating as scalar SelectAll).
+        for predicate in predicates {
+            let column = table_state
+                .columns
+                .iter()
+                .find(|c| c.name == predicate.column)
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!("column {} not in table {table}", predicate.column))
+                })?;
+            if !matches!(predicate.value, Value::Null)
+                && !value_matches_type(&predicate.value, &column.data_type)
+            {
+                return Err(OpenDbError::Sql(format!(
+                    "WHERE value for column {} does not match {:?}",
+                    column.name, column.data_type
+                )));
+            }
+        }
+
+        // Fold matching rows into per-group aggregate state. Empty group_by =>
+        // a single global group keyed by an empty string. We key groups by a
+        // serialized representation of the GROUP BY value tuple because
+        // `Value` does not implement `Ord`.
+        let mut groups: std::collections::BTreeMap<String, (Vec<Value>, Vec<AggregateState>)> =
+            std::collections::BTreeMap::new();
+        let mut matched_any = false;
+        for row in table_state.rows.values() {
+            if !predicates.iter().all(|p| evaluate_predicate(row, p)) {
+                continue;
+            }
+            matched_any = true;
+            let key_values: Vec<Value> = group_by
+                .iter()
+                .map(|g| row.get(g).cloned().unwrap_or(Value::Null))
+                .collect();
+            let key_str = group_key_string(&key_values);
+            let (_, states) = groups.entry(key_str).or_insert_with(|| {
+                (
+                    key_values.clone(),
+                    projection
+                        .items
+                        .iter()
+                        .map(|_| AggregateState::new())
+                        .collect(),
+                )
+            });
+            for (slot, item) in states.iter_mut().zip(projection.items.iter()) {
+                if let AggregateOrColumn::Aggregate(expr) = &item.expr {
+                    let value = match &expr.arg {
+                        AggregateArg::Star => Value::Int64(1),
+                        AggregateArg::Column(name) => row.get(name).cloned().unwrap_or(Value::Null),
+                    };
+                    slot.accumulate(expr.func, &value);
+                }
+            }
+        }
+
+        // Emit one row per group. If group_by is empty AND no rows match, we
+        // still return a single row with the aggregate's empty-set semantics
+        // (COUNT(*) = 0, others = NULL) — matches PostgreSQL behaviour.
+        let mut output_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        let mut column_names: Vec<String> = projection
+            .items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| aggregate_item_default_name(item, idx))
+            .collect();
+        let _ = &mut column_names;
+        if groups.is_empty() && group_by.is_empty() {
+            let states: Vec<AggregateState> = projection
+                .items
+                .iter()
+                .map(|_| AggregateState::new())
+                .collect();
+            let row = projection
+                .items
+                .iter()
+                .zip(states.iter())
+                .map(|(item, state)| match &item.expr {
+                    AggregateOrColumn::Column(_) => Value::Null,
+                    AggregateOrColumn::Aggregate(expr) => state.finalize(expr.func),
+                })
+                .collect();
+            output_rows.push(row);
+            let _ = matched_any;
+        } else {
+            for (_, (key_values, states)) in &groups {
+                let row: Vec<Value> = projection
+                    .items
+                    .iter()
+                    .zip(states.iter())
+                    .map(|(item, state)| match &item.expr {
+                        AggregateOrColumn::Column(name) => {
+                            let pos = group_by
+                                .iter()
+                                .position(|g| g == name)
+                                .expect("validated above");
+                            key_values.get(pos).cloned().unwrap_or(Value::Null)
+                        }
+                        AggregateOrColumn::Aggregate(expr) => state.finalize(expr.func),
+                    })
+                    .collect();
+                output_rows.push(row);
+            }
+        }
+
+        // Optional ORDER BY against the aggregated column names.
+        if let Some(ob) = order_by {
+            let pos = column_names
+                .iter()
+                .position(|c| c == &ob.column)
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!(
+                        "ORDER BY column {} not in aggregated projection",
+                        ob.column
+                    ))
+                })?;
+            output_rows.sort_by(|l, r| {
+                let lv = l.get(pos).cloned().unwrap_or(Value::Null);
+                let rv = r.get(pos).cloned().unwrap_or(Value::Null);
+                let ord = compare_values(&lv, &rv);
+                match ob.direction {
+                    crate::ast::OrderDirection::Asc => ord,
+                    crate::ast::OrderDirection::Desc => ord.reverse(),
+                }
+            });
+        }
+        let offset_count = offset.unwrap_or(0) as usize;
+        let limit_count = limit.unwrap_or(u64::MAX) as usize;
+        let final_rows: Vec<Vec<Value>> = output_rows
+            .into_iter()
+            .skip(offset_count)
+            .take(limit_count)
+            .collect();
+        Ok((
+            QueryResult::Rows {
+                columns: column_names,
+                column_types: Vec::new(),
+                rows: final_rows,
+            },
+            RouteIntent::Scan {
+                table: table.to_owned(),
+            },
+        ))
+    }
+}
+
+/// Sprint 15: per-aggregate-slot running state. We keep a small Sum-of-Int /
+/// Sum-of-Float / Count / Max / Min view; the right field is picked at
+/// `finalize` time based on the aggregate function.
+#[derive(Clone, Debug, Default)]
+struct AggregateState {
+    count: i64,
+    sum_int: i128,
+    sum_float: f64,
+    sum_float_seen: bool,
+    sum_int_seen: bool,
+    max: Option<Value>,
+    min: Option<Value>,
+    any_non_null: bool,
+}
+
+impl AggregateState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn accumulate(&mut self, func: crate::ast::AggregateFunction, value: &Value) {
+        use crate::ast::AggregateFunction as F;
+        match func {
+            F::Count => {
+                if !matches!(value, Value::Null) {
+                    self.count += 1;
+                }
+            }
+            F::Sum | F::Avg => {
+                match value {
+                    Value::Int64(n) => {
+                        self.sum_int += *n as i128;
+                        self.sum_int_seen = true;
+                        self.count += 1;
+                        self.any_non_null = true;
+                    }
+                    Value::Float64(f) => {
+                        self.sum_float += *f;
+                        self.sum_float_seen = true;
+                        self.count += 1;
+                        self.any_non_null = true;
+                    }
+                    Value::Null => {}
+                    _ => {
+                        // Non-numeric: ignore (PG would error; we choose lenient
+                        // semantics for now and emit Null at finalize).
+                    }
+                }
+            }
+            F::Max => {
+                if !matches!(value, Value::Null) {
+                    self.any_non_null = true;
+                    self.max = Some(match &self.max {
+                        None => value.clone(),
+                        Some(current) => {
+                            if compare_values(value, current).is_gt() {
+                                value.clone()
+                            } else {
+                                current.clone()
+                            }
+                        }
+                    });
+                }
+            }
+            F::Min => {
+                if !matches!(value, Value::Null) {
+                    self.any_non_null = true;
+                    self.min = Some(match &self.min {
+                        None => value.clone(),
+                        Some(current) => {
+                            if compare_values(value, current).is_lt() {
+                                value.clone()
+                            } else {
+                                current.clone()
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn finalize(&self, func: crate::ast::AggregateFunction) -> Value {
+        use crate::ast::AggregateFunction as F;
+        match func {
+            F::Count => Value::Int64(self.count),
+            F::Sum => {
+                if self.sum_float_seen {
+                    Value::Float64(self.sum_float + self.sum_int as f64)
+                } else if self.sum_int_seen {
+                    Value::Int64(self.sum_int as i64)
+                } else {
+                    Value::Null
+                }
+            }
+            F::Avg => {
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    let total = self.sum_float + self.sum_int as f64;
+                    Value::Float64(total / self.count as f64)
+                }
+            }
+            F::Max => self.max.clone().unwrap_or(Value::Null),
+            F::Min => self.min.clone().unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Sprint 15: build a deterministic ordering-safe string key for a tuple of
+/// GROUP BY values (since `Value` doesn't implement `Ord`).
+fn group_key_string(values: &[Value]) -> String {
+    let mut out = String::new();
+    for v in values {
+        match v {
+            Value::Null => out.push_str("N|"),
+            Value::Bool(b) => {
+                out.push('B');
+                out.push(if *b { 'T' } else { 'F' });
+                out.push('|');
+            }
+            Value::Int64(n) => {
+                out.push('I');
+                out.push_str(&n.to_string());
+                out.push('|');
+            }
+            Value::Float64(f) => {
+                out.push('F');
+                out.push_str(&f.to_bits().to_string());
+                out.push('|');
+            }
+            Value::Text(s) => {
+                out.push('S');
+                out.push_str(&s.len().to_string());
+                out.push(':');
+                out.push_str(s);
+                out.push('|');
+            }
+            Value::Timestamp(n) => {
+                out.push('T');
+                out.push_str(&n.to_string());
+                out.push('|');
+            }
+            Value::Json(s) => {
+                let serialized = s.to_string();
+                out.push('J');
+                out.push_str(&serialized.len().to_string());
+                out.push(':');
+                out.push_str(&serialized);
+                out.push('|');
+            }
+        }
+    }
+    out
+}
+
+/// Sprint 15: default column name for an aggregated projection slot.
+fn aggregate_item_default_name(item: &crate::ast::AggregateSelectItem, index: usize) -> String {
+    if let Some(alias) = &item.alias {
+        return alias.clone();
+    }
+    use crate::ast::{AggregateArg, AggregateFunction as F, AggregateOrColumn};
+    match &item.expr {
+        AggregateOrColumn::Column(name) => name.clone(),
+        AggregateOrColumn::Aggregate(expr) => {
+            let func = match expr.func {
+                F::Count => "count",
+                F::Sum => "sum",
+                F::Max => "max",
+                F::Min => "min",
+                F::Avg => "avg",
+            };
+            let _ = index;
+            match &expr.arg {
+                AggregateArg::Star => func.to_owned(),
+                AggregateArg::Column(_) => func.to_owned(),
+            }
+        }
     }
 }
 
@@ -1202,6 +1598,181 @@ mod tests {
                 tag: "UPDATE 2".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn select_count_star_returns_total_rows() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, label TEXT)").expect("parse"))
+            .expect("create");
+        for (id, label) in [(1, "a"), (2, "b"), (3, "c")] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{label}')")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(parse("SELECT count(*) FROM t").expect("parse"))
+            .expect("count");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["count".to_owned()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn select_count_star_with_where_filters_before_counting() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)").expect("parse"))
+            .expect("create");
+        for (id, status) in [(1, "open"), (2, "open"), (3, "closed")] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{status}')")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(parse("SELECT count(*) FROM t WHERE status = 'open'").expect("parse"))
+            .expect("count");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows[0][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn select_count_star_group_by_partitions() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)").expect("parse"))
+            .expect("create");
+        for (id, status) in [
+            (1, "open"),
+            (2, "open"),
+            (3, "closed"),
+            (4, "closed"),
+            (5, "open"),
+        ] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{status}')")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(parse("SELECT status, count(*) FROM t GROUP BY status").expect("parse"))
+            .expect("count by status");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["status".to_owned(), "count".to_owned()]);
+        assert_eq!(rows.len(), 2);
+        // Sorted by group_key_string("S{n}:open" < "S{n}:closed" lexicographic).
+        // Just verify the values regardless of order.
+        let mut counts = std::collections::HashMap::new();
+        for row in &rows {
+            let Value::Text(status) = &row[0] else {
+                panic!("expected text status");
+            };
+            let Value::Int64(c) = &row[1] else {
+                panic!("expected int count");
+            };
+            counts.insert(status.clone(), *c);
+        }
+        assert_eq!(counts.get("open"), Some(&3));
+        assert_eq!(counts.get("closed"), Some(&2));
+    }
+
+    #[test]
+    fn select_sum_max_min_avg_global() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE orders (id INT PRIMARY KEY, amount INT)").expect("parse"))
+            .expect("create");
+        for (id, amount) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            engine
+                .execute(
+                    parse(&format!("INSERT INTO orders VALUES ({id}, {amount})")).expect("parse"),
+                )
+                .expect("insert");
+        }
+        let result = engine
+            .execute(
+                parse("SELECT sum(amount), max(amount), min(amount), avg(amount) FROM orders")
+                    .expect("parse"),
+            )
+            .expect("agg");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(
+            columns,
+            vec![
+                "sum".to_owned(),
+                "max".to_owned(),
+                "min".to_owned(),
+                "avg".to_owned()
+            ]
+        );
+        assert_eq!(rows[0][0], Value::Int64(100));
+        assert_eq!(rows[0][1], Value::Int64(40));
+        assert_eq!(rows[0][2], Value::Int64(10));
+        assert_eq!(rows[0][3], Value::Float64(25.0));
+    }
+
+    #[test]
+    fn select_sum_group_by_with_alias() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)")
+                    .expect("parse"),
+            )
+            .expect("create");
+        for (id, uid, amount) in [(1, 1, 10), (2, 1, 5), (3, 2, 100)] {
+            engine
+                .execute(
+                    parse(&format!(
+                        "INSERT INTO orders VALUES ({id}, {uid}, {amount})"
+                    ))
+                    .expect("parse"),
+                )
+                .expect("insert");
+        }
+        let result = engine
+            .execute(
+                parse("SELECT user_id, sum(amount) AS total FROM orders GROUP BY user_id")
+                    .expect("parse"),
+            )
+            .expect("agg");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["user_id".to_owned(), "total".to_owned()]);
+        assert_eq!(rows.len(), 2);
+        let mut by_uid = std::collections::HashMap::new();
+        for row in &rows {
+            let Value::Int64(uid) = row[0] else { panic!() };
+            let Value::Int64(t) = row[1] else { panic!() };
+            by_uid.insert(uid, t);
+        }
+        assert_eq!(by_uid.get(&1), Some(&15));
+        assert_eq!(by_uid.get(&2), Some(&100));
+    }
+
+    #[test]
+    fn select_count_star_on_empty_returns_zero() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
+            .expect("create");
+        let result = engine
+            .execute(parse("SELECT count(*) FROM t").expect("parse"))
+            .expect("count");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows, vec![vec![Value::Int64(0)]]);
     }
 
     #[test]
