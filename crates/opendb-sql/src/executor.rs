@@ -358,9 +358,9 @@ impl SqlEngine {
                     )));
                 }
             }
-            let pk_eq = predicates.iter().find(|p| {
-                p.column == primary_key.name && matches!(p.op, crate::ast::WhereOp::Eq)
-            });
+            let pk_eq = predicates
+                .iter()
+                .find(|p| p.column == primary_key.name && matches!(p.op, crate::ast::WhereOp::Eq));
             let route = match pk_eq {
                 Some(p) => RouteIntent::Key {
                     table: table.to_owned(),
@@ -1017,11 +1017,16 @@ mod tests {
     fn select_where_and_composes_predicates() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").expect("parse"))
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").expect("parse"),
+            )
             .expect("create");
         for (id, name, score) in [(1, "a", 10), (2, "a", 20), (3, "b", 30)] {
             engine
-                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})")).expect("parse"))
+                .execute(
+                    parse(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})"))
+                        .expect("parse"),
+                )
                 .expect("insert");
         }
         let result = engine

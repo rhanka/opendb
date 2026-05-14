@@ -1473,7 +1473,9 @@ mod tests {
             let Statement::SelectAll { predicate, .. } = parsed else {
                 panic!("{sql} should produce a SelectAll");
             };
-            let p = predicate.first().unwrap_or_else(|| panic!("{sql} should produce a predicate"));
+            let p = predicate
+                .first()
+                .unwrap_or_else(|| panic!("{sql} should produce a predicate"));
             assert_eq!(p.op, op, "{sql}");
         }
     }
