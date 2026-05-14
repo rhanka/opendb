@@ -131,6 +131,10 @@ diff: ## Show uncommitted diff
 smoke: ## Run the entropiq POC smoke (POC = end-to-end Drizzle probe matrix)
 	cd $(WORKTREE) && $(NPM) run poc:entropiq:smoke
 
+.PHONY: smoke-real
+smoke-real: ## Sprint 15.E corrective: rejoue 8 vraies requêtes entropiq
+	cd $(WORKTREE) && $(NPM) run poc:entropiq:real
+
 .PHONY: smoke-k3s
 smoke-k3s: ## Run the k3s cluster smoke (non-destructive default)
 	cd $(WORKTREE) && $(NPM) run smoke:k3s
