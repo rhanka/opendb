@@ -249,7 +249,136 @@ impl SqlEngine {
                 },
                 route: RouteIntent::Root,
             }),
+            Statement::DeleteWhere { table, predicate } => {
+                self.prepare_delete_where(table, predicate)
+            }
+            Statement::UpdateWhere {
+                table,
+                predicate,
+                assignments,
+            } => self.prepare_update_where(table, predicate, assignments),
         }
+    }
+
+    /// Sprint 14.D: multi-row DELETE via full-table scan + filter.
+    fn prepare_delete_where(
+        &self,
+        table: String,
+        predicates: Vec<Predicate>,
+    ) -> OpenDbResult<PreparedQuery> {
+        let table_state = self
+            .projection
+            .table(&table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        // Validate column references early.
+        for p in &predicates {
+            let column = table_state
+                .columns
+                .iter()
+                .find(|c| c.name == p.column)
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!("column {} not in table {table}", p.column))
+                })?;
+            if !matches!(p.value, Value::Null) && !value_matches_type(&p.value, &column.data_type) {
+                return Err(OpenDbError::Sql(format!(
+                    "WHERE value for column {} does not match {:?}",
+                    column.name, column.data_type
+                )));
+            }
+        }
+        let primary_key = table_state.primary_key_column().ok_or_else(|| {
+            OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+        })?;
+        let matching_keys: Vec<String> = table_state
+            .rows
+            .iter()
+            .filter(|(_, row)| predicates.iter().all(|p| evaluate_predicate(row, p)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let _ = primary_key;
+        let row_count = matching_keys.len();
+        let mutations: Vec<Mutation> = matching_keys
+            .into_iter()
+            .map(|key| Mutation::DeleteRow {
+                table: table.clone(),
+                key,
+            })
+            .collect();
+        self.prepare_write(
+            mutations,
+            &format!("DELETE {row_count}"),
+            RouteIntent::Scan {
+                table: table.clone(),
+            },
+        )
+    }
+
+    /// Sprint 14.D: multi-row UPDATE via full-table scan + filter.
+    fn prepare_update_where(
+        &self,
+        table: String,
+        predicates: Vec<Predicate>,
+        assignments: Vec<(String, Value)>,
+    ) -> OpenDbResult<PreparedQuery> {
+        let table_state = self
+            .projection
+            .table(&table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        for p in &predicates {
+            let column = table_state
+                .columns
+                .iter()
+                .find(|c| c.name == p.column)
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!("column {} not in table {table}", p.column))
+                })?;
+            if !matches!(p.value, Value::Null) && !value_matches_type(&p.value, &column.data_type) {
+                return Err(OpenDbError::Sql(format!(
+                    "WHERE value for column {} does not match {:?}",
+                    column.name, column.data_type
+                )));
+            }
+        }
+        let coerced_assignments: Vec<ColumnValue> = assignments
+            .into_iter()
+            .map(|(column_name, value)| {
+                let column = table_state
+                    .columns
+                    .iter()
+                    .find(|c| c.name == column_name)
+                    .ok_or_else(|| {
+                        OpenDbError::InvalidInput(format!(
+                            "unknown column {column_name} on table {table}"
+                        ))
+                    })?;
+                Ok(ColumnValue {
+                    column: column_name,
+                    value: coerce_value(value, &column.data_type),
+                })
+            })
+            .collect::<OpenDbResult<Vec<_>>>()?;
+        let matching_keys: Vec<String> = table_state
+            .rows
+            .iter()
+            .filter(|(_, row)| predicates.iter().all(|p| evaluate_predicate(row, p)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let row_count = matching_keys.len();
+        let mutations: Vec<Mutation> = matching_keys
+            .into_iter()
+            .map(|key| Mutation::UpdateRow {
+                table: table.clone(),
+                key,
+                assignments: coerced_assignments.clone(),
+            })
+            .collect();
+        self.prepare_write(
+            mutations,
+            &format!("UPDATE {row_count}"),
+            RouteIntent::Scan {
+                table: table.clone(),
+            },
+        )
     }
 
     pub fn commits(&self) -> &[CommitRecord] {
@@ -1011,6 +1140,65 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Value::Text("Ada".to_owned()));
+    }
+
+    #[test]
+    fn delete_where_multi_row_filters_via_scan() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").expect("parse"),
+            )
+            .expect("create");
+        for (id, name, score) in [(1, "a", 10), (2, "a", 20), (3, "b", 30)] {
+            engine
+                .execute(
+                    parse(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})"))
+                        .expect("parse"),
+                )
+                .expect("insert");
+        }
+        let tag = engine
+            .execute(parse("DELETE FROM t WHERE name = 'a'").expect("parse"))
+            .expect("delete multi");
+        assert_eq!(
+            tag,
+            QueryResult::Command {
+                tag: "DELETE 2".to_owned()
+            }
+        );
+        let rows = engine
+            .execute(parse("SELECT * FROM t").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = rows else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], Value::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn update_where_multi_row_filters_via_scan() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)").expect("parse"))
+            .expect("create");
+        for (id, status) in [(1, "pending"), (2, "pending"), (3, "done")] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{status}')")).expect("parse"))
+                .expect("insert");
+        }
+        let tag = engine
+            .execute(
+                parse("UPDATE t SET status = 'active' WHERE status = 'pending'").expect("parse"),
+            )
+            .expect("update multi");
+        assert_eq!(
+            tag,
+            QueryResult::Command {
+                tag: "UPDATE 2".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1829,12 +2017,21 @@ mod tests {
 
     #[test]
     fn update_rejects_missing_row() {
+        // Sprint 14.D: UPDATE WHERE pk = lit follows the scan + filter path,
+        // which silently affects zero rows when none match (Postgres semantics).
         let mut engine = SqlEngine::default();
         engine
             .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
             .expect("create");
-        let result = engine.execute(parse("UPDATE t SET name = 'b' WHERE id = 99").expect("parse"));
-        assert!(matches!(result, Err(OpenDbError::NotFound(_))));
+        let tag = engine
+            .execute(parse("UPDATE t SET name = 'b' WHERE id = 99").expect("parse"))
+            .expect("update");
+        assert_eq!(
+            tag,
+            QueryResult::Command {
+                tag: "UPDATE 0".to_owned()
+            }
+        );
     }
 
     #[test]

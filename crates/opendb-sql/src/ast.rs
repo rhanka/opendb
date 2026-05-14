@@ -109,6 +109,17 @@ pub enum Statement {
         key: String,
         assignments: Vec<(String, Value)>,
     },
+    /// Sprint 14.D: multi-row DELETE with a conjunctive WHERE clause.
+    DeleteWhere {
+        table: String,
+        predicate: Vec<Predicate>,
+    },
+    /// Sprint 14.D: multi-row UPDATE with a conjunctive WHERE clause.
+    UpdateWhere {
+        table: String,
+        predicate: Vec<Predicate>,
+        assignments: Vec<(String, Value)>,
+    },
     Select {
         left: String,
         join: JoinClause,

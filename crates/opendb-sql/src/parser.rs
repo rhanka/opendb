@@ -83,23 +83,13 @@ fn parse_update(sql: &str) -> OpenDbResult<Statement> {
             "UPDATE requires at least one SET assignment".to_owned(),
         ));
     }
-    let predicate = parse_predicate(predicate_text)?;
-    let key = match predicate.value {
-        Value::Int64(v) => v.to_string(),
-        Value::Text(v) => v,
-        Value::Bool(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::Timestamp(v) => v.to_string(),
-        Value::Json(v) => v.to_string(),
-        Value::Null => {
-            return Err(OpenDbError::Sql(
-                "UPDATE WHERE primary key cannot be NULL".to_owned(),
-            ));
-        }
-    };
-    Ok(Statement::UpdateRow {
+    let predicates = parse_predicate_conjunction(predicate_text)?;
+    // Sprint 14.D: the executor is responsible for the PK-equality fast
+    // path (it knows the schema). The parser unconditionally produces
+    // `UpdateWhere`.
+    Ok(Statement::UpdateWhere {
         table: unquote_identifier(table),
-        key,
+        predicate: predicates,
         assignments,
     })
 }
@@ -134,23 +124,10 @@ fn parse_delete(sql: &str) -> OpenDbResult<Statement> {
         .ok_or_else(|| OpenDbError::Sql("DELETE requires WHERE primary-key equality".to_owned()))?;
     let table = rest[..where_pos].trim().to_owned();
     let predicate_text = rest[where_pos + " WHERE ".len()..].trim();
-    let predicate = parse_predicate(predicate_text)?;
-    let key = match predicate.value {
-        Value::Int64(v) => v.to_string(),
-        Value::Text(v) => v,
-        Value::Bool(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::Timestamp(v) => v.to_string(),
-        Value::Json(v) => v.to_string(),
-        Value::Null => {
-            return Err(OpenDbError::Sql(
-                "DELETE WHERE primary key cannot be NULL".to_owned(),
-            ));
-        }
-    };
-    Ok(Statement::DeleteRow {
+    let predicates = parse_predicate_conjunction(predicate_text)?;
+    Ok(Statement::DeleteWhere {
         table: unquote_identifier(&table),
-        key,
+        predicate: predicates,
     })
 }
 
@@ -1708,16 +1685,16 @@ mod tests {
     fn parses_update_set_where_pk() {
         let stmt = parse("UPDATE accounts SET name = 'Bob', status = 'active' WHERE id = 1")
             .expect("update");
-        let Statement::UpdateRow {
+        let Statement::UpdateWhere {
             table,
-            key,
+            predicate,
             assignments,
         } = stmt
         else {
-            panic!("expected UpdateRow");
+            panic!("expected UpdateWhere");
         };
         assert_eq!(table, "accounts");
-        assert_eq!(key, "1");
+        assert_eq!(predicate.len(), 1);
         assert_eq!(assignments.len(), 2);
         assert_eq!(assignments[0].0, "name");
         assert_eq!(assignments[1].0, "status");
@@ -1734,11 +1711,15 @@ mod tests {
     #[test]
     fn parses_delete_from_where_primary_key_equality() {
         let stmt = parse("DELETE FROM accounts WHERE id = 1").expect("delete");
-        let Statement::DeleteRow { table, key } = stmt else {
-            panic!("expected DeleteRow");
+        // Sprint 14.D: parser unconditionally emits `DeleteWhere`; the
+        // executor handles the PK fast path.
+        let Statement::DeleteWhere { table, predicate } = stmt else {
+            panic!("expected DeleteWhere");
         };
         assert_eq!(table, "accounts");
-        assert_eq!(key, "1");
+        assert_eq!(predicate.len(), 1);
+        assert_eq!(predicate[0].column, "id");
+        assert_eq!(predicate[0].value, Value::Int64(1));
     }
 
     #[test]
