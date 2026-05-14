@@ -134,6 +134,7 @@ impl SqlEngine {
                 offset,
                 columns,
                 group_by,
+                having,
             } => self
                 .select_all(
                     &table,
@@ -143,6 +144,7 @@ impl SqlEngine {
                     offset,
                     &columns,
                     &group_by,
+                    &having,
                 )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
             Statement::SelectExpr { items } => {
@@ -423,6 +425,7 @@ impl SqlEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_all(
         &self,
         table: &str,
@@ -432,6 +435,7 @@ impl SqlEngine {
         offset: Option<u64>,
         columns: &crate::ast::SelectColumns,
         group_by: &[String],
+        having: &[crate::ast::HavingPredicate],
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let table_state = self
             .projection
@@ -448,6 +452,7 @@ impl SqlEngine {
                 predicates,
                 projection,
                 group_by,
+                having,
                 order_by,
                 limit,
                 offset,
@@ -456,6 +461,11 @@ impl SqlEngine {
         if !group_by.is_empty() {
             return Err(OpenDbError::Sql(
                 "GROUP BY requires an aggregated projection".to_owned(),
+            ));
+        }
+        if !having.is_empty() {
+            return Err(OpenDbError::Sql(
+                "HAVING requires an aggregated projection".to_owned(),
             ));
         }
         let column_names = match columns {
@@ -581,11 +591,22 @@ impl SqlEngine {
         predicates: &[Predicate],
         projection: &crate::ast::AggregateProjection,
         group_by: &[String],
+        having: &[crate::ast::HavingPredicate],
         order_by: Option<&crate::ast::OrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         use crate::ast::{AggregateArg, AggregateOrColumn};
+        // Sprint 15.C: collect the aggregate expressions referenced by HAVING
+        // (deduplicated by structural identity) so we can fold them per group
+        // alongside the projection aggregates.
+        let having_aggs: Vec<crate::ast::AggregateExpr> = having
+            .iter()
+            .filter_map(|p| match &p.expr {
+                AggregateOrColumn::Aggregate(e) => Some(e.clone()),
+                AggregateOrColumn::Column(_) => None,
+            })
+            .collect();
         let all_columns = table_state.column_names();
         // Validate group_by columns + bare projection columns belong to the table
         // and are listed in GROUP BY.
@@ -636,9 +657,13 @@ impl SqlEngine {
         // Fold matching rows into per-group aggregate state. Empty group_by =>
         // a single global group keyed by an empty string. We key groups by a
         // serialized representation of the GROUP BY value tuple because
-        // `Value` does not implement `Ord`.
-        let mut groups: std::collections::BTreeMap<String, (Vec<Value>, Vec<AggregateState>)> =
-            std::collections::BTreeMap::new();
+        // `Value` does not implement `Ord`. Each group carries two parallel
+        // state vectors: one for the projection items, one for the HAVING
+        // aggregate expressions (used by Sprint 15.C).
+        let mut groups: std::collections::BTreeMap<
+            String,
+            (Vec<Value>, Vec<AggregateState>, Vec<AggregateState>),
+        > = std::collections::BTreeMap::new();
         let mut matched_any = false;
         for row in table_state.rows.values() {
             if !predicates.iter().all(|p| evaluate_predicate(row, p)) {
@@ -650,7 +675,7 @@ impl SqlEngine {
                 .map(|g| row.get(g).cloned().unwrap_or(Value::Null))
                 .collect();
             let key_str = group_key_string(&key_values);
-            let (_, states) = groups.entry(key_str).or_insert_with(|| {
+            let (_, states, having_states) = groups.entry(key_str).or_insert_with(|| {
                 (
                     key_values.clone(),
                     projection
@@ -658,6 +683,7 @@ impl SqlEngine {
                         .iter()
                         .map(|_| AggregateState::new())
                         .collect(),
+                    having_aggs.iter().map(|_| AggregateState::new()).collect(),
                 )
             });
             for (slot, item) in states.iter_mut().zip(projection.items.iter()) {
@@ -668,6 +694,13 @@ impl SqlEngine {
                     };
                     slot.accumulate(expr.func, &value);
                 }
+            }
+            for (slot, expr) in having_states.iter_mut().zip(having_aggs.iter()) {
+                let value = match &expr.arg {
+                    AggregateArg::Star => Value::Int64(1),
+                    AggregateArg::Column(name) => row.get(name).cloned().unwrap_or(Value::Null),
+                };
+                slot.accumulate(expr.func, &value);
             }
         }
 
@@ -700,7 +733,7 @@ impl SqlEngine {
             output_rows.push(row);
             let _ = matched_any;
         } else {
-            for (_, (key_values, states)) in &groups {
+            for (_, (key_values, states, _)) in &groups {
                 let row: Vec<Value> = projection
                     .items
                     .iter()
@@ -718,6 +751,36 @@ impl SqlEngine {
                     .collect();
                 output_rows.push(row);
             }
+        }
+
+        // Sprint 15.C: HAVING filters AFTER aggregation. Each predicate's LHS
+        // is evaluated against the per-group `having_states` slot computed
+        // during the main fold (or against the GROUP BY key for bare-column
+        // predicates).
+        if !having.is_empty() {
+            let groups_vec: Vec<(
+                &String,
+                &(Vec<Value>, Vec<AggregateState>, Vec<AggregateState>),
+            )> = groups.iter().collect();
+            let mut kept: Vec<Vec<Value>> = Vec::with_capacity(output_rows.len());
+            if group_by.is_empty() && groups.is_empty() {
+                let empty_having_states: Vec<AggregateState> =
+                    having_aggs.iter().map(|_| AggregateState::new()).collect();
+                if output_rows.len() == 1
+                    && having_matches(having, &having_aggs, group_by, &[], &empty_having_states)
+                {
+                    kept.push(output_rows[0].clone());
+                }
+            } else {
+                for (row, (_, (key_values, _, having_states))) in
+                    output_rows.iter().zip(groups_vec.iter())
+                {
+                    if having_matches(having, &having_aggs, group_by, key_values, having_states) {
+                        kept.push(row.clone());
+                    }
+                }
+            }
+            output_rows = kept;
         }
 
         // Optional ORDER BY against the aggregated column names.
@@ -867,6 +930,62 @@ impl AggregateState {
             F::Max => self.max.clone().unwrap_or(Value::Null),
             F::Min => self.min.clone().unwrap_or(Value::Null),
         }
+    }
+}
+
+/// Sprint 15.C: evaluate the conjunction of HAVING predicates against a
+/// single group. `having_aggs` and `having_states` are aligned: index `i` in
+/// `having_aggs` matches state slot `i` (built during the main fold).
+fn having_matches(
+    having: &[crate::ast::HavingPredicate],
+    having_aggs: &[crate::ast::AggregateExpr],
+    group_by: &[String],
+    key_values: &[Value],
+    having_states: &[AggregateState],
+) -> bool {
+    use crate::ast::AggregateOrColumn;
+    let mut agg_cursor = 0usize;
+    for pred in having {
+        let lhs_value = match &pred.expr {
+            AggregateOrColumn::Column(name) => {
+                let Some(pos) = group_by.iter().position(|g| g == name) else {
+                    return false;
+                };
+                key_values.get(pos).cloned().unwrap_or(Value::Null)
+            }
+            AggregateOrColumn::Aggregate(_expr) => {
+                let slot = having_states
+                    .get(agg_cursor)
+                    .expect("having_states aligned with having_aggs by construction");
+                let func = having_aggs
+                    .get(agg_cursor)
+                    .expect("having_aggs aligned with predicates")
+                    .func;
+                agg_cursor += 1;
+                slot.finalize(func)
+            }
+        };
+        if !compare_where_op(&lhs_value, pred.op.clone(), &pred.value) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sprint 15.C: thin wrapper that maps a `WhereOp` over the (LHS, RHS) value
+/// pair. Subset of `evaluate_predicate` re-used for HAVING.
+fn compare_where_op(lhs: &Value, op: crate::ast::WhereOp, rhs: &Value) -> bool {
+    use crate::ast::WhereOp as W;
+    match op {
+        W::Eq => lhs == rhs,
+        W::NotEq => lhs != rhs,
+        W::Lt => compare_values(lhs, rhs).is_lt(),
+        W::Lte => compare_values(lhs, rhs).is_le(),
+        W::Gt => compare_values(lhs, rhs).is_gt(),
+        W::Gte => compare_values(lhs, rhs).is_ge(),
+        W::In(list) => list.iter().any(|v| v == lhs),
+        W::IsNull => matches!(lhs, Value::Null),
+        W::IsNotNull => !matches!(lhs, Value::Null),
     }
 }
 
@@ -1681,6 +1800,91 @@ mod tests {
         }
         assert_eq!(counts.get("open"), Some(&3));
         assert_eq!(counts.get("closed"), Some(&2));
+    }
+
+    #[test]
+    fn select_group_by_multi_column() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE t (id INT PRIMARY KEY, region TEXT, status TEXT)")
+                    .expect("parse"),
+            )
+            .expect("create");
+        for (id, region, status) in [
+            (1, "EU", "open"),
+            (2, "EU", "open"),
+            (3, "EU", "closed"),
+            (4, "US", "open"),
+            (5, "US", "closed"),
+            (6, "US", "closed"),
+        ] {
+            engine
+                .execute(
+                    parse(&format!(
+                        "INSERT INTO t VALUES ({id}, '{region}', '{status}')"
+                    ))
+                    .expect("parse"),
+                )
+                .expect("insert");
+        }
+        let result = engine
+            .execute(
+                parse("SELECT region, status, count(*) FROM t GROUP BY region, status")
+                    .expect("parse"),
+            )
+            .expect("agg");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 4);
+        let mut by_key: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let Value::Text(region) = &row[0] else {
+                panic!()
+            };
+            let Value::Text(status) = &row[1] else {
+                panic!()
+            };
+            let Value::Int64(c) = &row[2] else { panic!() };
+            by_key.insert((region.clone(), status.clone()), *c);
+        }
+        assert_eq!(by_key.get(&("EU".to_owned(), "open".to_owned())), Some(&2));
+        assert_eq!(
+            by_key.get(&("EU".to_owned(), "closed".to_owned())),
+            Some(&1)
+        );
+        assert_eq!(by_key.get(&("US".to_owned(), "open".to_owned())), Some(&1));
+        assert_eq!(
+            by_key.get(&("US".to_owned(), "closed".to_owned())),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn select_having_filters_groups_post_aggregation() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)").expect("parse"))
+            .expect("create");
+        for (id, status) in [(1, "open"), (2, "open"), (3, "open"), (4, "closed")] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{status}')")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(
+                parse("SELECT status, count(*) FROM t GROUP BY status HAVING count(*) > 1")
+                    .expect("parse"),
+            )
+            .expect("having");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Text("open".to_owned()));
+        assert_eq!(rows[0][1], Value::Int64(3));
     }
 
     #[test]

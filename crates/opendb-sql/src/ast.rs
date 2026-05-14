@@ -92,6 +92,8 @@ pub enum Statement {
         columns: SelectColumns,
         #[doc = "Sprint 15: GROUP BY <col1>[, ...]. Empty vector = no GROUP BY."]
         group_by: Vec<String>,
+        #[doc = "Sprint 15.C: HAVING <agg-predicate> [AND ...]. Empty = no HAVING."]
+        having: Vec<HavingPredicate>,
     },
     SelectExpr {
         items: Vec<SelectExprItem>,
@@ -220,6 +222,15 @@ pub enum AggregateFunction {
     Avg,
 }
 
+/// Sprint 15.C: a single HAVING-clause predicate. The LHS is either an
+/// aggregate expression or a bare column that participates in `GROUP BY`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HavingPredicate {
+    pub expr: AggregateOrColumn,
+    pub op: WhereOp,
+    pub value: Value,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectExprItem {
     pub expr: SelectExpr,
@@ -264,6 +275,7 @@ impl Statement {
             offset: None,
             columns: SelectColumns::Star,
             group_by: Vec::new(),
+            having: Vec::new(),
         }
     }
 }

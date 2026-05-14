@@ -1,8 +1,8 @@
 use crate::ast::{
     AggregateArg, AggregateExpr, AggregateFunction, AggregateOrColumn, AggregateProjection,
-    AggregateSelectItem, JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate, OrderBy,
-    OrderDirection, Predicate, SelectColumns, SelectExpr, SelectExprItem, SelectFunction,
-    Statement,
+    AggregateSelectItem, HavingPredicate, JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate,
+    OrderBy, OrderDirection, Predicate, SelectColumns, SelectExpr, SelectExprItem, SelectFunction,
+    Statement, WhereOp,
 };
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
@@ -774,7 +774,11 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     let (rest, offset) = take_trailing_keyword_value(rest, " OFFSET ")?;
     let (rest, limit) = take_trailing_keyword_value(&rest, " LIMIT ")?;
     let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
-    // Sprint 15: extract optional GROUP BY clause sitting between WHERE and ORDER BY.
+    // Sprint 15.C: HAVING sits between GROUP BY and ORDER BY in SQL grammar
+    // ("...GROUP BY <cols> HAVING <preds> [ORDER BY ...]"). We already stripped
+    // ORDER BY / LIMIT / OFFSET so HAVING is now trailing.
+    let (rest, having_text) = take_trailing_keyword(&rest, " HAVING ");
+    // Sprint 15: extract optional GROUP BY clause sitting between WHERE and HAVING.
     let (rest, group_by_text) = take_trailing_keyword(&rest, " GROUP BY ");
 
     let upper_rest = rest.to_ascii_uppercase();
@@ -802,6 +806,10 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         Some(text) => parse_group_by(text)?,
         None => Vec::new(),
     };
+    let having = match having_text.as_deref() {
+        Some(text) => parse_having(text)?,
+        None => Vec::new(),
+    };
     Ok(Statement::SelectAll {
         table: unquote_identifier(table),
         predicate: predicates,
@@ -810,7 +818,95 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         offset,
         columns: SelectColumns::Star,
         group_by,
+        having,
     })
+}
+
+/// Sprint 15.C: parse a HAVING clause as a conjunction of agg-or-column
+/// comparison predicates. Mirrors `parse_predicate_conjunction` but the LHS is
+/// allowed to be `count(*)` / `sum(c)` / etc.
+fn parse_having(text: &str) -> OpenDbResult<Vec<HavingPredicate>> {
+    let parts = split_top_level_and(text)?;
+    parts
+        .into_iter()
+        .map(parse_having_predicate)
+        .collect::<OpenDbResult<Vec<_>>>()
+}
+
+fn parse_having_predicate(raw: &str) -> OpenDbResult<HavingPredicate> {
+    let trimmed = raw.trim();
+    // `find_first_comparison_op` walks left-to-right; but it doesn't skip over
+    // parens, so for `count(*) > 5` the first `>` is fine. To be safe against
+    // future regression on `sum(x)`-style operators in args, we look for the
+    // first comparator that sits at top-level paren depth.
+    let (op, op_pos, op_len) = find_first_comparison_op_outside_parens(trimmed)?;
+    let lhs = trimmed[..op_pos].trim();
+    let rhs = trimmed[op_pos + op_len..].trim();
+    let expr = parse_aggregate_or_column(lhs)?;
+    let value = parse_value(rhs)?;
+    Ok(HavingPredicate { expr, op, value })
+}
+
+/// Sprint 15.C: like `find_first_comparison_op` but only matches operators
+/// that sit outside any `(...)` group. Used by HAVING because the LHS may be
+/// `count(*)` / `sum(col)`.
+fn find_first_comparison_op_outside_parens(
+    raw: &str,
+) -> OpenDbResult<(crate::ast::WhereOp, usize, usize)> {
+    let bytes = raw.as_bytes();
+    let mut in_quote = false;
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote {
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0 {
+                if i + 2 <= bytes.len() {
+                    let two = &bytes[i..i + 2];
+                    if two == b"!=" {
+                        return Ok((WhereOp::NotEq, i, 2));
+                    }
+                    if two == b"<=" {
+                        return Ok((WhereOp::Lte, i, 2));
+                    }
+                    if two == b">=" {
+                        return Ok((WhereOp::Gte, i, 2));
+                    }
+                    if two == b"<>" {
+                        return Ok((WhereOp::NotEq, i, 2));
+                    }
+                }
+                if c == b'=' {
+                    return Ok((WhereOp::Eq, i, 1));
+                }
+                if c == b'<' {
+                    return Ok((WhereOp::Lt, i, 1));
+                }
+                if c == b'>' {
+                    return Ok((WhereOp::Gt, i, 1));
+                }
+            }
+        }
+        i += 1;
+    }
+    Err(OpenDbError::Sql(format!(
+        "HAVING predicate missing comparison: {raw}"
+    )))
 }
 
 /// Sprint 15: parse `GROUP BY <col1>[, <col2> ...]`. Identifiers may be quoted
@@ -860,6 +956,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
             limit,
             offset,
             group_by,
+            having,
             ..
         } = parsed
         else {
@@ -880,6 +977,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
                 offset,
                 columns: SelectColumns::Aggregated(AggregateProjection { items }),
                 group_by,
+                having,
             });
         }
         let columns = tokens
@@ -908,6 +1006,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
             offset,
             columns: SelectColumns::Explicit(columns),
             group_by,
+            having,
         });
     }
 
