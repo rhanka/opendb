@@ -30,7 +30,7 @@ impl Predicate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WhereOp {
     Eq,
     NotEq,
@@ -38,6 +38,12 @@ pub enum WhereOp {
     Lte,
     Gt,
     Gte,
+    /// Sprint 14.C: `col IN (v1, v2, ...)`. The literal list lives inline.
+    In(Vec<Value>),
+    /// Sprint 14.C: `col IS NULL`.
+    IsNull,
+    /// Sprint 14.C: `col IS NOT NULL`.
+    IsNotNull,
 }
 
 /// Sprint 14: composite WHERE clause joined by AND. A single-element vector

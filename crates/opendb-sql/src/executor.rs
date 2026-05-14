@@ -798,13 +798,16 @@ fn evaluate_predicate(
     use crate::ast::WhereOp;
     let value = row.get(&predicate.column).cloned().unwrap_or(Value::Null);
     let ordering = compare_values(&value, &predicate.value);
-    match predicate.op {
+    match &predicate.op {
         WhereOp::Eq => value == predicate.value,
         WhereOp::NotEq => value != predicate.value,
         WhereOp::Lt => ordering == std::cmp::Ordering::Less,
         WhereOp::Lte => ordering != std::cmp::Ordering::Greater,
         WhereOp::Gt => ordering == std::cmp::Ordering::Greater,
         WhereOp::Gte => ordering != std::cmp::Ordering::Less,
+        WhereOp::In(values) => values.iter().any(|v| v == &value),
+        WhereOp::IsNull => matches!(value, Value::Null),
+        WhereOp::IsNotNull => !matches!(value, Value::Null),
     }
 }
 
@@ -1199,6 +1202,37 @@ mod tests {
                 tag: "UPDATE 2".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn select_where_in_and_is_null() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, label TEXT)").expect("parse"))
+            .expect("create");
+        for (id, label) in [(1, "a"), (2, "b"), (3, "c")] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{label}')")).expect("parse"))
+                .expect("insert");
+        }
+        engine
+            .execute(parse("INSERT INTO t (id, label) VALUES (4, NULL)").expect("parse"))
+            .expect("insert null");
+        let result = engine
+            .execute(parse("SELECT * FROM t WHERE id IN (1, 3)").expect("parse"))
+            .expect("in");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 2);
+        let null_result = engine
+            .execute(parse("SELECT * FROM t WHERE label IS NULL").expect("parse"))
+            .expect("is null");
+        let QueryResult::Rows { rows, .. } = null_result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(4));
     }
 
     #[test]

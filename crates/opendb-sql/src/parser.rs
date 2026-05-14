@@ -1173,6 +1173,57 @@ fn parse_order_by(text: &str) -> OpenDbResult<OrderBy> {
 
 fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
     // Sprint 14: support `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` as operators.
+    // Sprint 14.C also handles `col IN (v1, v2, ...)`, `col IS NULL`, and
+    // `col IS NOT NULL` as alternative predicate shapes.
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if let Some(in_pos) = find_keyword_outside_quotes(trimmed, " IN ") {
+        let column_text = trimmed[..in_pos].trim();
+        let rest = trimmed[in_pos + " IN ".len()..].trim();
+        let open = rest
+            .find('(')
+            .ok_or_else(|| OpenDbError::Sql("IN expects `(`".to_owned()))?;
+        let close = rest
+            .rfind(')')
+            .ok_or_else(|| OpenDbError::Sql("IN expects `)`".to_owned()))?;
+        if open >= close {
+            return Err(OpenDbError::Sql("malformed IN list".to_owned()));
+        }
+        let values_text = &rest[open + 1..close];
+        let values = split_top_level_commas(values_text)?
+            .into_iter()
+            .map(parse_value)
+            .collect::<OpenDbResult<Vec<Value>>>()?;
+        if values.is_empty() {
+            return Err(OpenDbError::Sql("IN list must not be empty".to_owned()));
+        }
+        return Ok(Predicate {
+            column: unqualified_column_name(column_text),
+            value: Value::Null,
+            op: crate::ast::WhereOp::In(values),
+        });
+    }
+    if let Some(is_pos) = find_keyword_outside_quotes(trimmed, " IS ") {
+        let column_text = trimmed[..is_pos].trim();
+        let rest_upper = upper[is_pos + " IS ".len()..].trim();
+        if rest_upper == "NULL" {
+            return Ok(Predicate {
+                column: unqualified_column_name(column_text),
+                value: Value::Null,
+                op: crate::ast::WhereOp::IsNull,
+            });
+        }
+        if rest_upper == "NOT NULL" {
+            return Ok(Predicate {
+                column: unqualified_column_name(column_text),
+                value: Value::Null,
+                op: crate::ast::WhereOp::IsNotNull,
+            });
+        }
+        return Err(OpenDbError::Sql(format!(
+            "unsupported IS form in WHERE predicate: {raw}"
+        )));
+    }
     parse_predicate_with_op(raw)
 }
 
