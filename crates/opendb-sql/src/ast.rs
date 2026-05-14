@@ -70,6 +70,11 @@ pub enum Statement {
         table: String,
         key: String,
     },
+    UpdateRow {
+        table: String,
+        key: String,
+        assignments: Vec<(String, Value)>,
+    },
     Select {
         left: String,
         join: JoinClause,

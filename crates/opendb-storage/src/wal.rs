@@ -488,9 +488,8 @@ mod tests {
             vec![Mutation::AlterTable {
                 table: "accounts".to_owned(),
                 op: AlterTableOp::AddColumn(
-                    ColumnDefinition::new("status", ColumnType::Text).with_default(
-                        DefaultExpr::Const(Value::Text("active".to_owned())),
-                    ),
+                    ColumnDefinition::new("status", ColumnType::Text)
+                        .with_default(DefaultExpr::Const(Value::Text("active".to_owned()))),
                 ),
             }],
         );

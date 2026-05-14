@@ -21,10 +21,7 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         trimmed
     };
     let upper = normalized.to_ascii_uppercase();
-    if upper == "BEGIN"
-        || upper == "BEGIN TRANSACTION"
-        || upper == "START TRANSACTION"
-    {
+    if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
         return Ok(Statement::Begin);
     }
     if upper == "COMMIT" || upper == "COMMIT TRANSACTION" || upper == "END" {
@@ -47,11 +44,84 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         parse_alter_table(normalized)
     } else if upper.starts_with("DELETE FROM ") {
         parse_delete(normalized)
+    } else if upper.starts_with("UPDATE ") {
+        parse_update(normalized)
     } else if upper.starts_with("DO ") || upper.starts_with("DO$") {
         parse_do_block(normalized)
     } else {
         Err(OpenDbError::Sql(format!("unsupported SQL: {normalized}")))
     }
+}
+
+/// Sprint 13: `UPDATE <table> SET <col1> = <lit1> [, ...] WHERE <pk> = <literal>`.
+fn parse_update(sql: &str) -> OpenDbResult<Statement> {
+    let rest = strip_keyword_prefix(sql, "UPDATE ")
+        .ok_or_else(|| OpenDbError::Sql("invalid UPDATE".to_owned()))?
+        .trim();
+    let upper_rest = rest.to_ascii_uppercase();
+    let set_pos = upper_rest
+        .find(" SET ")
+        .ok_or_else(|| OpenDbError::Sql("UPDATE requires SET".to_owned()))?;
+    let table = rest[..set_pos].trim();
+    if table.is_empty() {
+        return Err(OpenDbError::Sql("UPDATE requires table".to_owned()));
+    }
+    let after_set = &rest[set_pos + " SET ".len()..];
+    let upper_after_set = after_set.to_ascii_uppercase();
+    let where_pos = upper_after_set
+        .find(" WHERE ")
+        .ok_or_else(|| OpenDbError::Sql("UPDATE requires WHERE".to_owned()))?;
+    let assignments_text = after_set[..where_pos].trim();
+    let predicate_text = after_set[where_pos + " WHERE ".len()..].trim();
+
+    let assignments = split_top_level_commas(assignments_text)?
+        .into_iter()
+        .map(parse_assignment)
+        .collect::<OpenDbResult<Vec<(String, Value)>>>()?;
+    if assignments.is_empty() {
+        return Err(OpenDbError::Sql(
+            "UPDATE requires at least one SET assignment".to_owned(),
+        ));
+    }
+    let predicate = parse_predicate(predicate_text)?;
+    let key = match predicate.value {
+        Value::Int64(v) => v.to_string(),
+        Value::Text(v) => v,
+        Value::Bool(v) => v.to_string(),
+        Value::Float64(v) => v.to_string(),
+        Value::Timestamp(v) => v.to_string(),
+        Value::Json(v) => v.to_string(),
+        Value::Null => {
+            return Err(OpenDbError::Sql(
+                "UPDATE WHERE primary key cannot be NULL".to_owned(),
+            ));
+        }
+    };
+    Ok(Statement::UpdateRow {
+        table: unquote_identifier(table),
+        key,
+        assignments,
+    })
+}
+
+fn parse_assignment(raw: &str) -> OpenDbResult<(String, Value)> {
+    let equals_positions = equality_positions_outside_quotes(raw)?;
+    let Some(equals_pos) = equals_positions.first().copied() else {
+        return Err(OpenDbError::Sql(format!("invalid SET assignment: {raw}")));
+    };
+    if equals_positions.len() != 1 {
+        return Err(OpenDbError::Sql(format!(
+            "SET assignment has more than one `=`: {raw}"
+        )));
+    }
+    let column = raw[..equals_pos].trim();
+    let value_text = raw[equals_pos + 1..].trim();
+    if column.is_empty() || value_text.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "SET assignment requires column and literal: {raw}"
+        )));
+    }
+    Ok((unqualified_column_name(column), parse_value(value_text)?))
 }
 
 fn parse_delete(sql: &str) -> OpenDbResult<Statement> {
@@ -167,8 +237,8 @@ fn parse_add_constraint(input: &str) -> OpenDbResult<NamedConstraint> {
     let upper_rest = rest.to_ascii_uppercase();
     if let Some(after) = strip_keyword(rest, &upper_rest, "FOREIGN KEY") {
         let after = after.trim_start();
-        let (columns_text, after_cols) =
-            extract_parenthesized(after).ok_or_else(|| OpenDbError::Sql("FK columns".to_owned()))?;
+        let (columns_text, after_cols) = extract_parenthesized(after)
+            .ok_or_else(|| OpenDbError::Sql("FK columns".to_owned()))?;
         let after_cols_trimmed = after_cols.trim_start();
         let upper_after_cols = after_cols_trimmed.to_ascii_uppercase();
         let after_refs = strip_keyword(after_cols_trimmed, &upper_after_cols, "REFERENCES")
@@ -303,13 +373,14 @@ fn take_referential_action(input: &str) -> OpenDbResult<(ReferentialAction, &str
 
 fn parse_create_index(sql: &str) -> OpenDbResult<Statement> {
     let upper = sql.to_ascii_uppercase();
-    let (unique, rest_after_unique) = if let Some(rest) = strip_keyword(sql, &upper, "CREATE UNIQUE INDEX ") {
-        (true, rest)
-    } else {
-        let rest = strip_keyword(sql, &upper, "CREATE INDEX ")
-            .ok_or_else(|| OpenDbError::Sql("invalid CREATE INDEX".to_owned()))?;
-        (false, rest)
-    };
+    let (unique, rest_after_unique) =
+        if let Some(rest) = strip_keyword(sql, &upper, "CREATE UNIQUE INDEX ") {
+            (true, rest)
+        } else {
+            let rest = strip_keyword(sql, &upper, "CREATE INDEX ")
+                .ok_or_else(|| OpenDbError::Sql("invalid CREATE INDEX".to_owned()))?;
+            (false, rest)
+        };
     let rest_upper = rest_after_unique.to_ascii_uppercase();
     let (if_not_exists, remainder) =
         if let Some(rest) = strip_keyword(rest_after_unique, &rest_upper, "IF NOT EXISTS ") {
@@ -368,22 +439,20 @@ fn parse_do_block(sql: &str) -> OpenDbResult<Statement> {
         .ok_or_else(|| OpenDbError::Sql("DO block missing END".to_owned()))?;
     let body_text = &body_after_begin[..end_index];
     let mut swallow_duplicate = false;
-    let inner_statements_text = if let Some(exception_pos) = body_text
-        .to_ascii_uppercase()
-        .find("EXCEPTION")
-    {
-        let main_body = &body_text[..exception_pos];
-        let exception_body = &body_text[exception_pos..];
-        if exception_body
-            .to_ascii_uppercase()
-            .contains("DUPLICATE_OBJECT")
-        {
-            swallow_duplicate = true;
-        }
-        main_body
-    } else {
-        body_text
-    };
+    let inner_statements_text =
+        if let Some(exception_pos) = body_text.to_ascii_uppercase().find("EXCEPTION") {
+            let main_body = &body_text[..exception_pos];
+            let exception_body = &body_text[exception_pos..];
+            if exception_body
+                .to_ascii_uppercase()
+                .contains("DUPLICATE_OBJECT")
+            {
+                swallow_duplicate = true;
+            }
+            main_body
+        } else {
+            body_text
+        };
     let inner = split_statements(inner_statements_text)
         .into_iter()
         .map(|stmt| parse(&stmt))
@@ -699,12 +768,7 @@ fn parse_value(value: &str) -> OpenDbResult<Value> {
 /// as parse errors and demand explicit support.
 fn strip_cast_suffix(value: &str) -> &str {
     for suffix in [
-        "::jsonb",
-        "::JSONB",
-        "::Jsonb",
-        "::json",
-        "::JSON",
-        "::Json",
+        "::jsonb", "::JSONB", "::Jsonb", "::json", "::JSON", "::Json",
     ] {
         if let Some(stripped) = value.strip_suffix(suffix) {
             return stripped.trim_end();
@@ -961,11 +1025,12 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         )));
     }
     // Normalize so left_column comes from left_table.
-    let (left_column, right_column) = if left_qualified.qualifier.as_deref() == Some(left_table.as_str()) {
-        (left_qualified.column, right_qualified.column)
-    } else {
-        (right_qualified.column, left_qualified.column)
-    };
+    let (left_column, right_column) =
+        if left_qualified.qualifier.as_deref() == Some(left_table.as_str()) {
+            (left_qualified.column, right_qualified.column)
+        } else {
+            (right_qualified.column, left_qualified.column)
+        };
 
     let join = JoinClause {
         kind: join_kind,
@@ -1002,11 +1067,12 @@ struct QualifiedColumn {
 fn parse_join_equality(expr: &str) -> OpenDbResult<(QualifiedColumn, QualifiedColumn)> {
     let parts: Vec<&str> = expr.split('=').collect();
     if parts.len() != 2 {
-        return Err(OpenDbError::Sql(format!(
-            "invalid ON expression: {expr}"
-        )));
+        return Err(OpenDbError::Sql(format!("invalid ON expression: {expr}")));
     }
-    Ok((parse_qualified_column(parts[0])?, parse_qualified_column(parts[1])?))
+    Ok((
+        parse_qualified_column(parts[0])?,
+        parse_qualified_column(parts[1])?,
+    ))
 }
 
 fn parse_qualified_column(raw: &str) -> OpenDbResult<QualifiedColumn> {
@@ -1434,7 +1500,10 @@ mod tests {
             panic!("expected SelectExpr");
         };
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0].expr, SelectExpr::Literal(Value::Int64(1))));
+        assert!(matches!(
+            items[0].expr,
+            SelectExpr::Literal(Value::Int64(1))
+        ));
     }
 
     #[test]
@@ -1443,7 +1512,10 @@ mod tests {
         let Statement::SelectExpr { items } = stmt else {
             panic!("expected SelectExpr");
         };
-        assert!(matches!(items[0].expr, SelectExpr::Function(SelectFunction::Version)));
+        assert!(matches!(
+            items[0].expr,
+            SelectExpr::Function(SelectFunction::Version)
+        ));
     }
 
     #[test]
@@ -1462,16 +1534,14 @@ mod tests {
             panic!("expected SelectAll");
         };
         assert_eq!(table, "accounts");
-        assert!(matches!(columns, SelectColumns::Explicit(ref cols) if cols == &vec!["id".to_owned(), "name".to_owned()]));
+        assert!(
+            matches!(columns, SelectColumns::Explicit(ref cols) if cols == &vec!["id".to_owned(), "name".to_owned()])
+        );
     }
 
     #[test]
     fn parses_begin_commit_rollback_in_all_synonyms() {
-        for sql in [
-            "BEGIN",
-            "begin transaction",
-            "START TRANSACTION",
-        ] {
+        for sql in ["BEGIN", "begin transaction", "START TRANSACTION"] {
             assert!(matches!(parse(sql).expect("begin"), Statement::Begin));
         }
         for sql in ["COMMIT", "commit transaction", "END"] {
@@ -1523,6 +1593,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_update_set_where_pk() {
+        let stmt = parse("UPDATE accounts SET name = 'Bob', status = 'active' WHERE id = 1")
+            .expect("update");
+        let Statement::UpdateRow {
+            table,
+            key,
+            assignments,
+        } = stmt
+        else {
+            panic!("expected UpdateRow");
+        };
+        assert_eq!(table, "accounts");
+        assert_eq!(key, "1");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].0, "name");
+        assert_eq!(assignments[1].0, "status");
+    }
+
+    #[test]
+    fn rejects_update_without_where() {
+        assert!(matches!(
+            parse("UPDATE accounts SET name = 'Bob'"),
+            Err(OpenDbError::Sql(_))
+        ));
+    }
+
+    #[test]
     fn parses_delete_from_where_primary_key_equality() {
         let stmt = parse("DELETE FROM accounts WHERE id = 1").expect("delete");
         let Statement::DeleteRow { table, key } = stmt else {
@@ -1542,10 +1639,8 @@ mod tests {
 
     #[test]
     fn parses_alter_table_add_column_with_default() {
-        let stmt = parse(
-            "ALTER TABLE accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
-        )
-        .expect("alter add");
+        let stmt = parse("ALTER TABLE accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            .expect("alter add");
         let Statement::AlterTable { table, op } = stmt else {
             panic!("expected AlterTable");
         };
@@ -1565,8 +1660,7 @@ mod tests {
 
     #[test]
     fn parses_alter_table_drop_and_rename_column() {
-        let drop_stmt =
-            parse("ALTER TABLE accounts DROP COLUMN legacy").expect("alter drop");
+        let drop_stmt = parse("ALTER TABLE accounts DROP COLUMN legacy").expect("alter drop");
         let Statement::AlterTable { op, .. } = drop_stmt else {
             panic!("expected AlterTable");
         };
@@ -1618,10 +1712,9 @@ mod tests {
 
     #[test]
     fn parses_create_index_if_not_exists_with_btree() {
-        let stmt = parse(
-            "CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING btree (name)",
-        )
-        .expect("create index");
+        let stmt =
+            parse("CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING btree (name)")
+                .expect("create index");
         let Statement::CreateIndex { table, index } = stmt else {
             panic!("expected CreateIndex");
         };
@@ -1676,8 +1769,8 @@ mod tests {
 
     #[test]
     fn parses_jsonb_literal_in_named_insert() {
-        let stmt = parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)")
-            .expect("insert");
+        let stmt =
+            parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)").expect("insert");
         let Statement::Insert {
             values, columns, ..
         } = stmt
@@ -1687,10 +1780,7 @@ mod tests {
         assert_eq!(columns, Some(vec!["id".to_owned(), "data".to_owned()]));
         assert_eq!(
             values,
-            vec![
-                Value::Int64(1),
-                Value::Text("{\"k\":\"v\"}".to_owned()),
-            ]
+            vec![Value::Int64(1), Value::Text("{\"k\":\"v\"}".to_owned()),]
         );
     }
 

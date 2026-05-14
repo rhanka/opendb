@@ -143,12 +143,12 @@ impl SqlEngine {
                     &columns,
                 )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
-            Statement::SelectExpr { items } => self
-                .select_expr(items)
-                .map(|result| PreparedQuery::Read {
+            Statement::SelectExpr { items } => {
+                self.select_expr(items).map(|result| PreparedQuery::Read {
                     result,
                     route: RouteIntent::Root,
-                }),
+                })
+            }
             Statement::AlterTable { table, op } => self.prepare_write(
                 vec![Mutation::AlterTable { table, op }],
                 "ALTER TABLE",
@@ -173,6 +173,48 @@ impl SqlEngine {
                         key: key.clone(),
                     }],
                     "DELETE 1",
+                    RouteIntent::Key {
+                        table,
+                        key: route_key_value,
+                    },
+                )
+            }
+            Statement::UpdateRow {
+                table,
+                key,
+                assignments,
+            } => {
+                let route_key_value = route_key(&table, &key);
+                // Coerce each assigned value against the declared column type
+                // before persisting, so DEFAULT NOW() / TIMESTAMP literals etc.
+                // behave consistently with INSERT.
+                let table_state = self
+                    .projection
+                    .table(&table)
+                    .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+                let mut coerced: Vec<ColumnValue> = Vec::with_capacity(assignments.len());
+                for (column_name, value) in assignments {
+                    let column = table_state
+                        .columns
+                        .iter()
+                        .find(|c| c.name == column_name)
+                        .ok_or_else(|| {
+                            OpenDbError::InvalidInput(format!(
+                                "unknown column {column_name} on table {table}"
+                            ))
+                        })?;
+                    coerced.push(ColumnValue {
+                        column: column_name,
+                        value: coerce_value(value, &column.data_type),
+                    });
+                }
+                self.prepare_write(
+                    vec![Mutation::UpdateRow {
+                        table: table.clone(),
+                        key,
+                        assignments: coerced,
+                    }],
+                    "UPDATE 1",
                     RouteIntent::Key {
                         table,
                         key: route_key_value,
@@ -344,7 +386,11 @@ impl SqlEngine {
         }
         let offset_count = offset.unwrap_or(0) as usize;
         let limit_count = limit.unwrap_or(u64::MAX) as usize;
-        let final_rows: Vec<_> = rows.into_iter().skip(offset_count).take(limit_count).collect();
+        let final_rows: Vec<_> = rows
+            .into_iter()
+            .skip(offset_count)
+            .take(limit_count)
+            .collect();
         Ok((
             QueryResult::Rows {
                 columns: column_names,
@@ -422,9 +468,7 @@ impl SqlEngine {
         let right_state = self
             .projection
             .table(&join.right)
-            .ok_or_else(|| {
-                OpenDbError::NotFound(format!("table not found: {}", join.right))
-            })?;
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", join.right)))?;
 
         let mut output_columns: Vec<String> = left_state
             .columns
@@ -465,8 +509,7 @@ impl SqlEngine {
                 }
             }
             if !matched && matches!(join.kind, crate::ast::JoinKind::Left) {
-                let projected =
-                    project_joined_row(&left_columns, left_row, &right_columns, None);
+                let projected = project_joined_row(&left_columns, left_row, &right_columns, None);
                 joined_rows.push(projected);
             }
         }
@@ -571,7 +614,9 @@ fn find_qualified_column_position(
         .map(|(i, _)| i)
         .collect();
     if matches.is_empty() {
-        return Err(OpenDbError::Sql(format!("column {column} not in projection")));
+        return Err(OpenDbError::Sql(format!(
+            "column {column} not in projection"
+        )));
     }
     if matches.len() > 1 {
         return Err(OpenDbError::Sql(format!(
@@ -1346,12 +1391,17 @@ mod tests {
         let mut engine = SqlEngine::default();
         engine
             .execute(
-                parse("CREATE TABLE t (id INT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}'::jsonb)")
-                    .expect("parse"),
+                parse(
+                    "CREATE TABLE t (id INT PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}'::jsonb)",
+                )
+                .expect("parse"),
             )
             .expect("create");
         engine
-            .execute(parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)").expect("parse"))
+            .execute(
+                parse("INSERT INTO t (id, data) VALUES (1, '{\"k\":\"v\"}'::jsonb)")
+                    .expect("parse"),
+            )
             .expect("insert");
         engine
             .execute(parse("INSERT INTO t (id) VALUES (2)").expect("parse"))
@@ -1394,7 +1444,9 @@ mod tests {
     #[test]
     fn select_literal_returns_single_row() {
         let mut engine = SqlEngine::default();
-        let result = engine.execute(parse("SELECT 1").expect("parse")).expect("select");
+        let result = engine
+            .execute(parse("SELECT 1").expect("parse"))
+            .expect("select");
         let QueryResult::Rows { columns, rows, .. } = result else {
             panic!("expected Rows");
         };
@@ -1435,10 +1487,16 @@ mod tests {
     fn select_explicit_projection_returns_only_listed_columns() {
         let mut engine = SqlEngine::default();
         engine
-            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, label TEXT)").expect("parse"))
+            .execute(
+                parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, label TEXT)")
+                    .expect("parse"),
+            )
             .expect("create");
         engine
-            .execute(parse("INSERT INTO accounts (id, name, label) VALUES (1, 'Ada', 'L')").expect("parse"))
+            .execute(
+                parse("INSERT INTO accounts (id, name, label) VALUES (1, 'Ada', 'L')")
+                    .expect("parse"),
+            )
             .expect("insert");
         let result = engine
             .execute(parse("SELECT id, name FROM accounts").expect("parse"))
@@ -1495,7 +1553,9 @@ mod tests {
             .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
             .expect("create");
 
-        let begin = engine.execute(parse("BEGIN").expect("parse")).expect("begin");
+        let begin = engine
+            .execute(parse("BEGIN").expect("parse"))
+            .expect("begin");
         assert_eq!(
             begin,
             QueryResult::Command {
@@ -1573,10 +1633,8 @@ mod tests {
             .expect("insert b");
         let result = engine
             .execute(
-                parse(
-                    "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id ASC",
-                )
-                .expect("parse"),
+                parse("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id ASC")
+                    .expect("parse"),
             )
             .expect("left join");
         let QueryResult::Rows { rows, .. } = result else {
@@ -1597,7 +1655,10 @@ mod tests {
             .expect("create");
         for i in 1..=5 {
             engine
-                .execute(parse(&format!("INSERT INTO t (id, name) VALUES ({i}, 'r{i}')")).expect("parse"))
+                .execute(
+                    parse(&format!("INSERT INTO t (id, name) VALUES ({i}, 'r{i}')"))
+                        .expect("parse"),
+                )
                 .expect("insert");
         }
         let result = engine
@@ -1618,6 +1679,66 @@ mod tests {
         };
         assert_eq!(first_id, 4);
         assert_eq!(second_id, 3);
+    }
+
+    #[test]
+    fn update_row_changes_assigned_columns() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(
+                parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, status TEXT)")
+                    .expect("parse"),
+            )
+            .expect("create");
+        engine
+            .execute(
+                parse("INSERT INTO accounts (id, name, status) VALUES (1, 'Ada', 'pending')")
+                    .expect("parse"),
+            )
+            .expect("insert");
+        let tag = engine
+            .execute(
+                parse("UPDATE accounts SET name = 'Bob', status = 'active' WHERE id = 1")
+                    .expect("parse"),
+            )
+            .expect("update");
+        assert_eq!(
+            tag,
+            QueryResult::Command {
+                tag: "UPDATE 1".to_owned()
+            }
+        );
+        let result = engine
+            .execute(parse("SELECT * FROM accounts WHERE id = 1").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows[0][1], Value::Text("Bob".to_owned()));
+        assert_eq!(rows[0][2], Value::Text("active".to_owned()));
+    }
+
+    #[test]
+    fn update_rejects_change_to_primary_key() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO t (id, name) VALUES (1, 'a')").expect("parse"))
+            .expect("insert");
+        let result = engine.execute(parse("UPDATE t SET id = 2 WHERE id = 1").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn update_rejects_missing_row() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .expect("create");
+        let result = engine.execute(parse("UPDATE t SET name = 'b' WHERE id = 99").expect("parse"));
+        assert!(matches!(result, Err(OpenDbError::NotFound(_))));
     }
 
     #[test]
@@ -1658,10 +1779,8 @@ mod tests {
             .expect("insert");
         engine
             .execute(
-                parse(
-                    "ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
-                )
-                .expect("parse"),
+                parse("ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                    .expect("parse"),
             )
             .expect("alter");
         engine
@@ -1687,10 +1806,8 @@ mod tests {
             .expect("create");
         let result = engine
             .execute(
-                parse(
-                    "CREATE INDEX IF NOT EXISTS t_name_idx ON t USING btree (name)",
-                )
-                .expect("parse"),
+                parse("CREATE INDEX IF NOT EXISTS t_name_idx ON t USING btree (name)")
+                    .expect("parse"),
             )
             .expect("create index");
         assert_eq!(
@@ -1708,12 +1825,7 @@ mod tests {
             .execute(parse("CREATE TABLE t (id INT PRIMARY KEY)").expect("parse"))
             .expect("create");
         engine
-            .execute(
-                parse(
-                    "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'x'",
-                )
-                .expect("parse"),
-            )
+            .execute(parse("ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'x'").expect("parse"))
             .expect("alter");
         // Second ALTER would fail with "already exists", but the DO block
         // marked WHEN duplicate_object swallows the error.

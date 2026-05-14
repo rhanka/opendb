@@ -145,6 +145,11 @@ pub enum Mutation {
         table: String,
         op: AlterTableOp,
     },
+    UpdateRow {
+        table: String,
+        key: String,
+        assignments: Vec<ColumnValue>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -295,10 +300,7 @@ mod tests {
         let cases = vec![
             Mutation::AlterTable {
                 table: "users".to_owned(),
-                op: AlterTableOp::AddColumn(ColumnDefinition::new(
-                    "email",
-                    ColumnType::Text,
-                )),
+                op: AlterTableOp::AddColumn(ColumnDefinition::new("email", ColumnType::Text)),
             },
             Mutation::AlterTable {
                 table: "users".to_owned(),

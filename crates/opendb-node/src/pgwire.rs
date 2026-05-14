@@ -162,12 +162,9 @@ async fn handle_bind(
     let _ = cursor;
 
     let sql_substituted = substitute_parameters(&statement.sql, &values, &formats)?;
-    session.portals.insert(
-        portal_name,
-        BoundPortal {
-            sql_substituted,
-        },
-    );
+    session
+        .portals
+        .insert(portal_name, BoundPortal { sql_substituted });
     write_message(stream, b'2', &[]).await
 }
 

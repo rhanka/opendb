@@ -174,10 +174,9 @@ impl RowProjection {
                     }
                     // Enforce UNIQUE / FK constraints before insertion.
                     {
-                        let table_ref = self
-                            .tables
-                            .get(table)
-                            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+                        let table_ref = self.tables.get(table).ok_or_else(|| {
+                            OpenDbError::NotFound(format!("table not found: {table}"))
+                        })?;
                         self.enforce_unique_constraints(table_ref, key, &row)?;
                         self.enforce_fk_constraints(table_ref, &row)?;
                     }
@@ -195,8 +194,79 @@ impl RowProjection {
                 Mutation::DeleteRow { table, key } => {
                     self.apply_delete_row(table, key)?;
                 }
+                Mutation::UpdateRow {
+                    table,
+                    key,
+                    assignments,
+                } => {
+                    self.apply_update_row(table, key, assignments)?;
+                }
             }
         }
+        Ok(())
+    }
+
+    fn apply_update_row(
+        &mut self,
+        table: &str,
+        key: &str,
+        assignments: &[crate::commit_stream::ColumnValue],
+    ) -> OpenDbResult<()> {
+        let updated_row = {
+            let table_state = self
+                .tables
+                .get(table)
+                .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+            let existing =
+                table_state.rows.get(key).cloned().ok_or_else(|| {
+                    OpenDbError::NotFound(format!("row not found: {table}/{key}"))
+                })?;
+            let mut next = existing;
+            let primary_key_name = table_state.primary_key_column().map(|c| c.name.clone());
+            for assignment in assignments {
+                let column = table_state
+                    .columns
+                    .iter()
+                    .find(|c| c.name == assignment.column)
+                    .ok_or_else(|| {
+                        OpenDbError::InvalidInput(format!(
+                            "unknown column {} on table {table}",
+                            assignment.column
+                        ))
+                    })?;
+                if Some(&column.name) == primary_key_name.as_ref() {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "UPDATE cannot change primary key column {}",
+                        column.name
+                    )));
+                }
+                if !column.nullable && matches!(assignment.value, Value::Null) {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "column {} on table {table} is NOT NULL",
+                        column.name
+                    )));
+                }
+                if !matches!(assignment.value, Value::Null)
+                    && !value_matches_type(&assignment.value, &column.data_type)
+                {
+                    return Err(OpenDbError::InvalidInput(format!(
+                        "value for column {} on table {table} does not match {:?}",
+                        column.name, column.data_type
+                    )));
+                }
+                next.insert(column.name.clone(), assignment.value.clone());
+            }
+            next
+        };
+        // Re-run UNIQUE / FK enforcement on the candidate row.
+        let table_ref = self
+            .tables
+            .get(table)
+            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+        self.enforce_unique_constraints(table_ref, key, &updated_row)?;
+        self.enforce_fk_constraints(table_ref, &updated_row)?;
+        let table_state = self.tables.get_mut(table).expect("table existed above");
+        table_state.rows.insert(key.to_owned(), updated_row);
         Ok(())
     }
 
@@ -206,9 +276,11 @@ impl RowProjection {
                 .tables
                 .get(table)
                 .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
-            table_state.rows.get(key).cloned().ok_or_else(|| {
-                OpenDbError::NotFound(format!("row not found: {table}/{key}"))
-            })?
+            table_state
+                .rows
+                .get(key)
+                .cloned()
+                .ok_or_else(|| OpenDbError::NotFound(format!("row not found: {table}/{key}")))?
         };
         // Walk every other table looking for FKs that point at this table.
         // Sprint 9 restricts cascades to one hop and references that map onto
@@ -294,10 +366,9 @@ impl RowProjection {
     }
 
     fn apply_set_null(&mut self, dependent: &FkDependent) -> OpenDbResult<()> {
-        let table_state = self
-            .tables
-            .get_mut(&dependent.table)
-            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", dependent.table)))?;
+        let table_state = self.tables.get_mut(&dependent.table).ok_or_else(|| {
+            OpenDbError::NotFound(format!("table not found: {}", dependent.table))
+        })?;
         for column_name in &dependent.columns {
             let column_def = table_state
                 .columns
@@ -325,10 +396,9 @@ impl RowProjection {
     }
 
     fn apply_set_default(&mut self, dependent: &FkDependent) -> OpenDbResult<()> {
-        let table_state = self
-            .tables
-            .get_mut(&dependent.table)
-            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", dependent.table)))?;
+        let table_state = self.tables.get_mut(&dependent.table).ok_or_else(|| {
+            OpenDbError::NotFound(format!("table not found: {}", dependent.table))
+        })?;
         let mut updates: Vec<(String, Value)> = Vec::new();
         for column_name in &dependent.columns {
             let column_def = table_state
@@ -416,7 +486,10 @@ impl RowProjection {
                 .iter()
                 .map(|column| row.get(column).unwrap_or(&Value::Null))
                 .collect();
-            if child_values.iter().any(|value| matches!(value, Value::Null)) {
+            if child_values
+                .iter()
+                .any(|value| matches!(value, Value::Null))
+            {
                 continue;
             }
             let Some(parent_table) = self.tables.get(references_table) else {
@@ -480,7 +553,8 @@ impl RowProjection {
                 };
                 table_state.columns.push(column.clone());
                 for row in table_state.rows.values_mut() {
-                    row.entry(column.name.clone()).or_insert_with(|| backfill.clone());
+                    row.entry(column.name.clone())
+                        .or_insert_with(|| backfill.clone());
                 }
             }
             AlterTableOp::DropColumn { column } => {
@@ -1052,10 +1126,9 @@ mod tests {
             alter_record(
                 3,
                 AlterTableOp::AddColumn(
-                    ColumnDefinition::new("status", ColumnType::Text)
-                        .with_default(crate::commit_stream::DefaultExpr::Const(
-                            Value::Text("active".to_owned()),
-                        )),
+                    ColumnDefinition::new("status", ColumnType::Text).with_default(
+                        crate::commit_stream::DefaultExpr::Const(Value::Text("active".to_owned())),
+                    ),
                 ),
             ),
         ])
@@ -1124,7 +1197,10 @@ mod tests {
         assert!(accounts.columns.iter().any(|c| c.name == "display_name"));
         assert!(accounts.columns.iter().all(|c| c.name != "name"));
         assert_eq!(
-            accounts.rows.get("1").and_then(|row| row.get("display_name")),
+            accounts
+                .rows
+                .get("1")
+                .and_then(|row| row.get("display_name")),
             Some(&Value::Text("Ada".to_owned()))
         );
     }
