@@ -1194,33 +1194,74 @@ fn parse_order_by(text: &str) -> OpenDbResult<OrderBy> {
 }
 
 fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
-    let equals_positions = equality_positions_outside_quotes(raw)?;
-    let Some(equals_pos) = equals_positions.first().copied() else {
-        return Err(OpenDbError::Sql(
-            "SELECT WHERE only supports equality predicates".to_owned(),
-        ));
-    };
-    if equals_positions.len() != 1 {
-        return Err(OpenDbError::Sql(
-            "SELECT WHERE only supports one equality predicate".to_owned(),
-        ));
-    }
-    let column = raw[..equals_pos].trim();
-    let value = raw[equals_pos + 1..].trim();
-    if column.is_empty() || value.is_empty() {
-        return Err(OpenDbError::Sql(
-            "SELECT WHERE requires column and literal".to_owned(),
-        ));
-    }
-    if column.split_whitespace().count() != 1 {
-        return Err(OpenDbError::Sql(
-            "SELECT WHERE only supports a single column".to_owned(),
-        ));
+    // Sprint 14: support `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` as operators.
+    parse_predicate_with_op(raw)
+}
+
+/// Sprint 14: parse a single predicate with an explicit comparison
+/// operator (`=`, `!=`, `<`, `<=`, `>`, `>=`). Used by composite WHERE
+/// parsing — single-equality predicates still flow through
+/// `parse_predicate` for backwards compatibility.
+fn parse_predicate_with_op(raw: &str) -> OpenDbResult<Predicate> {
+    let (op, op_pos, op_len) = find_first_comparison_op(raw)?;
+    let column = raw[..op_pos].trim();
+    let value_text = raw[op_pos + op_len..].trim();
+    if column.is_empty() || value_text.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "WHERE predicate requires column and literal: {raw}"
+        )));
     }
     Ok(Predicate {
         column: unqualified_column_name(column),
-        value: parse_value(value)?,
+        value: parse_value(value_text)?,
+        op,
     })
+}
+
+fn find_first_comparison_op(raw: &str) -> OpenDbResult<(crate::ast::WhereOp, usize, usize)> {
+    use crate::ast::WhereOp;
+    let bytes = raw.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote {
+            // Order matters: longer operators first.
+            if i + 2 <= bytes.len() {
+                let two = &bytes[i..i + 2];
+                if two == b"!=" {
+                    return Ok((WhereOp::NotEq, i, 2));
+                }
+                if two == b"<=" {
+                    return Ok((WhereOp::Lte, i, 2));
+                }
+                if two == b">=" {
+                    return Ok((WhereOp::Gte, i, 2));
+                }
+                if two == b"<>" {
+                    return Ok((WhereOp::NotEq, i, 2));
+                }
+            }
+            if c == b'=' {
+                return Ok((WhereOp::Eq, i, 1));
+            }
+            if c == b'<' {
+                return Ok((WhereOp::Lt, i, 1));
+            }
+            if c == b'>' {
+                return Ok((WhereOp::Gt, i, 1));
+            }
+        }
+        i += 1;
+    }
+    Err(OpenDbError::Sql(format!(
+        "WHERE predicate has no comparison operator: {raw}"
+    )))
 }
 
 fn equality_positions_outside_quotes(raw: &str) -> OpenDbResult<Vec<usize>> {
@@ -1355,14 +1396,39 @@ mod tests {
 
     #[test]
     fn rejects_malformed_select_where_at_parse_time() {
+        // Sprint 14: `>` is now a real comparison operator; the legacy assertion
+        // was that `>` was unsupported. The new contract: the parser parses it,
+        // executor enforces semantics.
         assert!(matches!(
             parse("SELECT * FROM accounts WHERE id > 1"),
-            Err(OpenDbError::Sql(_))
+            Ok(Statement::SelectAll { .. })
         ));
         assert!(matches!(
             parse("SELECT * FROM accounts WHERE id = "),
             Err(OpenDbError::Sql(_))
         ));
+    }
+
+    #[test]
+    fn parses_comparison_operators_in_where() {
+        for (sql, op) in [
+            ("SELECT * FROM t WHERE c = 1", crate::ast::WhereOp::Eq),
+            ("SELECT * FROM t WHERE c != 1", crate::ast::WhereOp::NotEq),
+            ("SELECT * FROM t WHERE c <> 1", crate::ast::WhereOp::NotEq),
+            ("SELECT * FROM t WHERE c < 1", crate::ast::WhereOp::Lt),
+            ("SELECT * FROM t WHERE c <= 1", crate::ast::WhereOp::Lte),
+            ("SELECT * FROM t WHERE c > 1", crate::ast::WhereOp::Gt),
+            ("SELECT * FROM t WHERE c >= 1", crate::ast::WhereOp::Gte),
+        ] {
+            let parsed = parse(sql).expect(sql);
+            let Statement::SelectAll {
+                predicate: Some(p), ..
+            } = parsed
+            else {
+                panic!("{sql} should produce a predicate");
+            };
+            assert_eq!(p.op, op, "{sql}");
+        }
     }
 
     #[test]
@@ -1393,20 +1459,17 @@ mod tests {
             parse("SELECT * FROM accounts WHERE id = 1").expect("select where"),
             Statement::select_all_legacy(
                 "accounts".to_owned(),
-                Some(Predicate {
-                    column: "id".to_owned(),
-                    value: Value::Int64(1),
-                }),
+                Some(Predicate::eq("id".to_owned(), Value::Int64(1))),
             )
         );
         assert_eq!(
             parse("select * from accounts where name = 'Ada'").expect("select where text"),
             Statement::select_all_legacy(
                 "accounts".to_owned(),
-                Some(Predicate {
-                    column: "name".to_owned(),
-                    value: Value::Text("Ada".to_owned()),
-                }),
+                Some(Predicate::eq(
+                    "name".to_owned(),
+                    Value::Text("Ada".to_owned()),
+                )),
             )
         );
     }
@@ -1799,10 +1862,10 @@ mod tests {
             parse("SELECT * FROM sessions WHERE token = 'a=b'").expect("select where text pk"),
             Statement::select_all_legacy(
                 "sessions".to_owned(),
-                Some(Predicate {
-                    column: "token".to_owned(),
-                    value: Value::Text("a=b".to_owned()),
-                }),
+                Some(Predicate::eq(
+                    "token".to_owned(),
+                    Value::Text("a=b".to_owned()),
+                )),
             )
         );
     }

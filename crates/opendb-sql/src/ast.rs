@@ -14,6 +14,37 @@ use opendb_storage::commit_stream::{
 pub struct Predicate {
     pub column: String,
     pub value: Value,
+    /// Sprint 14: comparison operator. Defaults to `Eq` to keep legacy
+    /// `WHERE col = lit` callers unchanged.
+    #[doc(hidden)]
+    pub op: WhereOp,
+}
+
+impl Predicate {
+    pub fn eq(column: String, value: Value) -> Self {
+        Self {
+            column,
+            value,
+            op: WhereOp::Eq,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WhereOp {
+    Eq,
+    NotEq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// Sprint 14: composite WHERE clause joined by AND. A single-element vector
+/// is the common case (legacy `WHERE col = lit`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WhereClause {
+    pub conjunction: Vec<Predicate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
