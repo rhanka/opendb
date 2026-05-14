@@ -1,6 +1,6 @@
 use crate::ast::{
     JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate, OrderBy, OrderDirection, Predicate,
-    Statement,
+    SelectColumns, SelectExpr, SelectExprItem, SelectFunction, Statement,
 };
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
@@ -41,6 +41,8 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         parse_insert(normalized)
     } else if upper.starts_with("SELECT * FROM ") {
         parse_select_all(normalized)
+    } else if upper.starts_with("SELECT ") {
+        parse_select_with_projection(normalized)
     } else if upper.starts_with("ALTER TABLE ") {
         parse_alter_table(normalized)
     } else if upper.starts_with("DELETE FROM ") {
@@ -745,7 +747,160 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
         order_by,
         limit,
         offset,
+        columns: SelectColumns::Star,
     })
+}
+
+/// Sprint 12.1: parser for `SELECT col1, col2 FROM t [...]` and
+/// `SELECT <expr> [AS alias] [, ...]` (no FROM, driver-level probes).
+fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
+    let rest = strip_keyword_prefix(sql, "SELECT ")
+        .ok_or_else(|| OpenDbError::Sql("invalid SELECT".to_owned()))?
+        .trim();
+    let upper_rest = rest.to_ascii_uppercase();
+    // Detect optional `FROM <table>` boundary while respecting quoted strings.
+    let from_pos = find_keyword_outside_quotes(rest, " FROM ");
+    if let Some(from_pos) = from_pos {
+        let columns_text = rest[..from_pos].trim();
+        let after_from = rest[from_pos + " FROM ".len()..].trim();
+        let columns = split_top_level_commas(columns_text)?
+            .into_iter()
+            .map(|token| {
+                let trimmed = token.trim();
+                if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+                    Err(OpenDbError::Sql(format!(
+                        "invalid SELECT column: {trimmed}"
+                    )))
+                } else {
+                    Ok(trimmed.to_owned())
+                }
+            })
+            .collect::<OpenDbResult<Vec<String>>>()?;
+        if columns.is_empty() {
+            return Err(OpenDbError::Sql(
+                "SELECT projection must not be empty".to_owned(),
+            ));
+        }
+        // Reuse the regular SelectAll plumbing: parse FROM/WHERE/ORDER BY/LIMIT/OFFSET
+        // with the existing helper. We rebuild a normalised string `SELECT * FROM <rest>` so
+        // the existing parser handles the WHERE/ORDER BY/LIMIT/OFFSET grammar.
+        let synthetic = format!("SELECT * FROM {after_from}");
+        let parsed = parse_select_all(&synthetic)?;
+        if let Statement::SelectAll {
+            table,
+            predicate,
+            order_by,
+            limit,
+            offset,
+            ..
+        } = parsed
+        {
+            return Ok(Statement::SelectAll {
+                table,
+                predicate,
+                order_by,
+                limit,
+                offset,
+                columns: SelectColumns::Explicit(columns),
+            });
+        }
+        return Err(OpenDbError::Sql(
+            "internal: SELECT projection inner parse mismatch".to_owned(),
+        ));
+    }
+
+    // No FROM → SELECT <expr> [AS alias] [, ...]
+    let items = split_top_level_commas(rest)?
+        .into_iter()
+        .map(parse_select_expr_item)
+        .collect::<OpenDbResult<Vec<SelectExprItem>>>()?;
+    if items.is_empty() {
+        return Err(OpenDbError::Sql(
+            "SELECT requires at least one expression".to_owned(),
+        ));
+    }
+    let _ = upper_rest; // suppress dead-code warning when items branch taken
+    Ok(Statement::SelectExpr { items })
+}
+
+fn parse_select_expr_item(raw: &str) -> OpenDbResult<SelectExprItem> {
+    let trimmed = raw.trim();
+    // Optional `<expr> AS <alias>` or `<expr> <alias>` (Sprint 12.1 only
+    // supports the AS form for clarity).
+    let upper = trimmed.to_ascii_uppercase();
+    let (expr_text, alias) = if let Some(as_pos) = upper.find(" AS ") {
+        let expr_text = trimmed[..as_pos].trim();
+        let alias = trimmed[as_pos + 4..].trim().to_owned();
+        if alias.is_empty() {
+            return Err(OpenDbError::Sql("alias after AS is required".to_owned()));
+        }
+        (expr_text, Some(alias))
+    } else {
+        (trimmed, None)
+    };
+    let expr = parse_select_expr(expr_text)?;
+    Ok(SelectExprItem { expr, alias })
+}
+
+fn parse_select_expr(raw: &str) -> OpenDbResult<SelectExpr> {
+    let upper = raw.to_ascii_uppercase();
+    if upper == "VERSION()" {
+        return Ok(SelectExpr::Function(SelectFunction::Version));
+    }
+    if upper == "NOW()" {
+        return Ok(SelectExpr::Function(SelectFunction::Now));
+    }
+    if upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_TIMESTAMP()" {
+        return Ok(SelectExpr::Function(SelectFunction::CurrentTimestamp));
+    }
+    // Fallback: any literal accepted by parse_value (int / float / 'text' /
+    // TRUE / FALSE / NULL).
+    let value = parse_value(raw)?;
+    Ok(SelectExpr::Literal(value))
+}
+
+/// Split a comma-separated list at the top level (respecting quoted text
+/// and balanced parentheses).
+fn split_top_level_commas(raw: &str) -> OpenDbResult<Vec<&str>> {
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut paren_depth: i32 = 0;
+    for (index, ch) in raw.char_indices() {
+        match ch {
+            '\'' => in_quote = !in_quote,
+            '(' if !in_quote => paren_depth += 1,
+            ')' if !in_quote => paren_depth -= 1,
+            ',' if !in_quote && paren_depth == 0 => {
+                tokens.push(raw[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_quote {
+        return Err(OpenDbError::Sql("unterminated quoted literal".to_owned()));
+    }
+    tokens.push(raw[start..].trim());
+    Ok(tokens)
+}
+
+fn find_keyword_outside_quotes(raw: &str, keyword: &str) -> Option<usize> {
+    let upper = raw.to_ascii_uppercase();
+    let lowercase_bytes = raw.as_bytes();
+    let mut in_quote = false;
+    let mut index = 0;
+    while index + keyword.len() <= upper.len() {
+        let ch = lowercase_bytes[index];
+        if ch == b'\'' {
+            in_quote = !in_quote;
+        }
+        if !in_quote && upper[index..].starts_with(keyword) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
@@ -1259,6 +1414,44 @@ mod tests {
             values,
             vec![Value::Null, Value::Bool(true), Value::Bool(false)]
         );
+    }
+
+    #[test]
+    fn parses_select_literal_without_from() {
+        let stmt = parse("SELECT 1").expect("select 1");
+        let Statement::SelectExpr { items } = stmt else {
+            panic!("expected SelectExpr");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].expr, SelectExpr::Literal(Value::Int64(1))));
+    }
+
+    #[test]
+    fn parses_select_version_function() {
+        let stmt = parse("SELECT version()").expect("select version");
+        let Statement::SelectExpr { items } = stmt else {
+            panic!("expected SelectExpr");
+        };
+        assert!(matches!(items[0].expr, SelectExpr::Function(SelectFunction::Version)));
+    }
+
+    #[test]
+    fn parses_select_with_alias() {
+        let stmt = parse("SELECT 1 AS one").expect("select 1 as one");
+        let Statement::SelectExpr { items } = stmt else {
+            panic!("expected SelectExpr");
+        };
+        assert_eq!(items[0].alias.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn parses_explicit_column_projection() {
+        let stmt = parse("SELECT id, name FROM accounts").expect("select projection");
+        let Statement::SelectAll { columns, table, .. } = stmt else {
+            panic!("expected SelectAll");
+        };
+        assert_eq!(table, "accounts");
+        assert!(matches!(columns, SelectColumns::Explicit(ref cols) if cols == &vec!["id".to_owned(), "name".to_owned()]));
     }
 
     #[test]

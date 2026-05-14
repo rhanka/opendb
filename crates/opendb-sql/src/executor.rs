@@ -132,6 +132,7 @@ impl SqlEngine {
                 order_by,
                 limit,
                 offset,
+                columns,
             } => self
                 .select_all(
                     &table,
@@ -139,8 +140,15 @@ impl SqlEngine {
                     order_by.as_ref(),
                     limit,
                     offset,
+                    &columns,
                 )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
+            Statement::SelectExpr { items } => self
+                .select_expr(items)
+                .map(|result| PreparedQuery::Read {
+                    result,
+                    route: RouteIntent::Root,
+                }),
             Statement::AlterTable { table, op } => self.prepare_write(
                 vec![Mutation::AlterTable { table, op }],
                 "ALTER TABLE",
@@ -249,12 +257,26 @@ impl SqlEngine {
         order_by: Option<&crate::ast::OrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
+        columns: &crate::ast::SelectColumns,
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let table_state = self
             .projection
             .table(table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
-        let column_names = table_state.column_names();
+        let all_columns = table_state.column_names();
+        let column_names = match columns {
+            crate::ast::SelectColumns::Star => all_columns.clone(),
+            crate::ast::SelectColumns::Explicit(requested) => {
+                for name in requested {
+                    if !all_columns.iter().any(|column| column == name) {
+                        return Err(OpenDbError::Sql(format!(
+                            "column {name} not in table {table}"
+                        )));
+                    }
+                }
+                requested.clone()
+            }
+        };
         let (rows, route) = match predicate {
             Some(predicate) => {
                 let primary_key = table_state.primary_key_column().ok_or_else(|| {
@@ -335,6 +357,54 @@ impl SqlEngine {
 }
 
 impl SqlEngine {
+    fn select_expr(&self, items: Vec<crate::ast::SelectExprItem>) -> OpenDbResult<QueryResult> {
+        use crate::ast::{SelectExpr, SelectFunction};
+        let mut column_names = Vec::with_capacity(items.len());
+        let mut row: Vec<Value> = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            let (value, default_name) = match item.expr {
+                SelectExpr::Literal(value) => {
+                    let name = match &value {
+                        Value::Int64(_) => "?column?".to_string(),
+                        Value::Text(_) => "?column?".to_string(),
+                        Value::Bool(_) => "?column?".to_string(),
+                        Value::Float64(_) => "?column?".to_string(),
+                        Value::Timestamp(_) => "?column?".to_string(),
+                        Value::Json(_) => "?column?".to_string(),
+                        Value::Null => "?column?".to_string(),
+                    };
+                    (value, name)
+                }
+                SelectExpr::Function(SelectFunction::Version) => (
+                    Value::Text("opendb-node 0.1.0 on PostgreSQL 16.0 compatible".to_owned()),
+                    "version".to_owned(),
+                ),
+                SelectExpr::Function(SelectFunction::Now) => (
+                    Value::Timestamp((self.next_tx + 1) as i64),
+                    "now".to_owned(),
+                ),
+                SelectExpr::Function(SelectFunction::CurrentTimestamp) => (
+                    Value::Timestamp((self.next_tx + 1) as i64),
+                    "current_timestamp".to_owned(),
+                ),
+            };
+            let name = item.alias.unwrap_or_else(|| {
+                if default_name == "?column?" {
+                    format!("?column?_{index}")
+                } else {
+                    default_name
+                }
+            });
+            column_names.push(name);
+            row.push(value);
+        }
+        Ok(QueryResult::Rows {
+            columns: column_names,
+            column_types: Vec::new(),
+            rows: vec![row],
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn select_joined(
         &self,
@@ -566,12 +636,37 @@ fn coerce_value(value: Value, target: &ColumnType) -> Value {
     match (value, target) {
         (Value::Int64(v), ColumnType::Float64) => Value::Float64(v as f64),
         (Value::Int64(v), ColumnType::Timestamp) => Value::Timestamp(v),
+        (Value::Text(text), ColumnType::Timestamp) => match parse_text_to_timestamp(&text) {
+            Some(micros) => Value::Timestamp(micros),
+            None => Value::Text(text),
+        },
         (Value::Text(text), ColumnType::Json) => match serde_json::from_str(&text) {
             Ok(json) => Value::Json(json),
             Err(_) => Value::Text(text),
         },
         (other, _) => other,
     }
+}
+
+/// Sprint 12.1: accept ISO-8601 (RFC 3339) and PostgreSQL
+/// `YYYY-MM-DD HH:MM:SS[.uuuuuu]` text literals as `TIMESTAMP` values.
+/// Returns microseconds since the Unix epoch (UTC, no timezone).
+fn parse_text_to_timestamp(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&chrono::Utc).timestamp_micros());
+    }
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
+            return Some(naive.and_utc().timestamp_micros());
+        }
+    }
+    None
 }
 
 fn materialize_insert_values(
@@ -1294,6 +1389,103 @@ mod tests {
             parse("INSERT INTO t (id, data) VALUES (1, '{not json}'::jsonb)").expect("parse"),
         );
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn select_literal_returns_single_row() {
+        let mut engine = SqlEngine::default();
+        let result = engine.execute(parse("SELECT 1").expect("parse")).expect("select");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(1));
+        assert_eq!(columns.len(), 1);
+    }
+
+    #[test]
+    fn select_version_returns_canonical_string() {
+        let mut engine = SqlEngine::default();
+        let result = engine
+            .execute(parse("SELECT version() AS v").expect("parse"))
+            .expect("select version");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["v"]);
+        let Value::Text(text) = &rows[0][0] else {
+            panic!("expected Text");
+        };
+        assert!(text.contains("opendb-node"));
+    }
+
+    #[test]
+    fn select_current_timestamp_returns_timestamp() {
+        let mut engine = SqlEngine::default();
+        let result = engine
+            .execute(parse("SELECT current_timestamp").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert!(matches!(rows[0][0], Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn select_explicit_projection_returns_only_listed_columns() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, label TEXT)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(parse("INSERT INTO accounts (id, name, label) VALUES (1, 'Ada', 'L')").expect("parse"))
+            .expect("insert");
+        let result = engine
+            .execute(parse("SELECT id, name FROM accounts").expect("parse"))
+            .expect("select");
+        let QueryResult::Rows { columns, rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(rows[0].len(), 2);
+    }
+
+    #[test]
+    fn insert_coerces_iso_8601_timestamp_literal() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(
+                parse("INSERT INTO t (id, ts) VALUES (1, '2026-05-13T00:00:00Z')").expect("parse"),
+            )
+            .expect("insert iso");
+        let last = engine.commits().last().expect("commit");
+        let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let ts = values.iter().find(|cv| cv.column == "ts").expect("ts");
+        assert!(matches!(ts.value, Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn insert_coerces_postgres_timestamp_literal() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)").expect("parse"))
+            .expect("create");
+        engine
+            .execute(
+                parse("INSERT INTO t (id, ts) VALUES (1, '2026-05-13 00:00:00')").expect("parse"),
+            )
+            .expect("insert pg");
+        let last = engine.commits().last().expect("commit");
+        let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
+            panic!("expected InsertRow");
+        };
+        let ts = values.iter().find(|cv| cv.column == "ts").expect("ts");
+        assert!(matches!(ts.value, Value::Timestamp(_)));
     }
 
     #[test]

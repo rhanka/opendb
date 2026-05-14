@@ -48,6 +48,11 @@ pub enum Statement {
         limit: Option<u64>,
         #[doc = "Sprint 10: optional OFFSET clause."]
         offset: Option<u64>,
+        #[doc = "Sprint 12.1: explicit column projection (`SELECT a, b FROM t`)."]
+        columns: SelectColumns,
+    },
+    SelectExpr {
+        items: Vec<SelectExprItem>,
     },
     AlterTable {
         table: String,
@@ -106,12 +111,38 @@ pub struct JoinedOrderBy {
     pub direction: OrderDirection,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectColumns {
+    Star,
+    Explicit(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectExprItem {
+    pub expr: SelectExpr,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectExpr {
+    Literal(Value),
+    Function(SelectFunction),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectFunction {
+    Version,
+    Now,
+    CurrentTimestamp,
+}
+
 impl Statement {
     pub fn is_read(&self) -> bool {
         matches!(
             self,
             Self::SelectAll { .. }
                 | Self::Select { .. }
+                | Self::SelectExpr { .. }
                 | Self::Begin
                 | Self::Commit
                 | Self::Rollback
@@ -128,6 +159,7 @@ impl Statement {
             order_by: None,
             limit: None,
             offset: None,
+            columns: SelectColumns::Star,
         }
     }
 }
