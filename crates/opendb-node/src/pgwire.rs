@@ -3,12 +3,28 @@ use anyhow::{Context, bail};
 use opendb_common::OpenDbError;
 use opendb_sql::{ast::QueryResult, parser::parse};
 use opendb_storage::commit_stream::Value;
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
+
+#[derive(Clone, Debug, Default)]
+struct ExtendedSession {
+    statements: HashMap<String, PreparedStatement>,
+    portals: HashMap<String, BoundPortal>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedStatement {
+    sql: String,
+}
+
+#[derive(Clone, Debug)]
+struct BoundPortal {
+    sql_substituted: String,
+}
 
 const SSL_REQUEST_CODE: i32 = 80877103;
 const PROTOCOL_VERSION_3: i32 = 196608;
@@ -50,6 +66,7 @@ async fn handle_connection(
 
     write_startup_ok(&mut stream).await?;
 
+    let mut session = ExtendedSession::default();
     loop {
         let Some((tag, payload)) = read_tagged_frame(&mut stream).await? else {
             return Ok(());
@@ -60,6 +77,15 @@ async fn handle_connection(
                 let sql = cstring_payload(&payload)?;
                 execute_simple_query(&mut stream, &database, sql).await?;
             }
+            b'P' => handle_parse(&mut stream, &mut session, &payload).await?,
+            b'B' => handle_bind(&mut stream, &mut session, &payload).await?,
+            b'D' => handle_describe(&mut stream, &session, &payload).await?,
+            b'E' => handle_execute(&mut stream, &database, &session, &payload).await?,
+            b'C' => handle_close(&mut stream, &mut session, &payload).await?,
+            b'H' => {
+                // Flush is a no-op at this layer; flush happens after every write.
+            }
+            b'S' => write_ready_for_query(&mut stream).await?,
             b'X' => return Ok(()),
             _ => {
                 write_error_response(&mut stream, &format!("unsupported message tag {tag}"))
@@ -68,6 +94,298 @@ async fn handle_connection(
             }
         }
     }
+}
+
+async fn handle_parse(
+    stream: &mut TcpStream,
+    session: &mut ExtendedSession,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let mut cursor = 0usize;
+    let statement_name = read_cstring_from(payload, &mut cursor)?;
+    let sql = read_cstring_from(payload, &mut cursor)?;
+    // Skip the parameter-type OID array; Sprint 12 substitutes textually and
+    // does not consult declared OIDs.
+    if cursor + 2 > payload.len() {
+        bail!("Parse payload truncated before param count");
+    }
+    let _param_count = read_u16_at(payload, &mut cursor)?;
+    let _ = cursor;
+    session.statements.insert(
+        statement_name.to_owned(),
+        PreparedStatement {
+            sql: sql.to_owned(),
+        },
+    );
+    write_message(stream, b'1', &[]).await
+}
+
+async fn handle_bind(
+    stream: &mut TcpStream,
+    session: &mut ExtendedSession,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let mut cursor = 0usize;
+    let portal_name = read_cstring_from(payload, &mut cursor)?.to_owned();
+    let statement_name = read_cstring_from(payload, &mut cursor)?.to_owned();
+    let statement = session
+        .statements
+        .get(&statement_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown statement {statement_name}"))?
+        .clone();
+
+    // Parameter format codes.
+    let format_count = read_u16_at(payload, &mut cursor)?;
+    let mut formats: Vec<u16> = Vec::with_capacity(format_count as usize);
+    for _ in 0..format_count {
+        formats.push(read_u16_at(payload, &mut cursor)?);
+    }
+    // Parameter values.
+    let value_count = read_u16_at(payload, &mut cursor)?;
+    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(value_count as usize);
+    for index in 0..value_count {
+        let len = read_i32_at(payload, &mut cursor)?;
+        if len < 0 {
+            values.push(None);
+        } else {
+            let len = len as usize;
+            if cursor + len > payload.len() {
+                bail!("Bind payload truncated at param {index}");
+            }
+            values.push(Some(payload[cursor..cursor + len].to_vec()));
+            cursor += len;
+        }
+    }
+    // Skip result-format-codes; Sprint 12 always emits text.
+    let result_format_count = read_u16_at(payload, &mut cursor)?;
+    cursor += result_format_count as usize * 2;
+    let _ = cursor;
+
+    let sql_substituted = substitute_parameters(&statement.sql, &values, &formats)?;
+    session.portals.insert(
+        portal_name,
+        BoundPortal {
+            sql_substituted,
+        },
+    );
+    write_message(stream, b'2', &[]).await
+}
+
+async fn handle_describe(
+    stream: &mut TcpStream,
+    _session: &ExtendedSession,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    // For Sprint 12 we do not infer columns at describe time. Drizzle accepts
+    // `NoData` ('n') here and re-discovers the RowDescription during Execute.
+    if payload.is_empty() {
+        bail!("Describe payload too short");
+    }
+    let _kind = payload[0];
+    write_message(stream, b'n', &[]).await
+}
+
+async fn handle_execute(
+    stream: &mut TcpStream,
+    database: &Arc<Mutex<Database>>,
+    session: &ExtendedSession,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let mut cursor = 0usize;
+    let portal_name = read_cstring_from(payload, &mut cursor)?.to_owned();
+    let _max_rows = read_i32_at(payload, &mut cursor)?;
+    let portal = session
+        .portals
+        .get(&portal_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown portal {portal_name}"))?
+        .clone();
+    execute_extended_query(stream, database, &portal.sql_substituted).await
+}
+
+async fn handle_close(
+    stream: &mut TcpStream,
+    session: &mut ExtendedSession,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    if payload.len() < 2 {
+        bail!("Close payload too short");
+    }
+    let kind = payload[0];
+    let mut cursor = 1usize;
+    let name = read_cstring_from(payload, &mut cursor)?.to_owned();
+    if kind == b'S' {
+        session.statements.remove(&name);
+    } else if kind == b'P' {
+        session.portals.remove(&name);
+    }
+    write_message(stream, b'3', &[]).await
+}
+
+async fn execute_extended_query(
+    stream: &mut TcpStream,
+    database: &Arc<Mutex<Database>>,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let result = match parse(sql) {
+        Ok(statement) => {
+            let mut database = database.lock().await;
+            database.execute(statement).await
+        }
+        Err(error) => Err(error),
+    };
+
+    match result {
+        Ok(QueryResult::Command { tag }) => write_command_complete(stream, &tag).await?,
+        Ok(QueryResult::Rows {
+            columns,
+            column_types,
+            rows,
+        }) => {
+            let row_count = rows.len();
+            let resolved_types = resolve_row_description_types(&columns, &column_types, &rows);
+            write_row_description(stream, &columns, &resolved_types).await?;
+            for row in rows {
+                write_data_row(stream, &row).await?;
+            }
+            write_command_complete(stream, &format!("SELECT {row_count}")).await?;
+        }
+        Err(error) => write_open_db_error_response(stream, &error).await?,
+    }
+    Ok(())
+}
+
+/// Sprint 12: substitute `$1`/`$2`/... placeholders with the parameter
+/// values as inline SQL literals. Both text-mode and binary-mode bytes
+/// are decoded as UTF-8 strings and quoted (text mode is what Drizzle
+/// emits by default).
+fn substitute_parameters(
+    sql: &str,
+    values: &[Option<Vec<u8>>],
+    formats: &[u16],
+) -> anyhow::Result<String> {
+    let mut output = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\'' {
+            // Copy the entire quoted literal verbatim.
+            output.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                output.push(c as char);
+                i += 1;
+                if c == b'\'' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let number_str = std::str::from_utf8(&bytes[i + 1..j])?;
+            let index: usize = number_str.parse().context("invalid $N parameter")?;
+            let value = values
+                .get(index - 1)
+                .ok_or_else(|| anyhow::anyhow!("bind value {index} missing"))?;
+            let format = formats.get(index - 1).copied().unwrap_or(0);
+            output.push_str(&render_bind_value(value.as_deref(), format)?);
+            i = j;
+            continue;
+        }
+        output.push(ch as char);
+        i += 1;
+    }
+    Ok(output)
+}
+
+fn render_bind_value(value: Option<&[u8]>, _format: u16) -> anyhow::Result<String> {
+    match value {
+        None => Ok("NULL".to_string()),
+        Some(bytes) => {
+            let text = std::str::from_utf8(bytes)
+                .context("bind value is not valid UTF-8 (binary mode not supported)")?;
+            // Sprint 12 minimum: always quote with single quotes and escape
+            // single-quote inner. The parser distinguishes between integer /
+            // float / boolean / NULL literals; if the original SQL gives the
+            // column type expectation, the executor coerces appropriately.
+            // We still pass numeric-looking strings unquoted so an `INSERT
+            // INTO t (id) VALUES ($1)` against an INT column receives an
+            // INT literal, not a TEXT literal.
+            if looks_numeric_or_boolean(text) {
+                Ok(text.to_owned())
+            } else {
+                Ok(format!("'{}'", text.replace('\'', "''")))
+            }
+        }
+    }
+}
+
+fn looks_numeric_or_boolean(text: &str) -> bool {
+    if text.eq_ignore_ascii_case("true")
+        || text.eq_ignore_ascii_case("false")
+        || text.eq_ignore_ascii_case("null")
+    {
+        return true;
+    }
+    let mut iter = text.chars().peekable();
+    if let Some(&c) = iter.peek()
+        && (c == '-' || c == '+')
+    {
+        iter.next();
+    }
+    let mut digits = false;
+    let mut dot = false;
+    for c in iter {
+        if c.is_ascii_digit() {
+            digits = true;
+        } else if c == '.' && !dot {
+            dot = true;
+        } else {
+            return false;
+        }
+    }
+    digits
+}
+
+fn read_cstring_from<'a>(payload: &'a [u8], cursor: &mut usize) -> anyhow::Result<&'a str> {
+    let start = *cursor;
+    while *cursor < payload.len() && payload[*cursor] != 0 {
+        *cursor += 1;
+    }
+    if *cursor >= payload.len() {
+        bail!("cstring missing null terminator");
+    }
+    let slice = &payload[start..*cursor];
+    *cursor += 1;
+    std::str::from_utf8(slice).context("cstring is not utf8")
+}
+
+fn read_u16_at(payload: &[u8], cursor: &mut usize) -> anyhow::Result<u16> {
+    if *cursor + 2 > payload.len() {
+        bail!("frame truncated before u16");
+    }
+    let value = u16::from_be_bytes([payload[*cursor], payload[*cursor + 1]]);
+    *cursor += 2;
+    Ok(value)
+}
+
+fn read_i32_at(payload: &[u8], cursor: &mut usize) -> anyhow::Result<i32> {
+    if *cursor + 4 > payload.len() {
+        bail!("frame truncated before i32");
+    }
+    let value = i32::from_be_bytes([
+        payload[*cursor],
+        payload[*cursor + 1],
+        payload[*cursor + 2],
+        payload[*cursor + 3],
+    ]);
+    *cursor += 4;
+    Ok(value)
 }
 
 async fn execute_simple_query(
