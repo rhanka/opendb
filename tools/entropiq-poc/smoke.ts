@@ -303,6 +303,56 @@ async function runProbes(port: number): Promise<void> {
     (rows) => `rows=${JSON.stringify(rows)}`
   );
 
+  // --- Sprint 15 aggregate probes ----------------------------------------
+  await probe(
+    port,
+    "D1",
+    `SELECT count(*) FROM folders_smoke (simple query)`,
+    "simple",
+    async (c) => (await c.query(`SELECT count(*) FROM folders_smoke`)).rows,
+    (rows) => `rows=${JSON.stringify(rows)}`
+  );
+  await probe(
+    port,
+    "D2",
+    `SELECT status, count(*) FROM folders_smoke GROUP BY status (simple query)`,
+    "simple",
+    async (c) =>
+      (
+        await c.query(
+          `SELECT status, count(*) FROM folders_smoke GROUP BY status`
+        )
+      ).rows,
+    (rows) => `rows=${JSON.stringify(rows)}`
+  );
+  await probe(
+    port,
+    "D3",
+    `SELECT status, count(*) FROM folders_smoke GROUP BY status HAVING count(*) > 0 (simple query)`,
+    "simple",
+    async (c) =>
+      (
+        await c.query(
+          `SELECT status, count(*) FROM folders_smoke GROUP BY status HAVING count(*) > 0`
+        )
+      ).rows,
+    (rows) => `rows=${JSON.stringify(rows)}`
+  );
+  await probe(
+    port,
+    "D4",
+    `SELECT count(*) FROM folders_smoke (extended/parametrized)`,
+    "extended",
+    async (c) =>
+      (
+        await c.query({
+          text: `SELECT count(*) FROM folders_smoke WHERE workspace_id = $1`,
+          values: ["w1"]
+        })
+      ).rows,
+    (rows) => `rows=${JSON.stringify(rows)}`
+  );
+
   // --- Drizzle probes -----------------------------------------------------
   await probe(
     port,

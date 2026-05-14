@@ -14,6 +14,10 @@ Reproduce: `npm run poc:entropiq:smoke`.
 | A4 | simple | PASS | rows=[{"id":"f1","workspace_id":"admin","name":"root","status":"completed","created_at":"2026-05-13T04:00:00.000Z"}] |
 | A5 | simple | PASS | rows=[{"id":"f1","name":"root"}] |
 | B1 | extended | PASS | rows=[{"id":"f1"}] |
+| D1 | simple | PASS | rows=[{"count":"1"}] |
+| D2 | simple | PASS | rows=[{"status":"completed","count":"1"}] |
+| D3 | simple | PASS | rows=[{"status":"completed","count":"1"}] |
+| D4 | extended | PASS | rows=[{"count":"0"}] |
 | C1 | drizzle | PASS | rows=[{"id":"f1","workspaceId":"admin","name":"root","status":"completed","createdAt":"2026-05-13T00:00:00.000Z"}] |
 | C2 | drizzle | PASS | rows=[{"id":"f1","workspaceId":"admin","name":"root","status":"completed","createdAt":"2026-05-13T00:00:00.000Z"}] |
 
