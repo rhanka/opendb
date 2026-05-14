@@ -1,12 +1,11 @@
 # OpenDB Milestone 2 Sprint 12 Design — pgwire Extended Protocol
 
-Status: deferred (2026-05-12). Drumbeat decision: skip until Sprint 13
-proves Drizzle needs it. Drizzle is configurable to disable prepared
-statements (`new Pool({ ..., types: ..., query: { simple: true } })` is
-not a real option but `pg` accepts plain text queries by default when
-`Pool.query(string)` is called instead of `Pool.query({ text, values
-})`). Drizzle's default path issues parameterized queries, so this
-spec is held in reserve and revisited from Sprint 13 onwards.
+Status: **active prerequisite for Sprint 13** (promoted 2026-05-13).
+The Sprint 13 smoke (`tools/entropiq-poc/smoke.ts`,
+`docs/bench/entropiq-poc-2026-05-13.md`) showed every Drizzle query
+path goes through Extended (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`)
+and opendb-node rejects each tag with `unsupported message tag`.
+Without Sprint 12, no Drizzle read can complete.
 
 ## Goal (when reactivated)
 

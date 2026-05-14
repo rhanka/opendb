@@ -17,10 +17,14 @@
     "k3s:down": "tsx tools/k3d-down.ts",
     "bench:jsonb": "tsx tools/bench/jsonb.ts",
     "bench:alter": "tsx tools/bench/alter-then-select.ts",
-    "bench:fk": "tsx tools/bench/fk-insert-delete.ts"
+    "bench:fk": "tsx tools/bench/fk-insert-delete.ts",
+    "poc:entropiq:smoke": "tsx tools/entropiq-poc/smoke.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "drizzle-orm": "^0.36.0",
+    "pg": "^8.13.0",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0",
     "vitest": "^3.0.0",

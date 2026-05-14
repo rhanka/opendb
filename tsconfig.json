@@ -6,6 +6,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "resolveJsonModule": true,
+    "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
   "include": ["tools/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
