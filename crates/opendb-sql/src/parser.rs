@@ -797,12 +797,13 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
 
     let upper_rest = rest.to_ascii_uppercase();
-    let (table, predicate) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
+    let (table, predicates) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
         let table = rest[..where_pos].trim();
-        let predicate = parse_predicate(rest[where_pos + " WHERE ".len()..].trim())?;
-        (table, Some(predicate))
+        let predicate_text = rest[where_pos + " WHERE ".len()..].trim();
+        let predicates = parse_predicate_conjunction(predicate_text)?;
+        (table, predicates)
     } else {
-        (rest.trim(), None)
+        (rest.trim(), Vec::new())
     };
     if table.is_empty() {
         return Err(OpenDbError::Sql("SELECT requires table".to_owned()));
@@ -818,7 +819,7 @@ fn parse_select_all(sql: &str) -> OpenDbResult<Statement> {
     };
     Ok(Statement::SelectAll {
         table: unquote_identifier(table),
-        predicate,
+        predicate: predicates,
         order_by,
         limit,
         offset,
@@ -1198,6 +1199,54 @@ fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
     parse_predicate_with_op(raw)
 }
 
+/// Sprint 14.B: parse a conjunctive WHERE clause (`a = 1 AND b > 2 AND ...`).
+fn parse_predicate_conjunction(raw: &str) -> OpenDbResult<Vec<Predicate>> {
+    split_top_level_and(raw)?
+        .into_iter()
+        .map(|part| parse_predicate(part.trim()))
+        .collect()
+}
+
+fn split_top_level_and(raw: &str) -> OpenDbResult<Vec<&str>> {
+    let mut parts = Vec::new();
+    let upper = raw.to_ascii_uppercase();
+    let bytes = raw.as_bytes();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut paren_depth: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote {
+            if c == b'(' {
+                paren_depth += 1;
+            } else if c == b')' {
+                paren_depth -= 1;
+            }
+            if paren_depth == 0
+                && i + 5 <= bytes.len()
+                && upper.as_bytes().get(i..i + 5) == Some(b" AND ".as_slice())
+            {
+                parts.push(raw[start..i].trim());
+                start = i + 5;
+                i += 5;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if in_quote {
+        return Err(OpenDbError::Sql("unterminated quoted literal".to_owned()));
+    }
+    parts.push(raw[start..].trim());
+    Ok(parts.into_iter().filter(|p| !p.is_empty()).collect())
+}
+
 /// Sprint 14: parse a single predicate with an explicit comparison
 /// operator (`=`, `!=`, `<`, `<=`, `>`, `>=`). Used by composite WHERE
 /// parsing — single-equality predicates still flow through
@@ -1421,12 +1470,10 @@ mod tests {
             ("SELECT * FROM t WHERE c >= 1", crate::ast::WhereOp::Gte),
         ] {
             let parsed = parse(sql).expect(sql);
-            let Statement::SelectAll {
-                predicate: Some(p), ..
-            } = parsed
-            else {
-                panic!("{sql} should produce a predicate");
+            let Statement::SelectAll { predicate, .. } = parsed else {
+                panic!("{sql} should produce a SelectAll");
             };
+            let p = predicate.first().unwrap_or_else(|| panic!("{sql} should produce a predicate"));
             assert_eq!(p.op, op, "{sql}");
         }
     }
@@ -1648,7 +1695,7 @@ mod tests {
         else {
             panic!("expected SelectAll");
         };
-        assert!(predicate.is_some());
+        assert!(!predicate.is_empty());
         let order_by = order_by.expect("order_by");
         assert_eq!(order_by.column, "id");
         assert!(matches!(order_by.direction, OrderDirection::Asc));

@@ -72,7 +72,10 @@ pub enum Statement {
     },
     SelectAll {
         table: String,
-        predicate: Option<Predicate>,
+        /// Sprint 14: conjunctive WHERE clause. Empty vector = no WHERE.
+        /// `predicate.first()` keeps a friendly accessor for the legacy
+        /// single-predicate path.
+        predicate: Vec<Predicate>,
         #[doc = "Sprint 10: optional ORDER BY clause."]
         order_by: Option<OrderBy>,
         #[doc = "Sprint 10: optional LIMIT clause."]
@@ -191,7 +194,7 @@ impl Statement {
     pub fn select_all_legacy(table: String, predicate: Option<Predicate>) -> Self {
         Self::SelectAll {
             table,
-            predicate,
+            predicate: predicate.into_iter().collect(),
             order_by: None,
             limit: None,
             offset: None,

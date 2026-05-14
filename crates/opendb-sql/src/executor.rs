@@ -136,7 +136,7 @@ impl SqlEngine {
             } => self
                 .select_all(
                     &table,
-                    predicate.as_ref(),
+                    &predicate,
                     order_by.as_ref(),
                     limit,
                     offset,
@@ -295,7 +295,7 @@ impl SqlEngine {
     fn select_all(
         &self,
         table: &str,
-        predicate: Option<&Predicate>,
+        predicates: &[Predicate],
         order_by: Option<&crate::ast::OrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
@@ -319,15 +319,26 @@ impl SqlEngine {
                 requested.clone()
             }
         };
-        let (rows, route) = match predicate {
-            Some(predicate) => {
-                // Sprint 14: WHERE now supports any column (not just PK) and
-                // any comparison operator (=, !=, <, <=, >, >=). The fast path
-                // for PK-equality is kept for routing; everything else falls
-                // back to a full scan + filter.
-                let primary_key = table_state.primary_key_column().ok_or_else(|| {
-                    OpenDbError::InvalidInput(format!("table {table} has no primary key"))
-                })?;
+        let (rows, route) = if predicates.is_empty() {
+            let rows = table_state
+                .rows
+                .values()
+                .map(|row| project_row(table, &column_names, row))
+                .collect::<OpenDbResult<Vec<_>>>()?;
+            (
+                rows,
+                RouteIntent::Scan {
+                    table: table.to_owned(),
+                },
+            )
+        } else {
+            // Sprint 14: a conjunction of predicates is filtered with a full-table
+            // scan unless one of the predicates is a PK-equality (then we fast-path
+            // the routing intent while still running the conjunction).
+            let primary_key = table_state.primary_key_column().ok_or_else(|| {
+                OpenDbError::InvalidInput(format!("table {table} has no primary key"))
+            })?;
+            for predicate in predicates {
                 let column = table_state
                     .columns
                     .iter()
@@ -338,61 +349,34 @@ impl SqlEngine {
                             predicate.column
                         ))
                     })?;
-                let is_pk_eq = predicate.column == primary_key.name
-                    && matches!(predicate.op, crate::ast::WhereOp::Eq);
-                if is_pk_eq {
-                    if !value_matches_type(&predicate.value, &primary_key.data_type) {
-                        return Err(OpenDbError::Sql(format!(
-                            "WHERE value for primary key column {} does not match {:?}",
-                            primary_key.name, primary_key.data_type
-                        )));
-                    }
-                    let row_key = value_to_key(&predicate.value);
-                    let route = RouteIntent::Key {
-                        table: table.to_owned(),
-                        key: route_key(table, &row_key),
-                    };
-                    let rows = match table_state.rows.get(&row_key) {
-                        Some(row) if row.get(&primary_key.name) == Some(&predicate.value) => {
-                            vec![project_row(table, &column_names, row)?]
-                        }
-                        Some(_) | None => Vec::new(),
-                    };
-                    (rows, route)
-                } else {
-                    if !matches!(predicate.value, Value::Null)
-                        && !value_matches_type(&predicate.value, &column.data_type)
-                    {
-                        return Err(OpenDbError::Sql(format!(
-                            "WHERE value for column {} does not match {:?}",
-                            column.name, column.data_type
-                        )));
-                    }
-                    let rows = table_state
-                        .rows
-                        .values()
-                        .filter(|row| evaluate_predicate(row, predicate))
-                        .map(|row| project_row(table, &column_names, row))
-                        .collect::<OpenDbResult<Vec<_>>>()?;
-                    let route = RouteIntent::Scan {
-                        table: table.to_owned(),
-                    };
-                    (rows, route)
+                if !matches!(predicate.value, Value::Null)
+                    && !value_matches_type(&predicate.value, &column.data_type)
+                {
+                    return Err(OpenDbError::Sql(format!(
+                        "WHERE value for column {} does not match {:?}",
+                        column.name, column.data_type
+                    )));
                 }
             }
-            None => {
-                let rows = table_state
-                    .rows
-                    .values()
-                    .map(|row| project_row(table, &column_names, row))
-                    .collect::<OpenDbResult<Vec<_>>>()?;
-                (
-                    rows,
-                    RouteIntent::Scan {
-                        table: table.to_owned(),
-                    },
-                )
-            }
+            let pk_eq = predicates.iter().find(|p| {
+                p.column == primary_key.name && matches!(p.op, crate::ast::WhereOp::Eq)
+            });
+            let route = match pk_eq {
+                Some(p) => RouteIntent::Key {
+                    table: table.to_owned(),
+                    key: route_key(table, &value_to_key(&p.value)),
+                },
+                None => RouteIntent::Scan {
+                    table: table.to_owned(),
+                },
+            };
+            let rows = table_state
+                .rows
+                .values()
+                .filter(|row| predicates.iter().all(|p| evaluate_predicate(row, p)))
+                .map(|row| project_row(table, &column_names, row))
+                .collect::<OpenDbResult<Vec<_>>>()?;
+            (rows, route)
         };
         let mut rows = rows;
         if let Some(order_by) = order_by {
@@ -1027,6 +1011,27 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Value::Text("Ada".to_owned()));
+    }
+
+    #[test]
+    fn select_where_and_composes_predicates() {
+        let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").expect("parse"))
+            .expect("create");
+        for (id, name, score) in [(1, "a", 10), (2, "a", 20), (3, "b", 30)] {
+            engine
+                .execute(parse(&format!("INSERT INTO t VALUES ({id}, '{name}', {score})")).expect("parse"))
+                .expect("insert");
+        }
+        let result = engine
+            .execute(parse("SELECT * FROM t WHERE name = 'a' AND score > 10").expect("parse"))
+            .expect("composite where");
+        let QueryResult::Rows { rows, .. } = result else {
+            panic!("expected Rows");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(2));
     }
 
     #[test]
