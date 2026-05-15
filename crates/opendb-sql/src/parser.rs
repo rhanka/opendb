@@ -69,6 +69,25 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     }
 }
 
+/// Sprint 18.B: split a `"quoted"` identifier from the rest of the input.
+/// Returns `(inner, remainder)` on success, `None` if the input does not
+/// start with a quoted identifier. The remainder is left untrimmed so the
+/// caller can decide whether to follow up on `.<next>` (schema qualifier).
+fn strip_quoted_segment(input: &str) -> Option<(&str, &str)> {
+    if !input.starts_with('"') {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            return Some((&input[1..i], &input[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Sprint 18.A.1.1: strip SQL line comments (`-- ... \n`) and block comments
 /// (`/* ... */`) outside of single-quoted string literals. Quoted strings are
 /// preserved verbatim so a literal like `'foo -- bar'` keeps its content.
@@ -128,6 +147,17 @@ fn strip_sql_comments(input: &str) -> String {
                 }
             }
             out.push(' ');
+            continue;
+        }
+        // Sprint 18.B: collapse newlines/tabs to spaces OUTSIDE quotes so the
+        // keyword sniffers (`upper.find(" VALUES ")`, etc.) work on multi-line
+        // statements emitted by Drizzle migrations. Avoid double-spaces by
+        // checking the previous output character.
+        if c == b'\n' || c == b'\r' || c == b'\t' {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+            i += 1;
             continue;
         }
         out.push(c as char);
@@ -486,6 +516,26 @@ fn parse_identifier_list(raw: &str) -> Vec<String> {
 
 fn unquote_identifier(raw: &str) -> String {
     let trimmed = raw.trim().trim_end_matches(';').trim();
+    // Sprint 18.B: handle Drizzle's qualified `"schema"."identifier"` form by
+    // peeling the schema prefix (opendb does not model schemas — every table
+    // lives in the implicit default).
+    if trimmed.starts_with('"') {
+        if let Some((maybe_schema, rest)) = strip_quoted_segment(trimmed) {
+            if rest.is_empty() {
+                return maybe_schema.to_owned();
+            }
+            if let Some(after_dot) = rest.strip_prefix('.') {
+                let after_dot = after_dot.trim();
+                if let Some(stripped) = after_dot
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                {
+                    return stripped.to_owned();
+                }
+                return after_dot.to_owned();
+            }
+        }
+    }
     // Drizzle (and any pgwire client respecting SQL standards) wraps
     // identifiers in double quotes — strip them.
     if let Some(stripped) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
@@ -649,7 +699,16 @@ fn parse_do_block(sql: &str) -> OpenDbResult<Statement> {
         } else {
             body_text
         };
-    let inner = split_statements(inner_statements_text)
+    // Sprint 18.B: PL/pgSQL `IF EXISTS (...) THEN <stmts> END IF;` is used by
+    // Drizzle migrations to make rename operations idempotent. opendb does
+    // not implement PL/pgSQL conditionals; we unwrap the body and force
+    // `swallow_duplicate` so missing-target / already-exists errors are
+    // tolerated. Same semantics for `IF NOT EXISTS(...) THEN ...`.
+    let (unwrapped_text, forced_swallow) = unwrap_if_then(inner_statements_text);
+    if forced_swallow {
+        swallow_duplicate = true;
+    }
+    let inner = split_statements(unwrapped_text)
         .into_iter()
         .map(|stmt| parse(&stmt))
         .collect::<OpenDbResult<Vec<_>>>()?;
@@ -657,6 +716,62 @@ fn parse_do_block(sql: &str) -> OpenDbResult<Statement> {
         inner,
         swallow_duplicate,
     })
+}
+
+/// Sprint 18.B: extract the body of a PL/pgSQL `IF ... THEN <body> END IF;`
+/// block. Drizzle uses this for idempotent rename / drop-constraint sequences
+/// inside DO $$ ... $$. Returns `(body, true)` when an IF was unwrapped
+/// (caller forces swallow_duplicate), or `(original, false)` if no IF was
+/// detected. Nested IFs are not supported — only the outermost one is
+/// unwrapped, which matches the Drizzle pattern.
+fn unwrap_if_then(text: &str) -> (&str, bool) {
+    let upper = text.to_ascii_uppercase();
+    let trimmed_start = upper.trim_start();
+    if !trimmed_start.starts_with("IF ") && !trimmed_start.starts_with("IF\n") {
+        return (text, false);
+    }
+    // Find `THEN` outside parens / quotes — the `IF` condition may contain
+    // nested SELECT subqueries with their own parens.
+    let bytes = upper.as_bytes();
+    let leading = text.len() - trimmed_start.len();
+    let mut i = leading + 3; // skip "IF "
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let needle_then = b" THEN";
+    let mut then_pos: Option<usize> = None;
+    while i + needle_then.len() <= bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => depth -= 1,
+            _ => {}
+        }
+        if !in_quote && depth == 0 && &bytes[i..i + needle_then.len()] == needle_then {
+            then_pos = Some(i + needle_then.len());
+            break;
+        }
+        i += 1;
+    }
+    let Some(then_start) = then_pos else {
+        return (text, false);
+    };
+    // Find the matching `END IF` (case-insensitive) outside quotes.
+    let needle_end_if = b"END IF";
+    let mut j = then_start;
+    let mut in_quote2 = false;
+    while j + needle_end_if.len() <= bytes.len() {
+        let b = bytes[j];
+        if b == b'\'' {
+            in_quote2 = !in_quote2;
+        }
+        if !in_quote2 && &bytes[j..j + needle_end_if.len()] == needle_end_if {
+            let body = text[then_start..j].trim();
+            return (body, true);
+        }
+        j += 1;
+    }
+    (text, false)
 }
 
 fn split_statements(raw: &str) -> Vec<String> {
@@ -1015,56 +1130,175 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
     // so the rest of the parser keeps its strict "trailing input is an error"
     // contract.
     let (values_part, returning) = split_off_returning(values_part)?;
+    // Sprint 18.B: also peel an optional `ON CONFLICT ... DO NOTHING` /
+    // `ON CONFLICT ... DO UPDATE SET ...` suffix. opendb does not yet
+    // implement upsert semantics; we ignore the clause and let the
+    // underlying INSERT either succeed (no duplicate) or fail at the PK
+    // uniqueness check. Drizzle migrations use `DO NOTHING` to seed default
+    // rows idempotently — wrap the parsed INSERT in a DoBlock with
+    // swallow_duplicate so a re-run is a no-op.
+    let (values_part, swallow_conflict) = split_off_on_conflict(values_part);
     let values_part = values_part.trim();
-    let open = values_part
-        .find('(')
-        .ok_or_else(|| OpenDbError::Sql("missing values open paren".to_owned()))?;
-    let close = values_part
-        .rfind(')')
-        .ok_or_else(|| OpenDbError::Sql("missing values close paren".to_owned()))?;
-    if open >= close {
-        return Err(OpenDbError::Sql("malformed values list".to_owned()));
+    // Sprint 18.B: support multi-row INSERT `VALUES (a,b),(c,d),...`.
+    // Drizzle uses this any time `db.insert(t).values([...])` is called with
+    // an array. Extract each top-level `(...)` tuple as a separate row.
+    let row_tuples = extract_value_tuples(values_part)?;
+    if row_tuples.is_empty() {
+        return Err(OpenDbError::Sql("missing values open paren".to_owned()));
     }
-    if !values_part[..open].trim().is_empty() || !values_part[close + 1..].trim().is_empty() {
-        return Err(OpenDbError::Sql("trailing input after INSERT".to_owned()));
+    // Single-row path keeps the legacy behaviour. Multi-row path emits a
+    // DoBlock of single-row Inserts so the downstream pipeline (which
+    // assumes one statement / one mutation per `Insert`) works unchanged.
+    if row_tuples.len() > 1 {
+        let mut inner: Vec<Statement> = Vec::with_capacity(row_tuples.len());
+        for tuple in &row_tuples {
+            let raw_values = split_values(tuple)?;
+            let (filtered_values, filtered_columns) =
+                filter_default_columns(&raw_values, columns.as_ref())?;
+            inner.push(Statement::Insert {
+                table: table.clone(),
+                columns: filtered_columns,
+                values: filtered_values,
+                returning: returning.clone(),
+            });
+        }
+        return Ok(Statement::DoBlock {
+            inner,
+            swallow_duplicate: swallow_conflict,
+        });
     }
-    let raw_values = split_values(&values_part[open + 1..close])?;
-    // Sprint 16.A: Drizzle emits an explicit `DEFAULT` keyword for omitted
-    // columns inside the values tuple. Strip those slots from both the named
-    // column list and the values vector so the executor's
-    // `materialize_insert_values` path uses the column's DEFAULT.
+    let raw_values = split_values(row_tuples[0])?;
+    let (values, filtered_columns) = filter_default_columns(&raw_values, columns.as_ref())?;
+    let columns = filtered_columns.or(columns);
+    let inner = Statement::Insert {
+        table,
+        columns,
+        values,
+        returning,
+    };
+    if swallow_conflict {
+        Ok(Statement::DoBlock {
+            inner: vec![inner],
+            swallow_duplicate: true,
+        })
+    } else {
+        Ok(inner)
+    }
+}
+
+/// Sprint 18.B: Drizzle emits an explicit `DEFAULT` keyword for omitted
+/// columns inside a VALUES tuple. Strip those slots from both the value
+/// vector and the named-column list so `materialize_insert_values` re-fills
+/// the gap from the column's DEFAULT clause. Used by both single-row and
+/// multi-row insert paths.
+fn filter_default_columns(
+    raw_values: &[&str],
+    columns: Option<&Vec<String>>,
+) -> OpenDbResult<(Vec<Value>, Option<Vec<String>>)> {
     let mut filtered_values: Vec<Value> = Vec::with_capacity(raw_values.len());
-    let mut filtered_columns: Option<Vec<String>> =
-        columns.as_ref().map(|c| Vec::with_capacity(c.len()));
+    let mut filtered_columns: Option<Vec<String>> = columns.map(|c| Vec::with_capacity(c.len()));
     for (idx, raw) in raw_values.iter().enumerate() {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("DEFAULT") {
-            // Skip both the value and the named column at this position.
-            // Without a named column list we can't drop a positional value, so
-            // require the named form (which Drizzle always emits anyway).
             if columns.is_none() {
                 return Err(OpenDbError::Sql(
                     "DEFAULT in unnamed VALUES tuple is not supported".to_owned(),
                 ));
             }
-            // filtered_columns is Some(...) when columns is Some
             continue;
         }
         filtered_values.push(parse_value(raw)?);
-        if let (Some(src), Some(dst)) = (columns.as_ref(), filtered_columns.as_mut()) {
+        if let (Some(src), Some(dst)) = (columns, filtered_columns.as_mut()) {
             if let Some(name) = src.get(idx) {
                 dst.push(name.clone());
             }
         }
     }
-    let values = filtered_values;
-    let columns = filtered_columns.or(columns);
-    Ok(Statement::Insert {
-        table,
-        columns,
-        values,
-        returning,
-    })
+    Ok((filtered_values, filtered_columns))
+}
+
+/// Sprint 18.B: parse the VALUES tail into individual row tuples. Accepts
+/// `(a,b)`, `(a,b),(c,d)`, optional whitespace between tuples, and returns
+/// each tuple's interior content (without the surrounding parens). The
+/// caller is responsible for further parsing each tuple via `split_values`.
+fn extract_value_tuples(input: &str) -> OpenDbResult<Vec<&str>> {
+    let trimmed = input.trim();
+    let bytes = trimmed.as_bytes();
+    let mut tuples: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'(' {
+            return Err(OpenDbError::Sql(format!(
+                "trailing input after INSERT VALUES tuples: {}",
+                &trimmed[i..]
+            )));
+        }
+        let start = i + 1;
+        i += 1;
+        let mut depth = 1i32;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'\'' => in_quote = !in_quote,
+                b'(' if !in_quote => depth += 1,
+                b')' if !in_quote => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return Err(OpenDbError::Sql(
+                "unterminated VALUES tuple (unbalanced parens)".to_owned(),
+            ));
+        }
+        let end = i - 1;
+        tuples.push(&trimmed[start..end]);
+    }
+    if in_quote {
+        return Err(OpenDbError::Sql(
+            "unterminated quoted literal in VALUES".to_owned(),
+        ));
+    }
+    Ok(tuples)
+}
+
+/// Sprint 18.B: split an SQL fragment on a trailing `ON CONFLICT ...` clause
+/// (case-insensitive, outside quotes/parens). Treats both `DO NOTHING` and
+/// `DO UPDATE SET ...` forms as a single boolean flag — we don't actually
+/// upsert, we just swallow duplicate-key errors at execute time.
+fn split_off_on_conflict(input: &str) -> (&str, bool) {
+    let upper = input.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let needle = b" ON CONFLICT";
+    let mut found: Option<usize> = None;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\'' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => depth -= 1,
+            _ => {}
+        }
+        if !in_quote
+            && depth == 0
+            && i + needle.len() <= bytes.len()
+            && &bytes[i..i + needle.len()] == needle
+        {
+            found = Some(i);
+            break;
+        }
+    }
+    match found {
+        Some(pos) => (&input[..pos], true),
+        None => (input, false),
+    }
 }
 
 /// Sprint 16.A: split an SQL fragment on the trailing `RETURNING ...` clause
@@ -1160,6 +1394,20 @@ fn parse_value(value: &str) -> OpenDbResult<Value> {
     }
     if trimmed.eq_ignore_ascii_case("FALSE") {
         return Ok(Value::Bool(false));
+    }
+    // Sprint 18.B: accept `now()` and `current_timestamp` as wall-clock
+    // sentinels inside VALUES tuples. The executor's coerce_value will pass
+    // these through to TIMESTAMP columns; here we resolve them to a fresh
+    // microsecond reading so each INSERT row gets a real timestamp.
+    if trimmed.eq_ignore_ascii_case("NOW()")
+        || trimmed.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        || trimmed.eq_ignore_ascii_case("CURRENT_TIMESTAMP()")
+    {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        return Ok(Value::Timestamp(micros));
     }
     if let Some(text) = trimmed
         .strip_prefix('\'')

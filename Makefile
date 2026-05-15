@@ -139,6 +139,10 @@ smoke-real: ## Sprint 15.E corrective: rejoue 8 vraies requêtes sentropic
 poc-migrate: ## Sprint 18.A: rejoue les 27 migrations Drizzle sentropic contre opendb-node
 	cd $(WORKTREE) && $(NPM) run poc:sentropic:migrate
 
+.PHONY: poc-seed
+poc-seed: ## Sprint 18.B: migrations + seed minimal Drizzle (workspaces/orgs/folders/initiatives)
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:seed
+
 .PHONY: smoke-k3s
 smoke-k3s: ## Run the k3s cluster smoke (non-destructive default)
 	cd $(WORKTREE) && $(NPM) run smoke:k3s
