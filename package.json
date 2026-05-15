@@ -19,7 +19,8 @@
     "bench:alter": "tsx tools/bench/alter-then-select.ts",
     "bench:fk": "tsx tools/bench/fk-insert-delete.ts",
     "poc:sentropic:smoke": "tsx tools/sentropic-poc/smoke.ts",
-    "poc:sentropic:real": "tsx tools/sentropic-poc/real-smoke.ts"
+    "poc:sentropic:real": "tsx tools/sentropic-poc/real-smoke.ts",
+    "poc:sentropic:migrate": "tsx tools/sentropic-poc/migrate-poc.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
