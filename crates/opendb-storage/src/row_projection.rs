@@ -515,6 +515,26 @@ impl RowProjection {
     }
 
     fn apply_alter_table(&mut self, table: &str, op: &AlterTableOp) -> OpenDbResult<()> {
+        // Sprint 18.A.1.6: RenameTable mutates the tables map itself, so it
+        // can't be handled inside the per-table mutable borrow below.
+        if let AlterTableOp::RenameTable { to } = op {
+            if to.trim().is_empty() {
+                return Err(OpenDbError::InvalidInput(
+                    "ALTER TABLE RENAME TO requires a target name".to_owned(),
+                ));
+            }
+            if self.tables.contains_key(to) {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "table {to} already exists; cannot RENAME TO it"
+                )));
+            }
+            let state = self
+                .tables
+                .remove(table)
+                .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
+            self.tables.insert(to.clone(), state);
+            return Ok(());
+        }
         let table_state = self
             .tables
             .get_mut(table)
@@ -631,6 +651,10 @@ impl RowProjection {
                     }
                 }
                 table_state.indexes.push(index.clone());
+            }
+            AlterTableOp::RenameTable { .. } => {
+                // Handled before the per-table mutable borrow above.
+                unreachable!("RenameTable short-circuited at the top of apply_alter_table")
             }
         }
         Ok(())

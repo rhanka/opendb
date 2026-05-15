@@ -324,16 +324,19 @@ fn parse_alter_table(sql: &str) -> OpenDbResult<Statement> {
             swallow_duplicate: true,
         });
     }
-    // Sprint 18.A.1.4: ALTER TABLE ... RENAME TO is also a no-op for now —
-    // opendb does not support table rename, so the migration's downstream
-    // refs to the new name will fail. Drizzle uses this in 0024 to rename
-    // `use_cases` → `initiatives`; full support deferred. We accept the
-    // statement here so subsequent statements in the same migration get a
-    // chance to run (some are independent of the rename).
-    if let Some(_after) = strip_keyword(remainder, &upper_remainder, "RENAME TO ") {
-        return Ok(Statement::DoBlock {
-            inner: Vec::new(),
-            swallow_duplicate: true,
+    // Sprint 18.A.1.6: ALTER TABLE ... RENAME TO <new-table>. Emits a
+    // RenameTable mutation that re-keys the projection. Drizzle uses this in
+    // migration 0024 to rename `use_cases → initiatives`.
+    if let Some(after) = strip_keyword(remainder, &upper_remainder, "RENAME TO ") {
+        let new_name = unquote_identifier(strip_optional_terminators(after.trim()));
+        if new_name.is_empty() {
+            return Err(OpenDbError::Sql(
+                "RENAME TO requires a target table name".to_owned(),
+            ));
+        }
+        return Ok(Statement::AlterTable {
+            table: unquote_identifier(table_name),
+            op: AlterTableOp::RenameTable { to: new_name },
         });
     }
     Err(OpenDbError::Sql(format!(

@@ -34,7 +34,7 @@ Source: `/home/antoinefa/src/entropiq/api/drizzle` (read-only, no modification t
 | 0021_extension_tool_permissions.sql | PASS | 4 | — |
 | 0022_settings_user_scope.sql | PASS | 8 | — |
 | 0023_todo_steering_workflow_core.sql | PASS | 90 | — |
-| 0024_workspace_types_initiatives.sql | FAIL | 1 ran | `-- 2. Add new columns on initiatives (formerly use_cases) ALTER TABLE "initiatives" ADD COLUMN "ante` → error: not found: table not found: initiatives |
+| 0024_workspace_types_initiatives.sql | FAIL | 41 ran | `-- 12. Backfill: create one neutral workspace per existing user who doesn't have one INSERT INTO "wo` → error: sql error: INSERT requires VALUES |
 | 0025_workflow_runtime_state.sql | FAIL | 7 ran | `CREATE TABLE IF NOT EXISTS "workflow_task_results" ( "run_id" text NOT NULL, "workspace_id" text NOT` → error: invalid input: table workflow_task_results requires exactly one primary key column |
 | 0026_google_drive_connector_accounts.sql | PASS | 12 | — |
 

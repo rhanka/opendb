@@ -156,10 +156,22 @@ pub enum Mutation {
 #[serde(deny_unknown_fields)]
 pub enum AlterTableOp {
     AddColumn(ColumnDefinition),
-    DropColumn { column: String },
-    RenameColumn { from: String, to: String },
+    DropColumn {
+        column: String,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     AddConstraint(NamedConstraint),
     AddIndex(IndexDescriptor),
+    /// Sprint 18.A.1.6: rename the table itself. The catalog re-keys both
+    /// the table-state map and any FK/index references whose `table` field
+    /// matches the old name. Used by Drizzle migrations like
+    /// `use_cases → initiatives`.
+    RenameTable {
+        to: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
