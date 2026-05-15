@@ -14,7 +14,7 @@ isolation, no rollback semantics).
 True snapshot isolation + rollback semantics land in Sprint 11.5 once
 we have a transactional buffer wired in front of the commit stream;
 splitting the work here keeps the drumbeat short while unblocking
-entropiq workloads that wrap small read-mostly batches in a
+sentropic workloads that wrap small read-mostly batches in a
 `db.transaction(...)` purely for connection grouping.
 
 ## Non-Goals (Sprint 11)

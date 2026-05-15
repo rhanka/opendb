@@ -1,11 +1,11 @@
-# Entropiq substitution gap audit — 2026-05-14
+# Sentropic substitution gap audit — 2026-05-14
 
 État OpenDB : Sprint 12 + 12.1 livrés. Tous les probes POC smoke
 PASS (A1..A5, B1, C1, C2) — un Drizzle client se connecte et
 exécute `SELECT * / SELECT col WHERE eq(...)` end-to-end.
 
-État cible utilisateur : substitution complète de la DB d'entropiq,
-**zéro modification côté entropiq**. Drizzle + `pg` + 50 tables +
+État cible utilisateur : substitution complète de la DB d'sentropic,
+**zéro modification côté sentropic**. Drizzle + `pg` + 50 tables +
 toutes les routes HTTP.
 
 ## Audit chiffré sur `/home/antoinefa/src/entropiq/api/`
@@ -68,7 +68,7 @@ toutes les routes HTTP.
 
 - Pas de `CREATE EXTENSION`, donc pas de `pgcrypto`, `pg_trgm`,
   `postgis`, `tsvector`.
-- Pas de JSON ops `-> / ->> / @> / ?` côté SQL — entropiq parse les
+- Pas de JSON ops `-> / ->> / @> / ?` côté SQL — sentropic parse les
   JSONB en TypeScript après lecture.
 - Pas de subqueries dans la première lecture, à reconfirmer pendant
   l'implémentation.
@@ -86,13 +86,13 @@ types, JOINs simples, INSERT/DELETE de base, pgwire Extended). Les
 - Sprint 16 — `.returning(...)` + PK composites.
 - Sprint 17 — Transactions atomiques (snapshot read + buffered
   writes + COMMIT/ROLLBACK).
-- Sprint 18 — POC entropiq read-only complet (toutes les routes
+- Sprint 18 — POC sentropic read-only complet (toutes les routes
   GET).
-- Sprint 19 — POC entropiq write (routes POST/PATCH/DELETE).
-- Sprint 20 — Migration full replay + UAT entropiq HTTP end-to-end
+- Sprint 19 — POC sentropic write (routes POST/PATCH/DELETE).
+- Sprint 20 — Migration full replay + UAT sentropic HTTP end-to-end
   + bench vs PostgreSQL.
 
 Estimation honnête : **8 sprints, ~30-50 jours-homme actifs** à la
 cadence du drumbeat précédent. Le checkpoint utilisateur Sprint 18
-(POC read-only entropiq sur HTTP réel) est l'étape qui mérite une
+(POC read-only sentropic sur HTTP réel) est l'étape qui mérite une
 validation interactive avant Sprint 19.

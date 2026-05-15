@@ -1,7 +1,7 @@
 # OpenDB Milestone 2 Sprint 6 Implementation Plan
 
 Date: 2026-05-12
-Sprint: Milestone 2 Sprint 6 — first entropiq-path sprint
+Sprint: Milestone 2 Sprint 6 — first sentropic-path sprint
 Workers: 1-2
 
 ## Source Spec

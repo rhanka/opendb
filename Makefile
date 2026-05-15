@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-# OpenDB workflow targets. Mirrors `entropiq/Makefile` style: every target
+# OpenDB workflow targets. Mirrors `sentropic/Makefile` style: every target
 # has a `## comment` consumed by `make help`. Run targets from this worktree:
 #
 #   cd /home/antoinefa/src/opendb/.worktrees/feat-milestone-1 && make <target>
@@ -30,7 +30,7 @@ help: ## Show available targets
 	@echo "  DB workflow:"
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; /DB|Query|opendb/ {printf "    \033[32m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo "  Audit:"
-	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; /Audit|entropiq|grep|cloc/ {printf "    \033[32m%-22s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; /Audit|sentropic|grep|cloc/ {printf "    \033[32m%-22s\033[0m %s\n", $$1, $$2}'
 
 # ----- Build / Test / Lint / Check ------------------------------------------
 
@@ -128,12 +128,12 @@ diff: ## Show uncommitted diff
 # ----- POC smoke / benches --------------------------------------------------
 
 .PHONY: smoke
-smoke: ## Run the entropiq POC smoke (POC = end-to-end Drizzle probe matrix)
-	cd $(WORKTREE) && $(NPM) run poc:entropiq:smoke
+smoke: ## Run the sentropic POC smoke (POC = end-to-end Drizzle probe matrix)
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:smoke
 
 .PHONY: smoke-real
-smoke-real: ## Sprint 15.E corrective: rejoue 8 vraies requêtes entropiq
-	cd $(WORKTREE) && $(NPM) run poc:entropiq:real
+smoke-real: ## Sprint 15.E corrective: rejoue 8 vraies requêtes sentropic
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:real
 
 .PHONY: smoke-k3s
 smoke-k3s: ## Run the k3s cluster smoke (non-destructive default)
@@ -188,33 +188,33 @@ db-status: ## Check whether the local opendb-node is up
 
 # ----- Audit (cross-repo grep helpers) --------------------------------------
 
-ENTROPIQ_ROOT ?= /home/antoinefa/src/entropiq/api
+SENTROPIC_ROOT ?= /home/antoinefa/src/entropiq/api
 
-.PHONY: audit-entropiq-tables
-audit-entropiq-tables: ## Count Drizzle pgTable() declarations in entropiq
-	@grep -cE "pgTable\(" $(ENTROPIQ_ROOT)/src/db/schema.ts
+.PHONY: audit-sentropic-tables
+audit-sentropic-tables: ## Count Drizzle pgTable() declarations in sentropic
+	@grep -cE "pgTable\(" $(SENTROPIC_ROOT)/src/db/schema.ts
 
-.PHONY: audit-entropiq-types
-audit-entropiq-types: ## Histogram of column types declared in entropiq migrations
-	@grep -ohE '\b(text|timestamp|jsonb|boolean|integer|bigint|uuid|varchar|numeric|serial|date|interval|bytea)\b' $(ENTROPIQ_ROOT)/drizzle/*.sql | sort | uniq -c | sort -rn
+.PHONY: audit-sentropic-types
+audit-sentropic-types: ## Histogram of column types declared in sentropic migrations
+	@grep -ohE '\b(text|timestamp|jsonb|boolean|integer|bigint|uuid|varchar|numeric|serial|date|interval|bytea)\b' $(SENTROPIC_ROOT)/drizzle/*.sql | sort | uniq -c | sort -rn
 
-.PHONY: audit-entropiq-verbs
-audit-entropiq-verbs: ## Drizzle verb usage histogram in entropiq src/
-	@printf "%-20s %5d\n" ".select(" "$$(grep -rE '\.select\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".update(" "$$(grep -rE '\.update\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".delete(" "$$(grep -rE '\.delete\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".insert(" "$$(grep -rE '\.insert\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".where(and(" "$$(grep -rE '\.where\(and\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".where(or(" "$$(grep -rE '\.where\(or\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".where(eq(" "$$(grep -rE '\.where\(eq\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" ".returning(" "$$(grep -rE '\.returning\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" "db.transaction(" "$$(grep -rE 'db\.transaction\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
-	@printf "%-20s %5d\n" "groupBy/agg" "$$(grep -rE '\.groupBy\(|\.having\(|count\(|sum\(|max\(|min\(|avg\(' $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+.PHONY: audit-sentropic-verbs
+audit-sentropic-verbs: ## Drizzle verb usage histogram in sentropic src/
+	@printf "%-20s %5d\n" ".select(" "$$(grep -rE '\.select\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".update(" "$$(grep -rE '\.update\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".delete(" "$$(grep -rE '\.delete\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".insert(" "$$(grep -rE '\.insert\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".where(and(" "$$(grep -rE '\.where\(and\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".where(or(" "$$(grep -rE '\.where\(or\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".where(eq(" "$$(grep -rE '\.where\(eq\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" ".returning(" "$$(grep -rE '\.returning\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" "db.transaction(" "$$(grep -rE 'db\.transaction\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
+	@printf "%-20s %5d\n" "groupBy/agg" "$$(grep -rE '\.groupBy\(|\.having\(|count\(|sum\(|max\(|min\(|avg\(' $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | wc -l)"
 
-.PHONY: audit-entropiq-grep
-audit-entropiq-grep: ## Generic grep over entropiq src: PATTERN="..."
-	@if [ -z "$(PATTERN)" ]; then echo "PATTERN is required: make audit-entropiq-grep PATTERN='SELECT'"; exit 1; fi
-	@grep -rE "$(PATTERN)" $(ENTROPIQ_ROOT)/src --include='*.ts' 2>/dev/null | head -50
+.PHONY: audit-sentropic-grep
+audit-sentropic-grep: ## Generic grep over sentropic src: PATTERN="..."
+	@if [ -z "$(PATTERN)" ]; then echo "PATTERN is required: make audit-sentropic-grep PATTERN='SELECT'"; exit 1; fi
+	@grep -rE "$(PATTERN)" $(SENTROPIC_ROOT)/src --include='*.ts' 2>/dev/null | head -50
 
 .PHONY: cloc
 cloc: ## Count lines of code in the opendb workspace

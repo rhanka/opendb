@@ -18,8 +18,8 @@
     "bench:jsonb": "tsx tools/bench/jsonb.ts",
     "bench:alter": "tsx tools/bench/alter-then-select.ts",
     "bench:fk": "tsx tools/bench/fk-insert-delete.ts",
-    "poc:entropiq:smoke": "tsx tools/entropiq-poc/smoke.ts",
-    "poc:entropiq:real": "tsx tools/entropiq-poc/real-smoke.ts"
+    "poc:sentropic:smoke": "tsx tools/sentropic-poc/smoke.ts",
+    "poc:sentropic:real": "tsx tools/sentropic-poc/real-smoke.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

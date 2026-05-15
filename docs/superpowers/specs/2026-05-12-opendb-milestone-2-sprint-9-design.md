@@ -7,7 +7,7 @@ Status: draft (2026-05-12)
 Sprint 8 recorded UNIQUE and FOREIGN KEY constraints as metadata. Sprint
 9 makes them enforce-able at INSERT time, and introduces a minimal
 `DELETE FROM t WHERE pk = ?` statement so referential integrity has a
-write path other than INSERT. This unblocks any entropiq INSERT/DELETE
+write path other than INSERT. This unblocks any sentropic INSERT/DELETE
 flow that depends on cascades or unique columns.
 
 ## Non-Goals

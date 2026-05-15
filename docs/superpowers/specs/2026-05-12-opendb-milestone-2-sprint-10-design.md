@@ -6,10 +6,10 @@ Status: draft (2026-05-12)
 
 Sprint 10 extends the SELECT surface with `INNER JOIN`, `LEFT JOIN`,
 `ORDER BY`, `LIMIT`, and `OFFSET`. Drizzle issues 28 join sites in the
-entropiq codebase plus heavy `orderBy` / `limit` usage. With this sprint,
+sentropic codebase plus heavy `orderBy` / `limit` usage. With this sprint,
 the substitution pilot can read its main relational paths.
 
-`GROUP BY` and aggregates land in Sprint 10.5 if entropiq usage forces
+`GROUP BY` and aggregates land in Sprint 10.5 if sentropic usage forces
 them; otherwise they stay deferred.
 
 ## Non-Goals

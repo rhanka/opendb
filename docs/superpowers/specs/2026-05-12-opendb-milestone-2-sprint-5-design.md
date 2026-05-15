@@ -47,7 +47,7 @@ themselves.
   optional advisory metric, but the act of splitting stays user-initiated in
   this sprint.
 - No `ALTER TABLE`, no secondary index, no JSON, no transactions, no joins.
-  Those belong to the entropiq-substitution path (sprints 6+).
+  Those belong to the sentropic-substitution path (sprints 6+).
 - No change to the `phase` of `OpenDbCluster`: it stays kube-readiness only.
 - No pgwire protocol changes. Admin operations go through a dedicated HTTP
   endpoint on opendb-node, not through pgwire.
@@ -260,7 +260,7 @@ by `Database::execute`.
 Unchanged. pgwire stays a client compatibility layer. We deliberately do
 not expose split/merge through `ALTER RANGE` SQL in this sprint:
 
-- Drizzle (the future entropiq client) does not need it.
+- Drizzle (the future sentropic client) does not need it.
 - pgwire prepared-statement plumbing would expand the parser surface for a
   feature that admins can already reach over HTTP.
 - Keeping admin off pgwire makes it trivial to ACL the admin endpoint

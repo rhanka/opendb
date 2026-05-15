@@ -5,11 +5,11 @@ Author: opendb maintainers
 
 ## Goal
 
-Sprint 7 adds the `JSONB` type to OpenDB. Entropiq has 75 `jsonb` columns
+Sprint 7 adds the `JSONB` type to OpenDB. Sentropic has 75 `jsonb` columns
 in its 50-table schema; without JSONB the substitution pilot is blocked.
 This sprint targets storage + serde round-trip + parser literals + pgwire
 emit/parse, sufficient to ingest and emit JSONB blobs verbatim. JSON
-operators (`->`, `->>`, `@>`) are not in scope; entropiq does not use
+operators (`->`, `->>`, `@>`) are not in scope; sentropic does not use
 them in its TypeScript source — JSONB is read raw and parsed in JS.
 
 A first-bench fixture for JSONB INSERT/SELECT throughput lands under
@@ -24,7 +24,7 @@ DOUBLE PRECISION/TIMESTAMP`, `NOT NULL`, `DEFAULT <literal>`, `DEFAULT
 NOW()`, named-column INSERT. pgwire emits the right OIDs, including a
 text-mode fallback for empty result sets.
 
-JSONB is the last big scalar gap in entropiq's schema. Drizzle declares
+JSONB is the last big scalar gap in sentropic's schema. Drizzle declares
 `jsonb('data').default(sql\`'{}'::jsonb\`)` and reads it as
 `Record<string, unknown>`. The TypeScript layer never issues `data->>'key'`
 queries — it parses the entire blob in Node.

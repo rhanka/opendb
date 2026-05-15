@@ -1,8 +1,8 @@
-# Entropiq POC smoke — 2026-05-13
+# Sentropic POC smoke — 2026-05-13
 
-Empirical decision: can opendb-node's pgwire surface serve a Drizzle-backed read path against an entropiq-shaped table?
+Empirical decision: can opendb-node's pgwire surface serve a Drizzle-backed read path against an sentropic-shaped table?
 
-Reproduce: `npm run poc:entropiq:smoke`.
+Reproduce: `npm run poc:sentropic:smoke`.
 
 ## Probe matrix
 
@@ -30,8 +30,8 @@ Sprint 13 cannot proceed as a single read-only POC — three orthogonal gaps mus
 
 1. **Sprint 12 (Extended pgwire)** — hard prerequisite for any Drizzle client. Without it `db.select().from(folders).limit(1)` cannot return a row.
 2. **SQL surface micro-sprint (proposed Sprint 12.1)** — add no-FROM `SELECT <expr>` literals (and at minimum `SELECT 1`, `SELECT version()`) plus explicit column projection in `SELECT`. These are both pre-handshake probes pg/Drizzle emit unconditionally.
-3. **TIMESTAMP literal grammar** — accept Postgres-style `'2026-05-13 00:00:00'` and ISO-8601 `'2026-05-13T00:00:00Z'` in `INSERT` text values. Without this no realistic entropiq seed can be replayed.
+3. **TIMESTAMP literal grammar** — accept Postgres-style `'2026-05-13 00:00:00'` and ISO-8601 `'2026-05-13T00:00:00Z'` in `INSERT` text values. Without this no realistic sentropic seed can be replayed.
 
 ## Next action (proposed)
 
-- Promote Sprint 12 out of the parked state and design Sprint 12.1 (SQL surface gaps surfaced here) at the same time. Land them together as a single PR before re-running this smoke; the smoke is the green-light gate for the table-level read-only POC (entropiq seed + HTTP route).
+- Promote Sprint 12 out of the parked state and design Sprint 12.1 (SQL surface gaps surfaced here) at the same time. Land them together as a single PR before re-running this smoke; the smoke is the green-light gate for the table-level read-only POC (sentropic seed + HTTP route).

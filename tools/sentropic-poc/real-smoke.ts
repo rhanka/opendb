@@ -1,8 +1,8 @@
 // Sprint 15.E corrective probe: rejoue des requêtes Drizzle/SQL réelles
-// extraites des routes entropiq contre opendb-node. Le but est de prouver
+// extraites des routes sentropic contre opendb-node. Le but est de prouver
 // (ou réfuter) que le moteur SQL valide aux smoke A/B/C/D fonctionne aussi
-// sur le SQL que l'API entropiq émet en production, sans rien modifier côté
-// entropiq.
+// sur le SQL que l'API sentropic émet en production, sans rien modifier côté
+// sentropic.
 //
 // Les requêtes ci-dessous sont copiées 1:1 depuis :
 //   - api/src/routes/api/admin.ts (counts simples)
@@ -10,7 +10,7 @@
 //   - api/src/routes/api/folders.ts (LEFT JOIN + count + multi-col GROUP BY)
 //   - api/src/routes/api/admin.ts (sélection par PK)
 // Le schéma est miroir exact de api/src/db/schema.ts pour les 5 tables
-// touchées par ces requêtes. Aucun fichier entropiq n'est lu à l'exécution.
+// touchées par ces requêtes. Aucun fichier sentropic n'est lu à l'exécution.
 
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -35,7 +35,7 @@ const nodeBin = join(
 );
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// --- Schema mirror (entropiq api/src/db/schema.ts) ------------------------
+// --- Schema mirror (sentropic api/src/db/schema.ts) ------------------------
 const workspaces = pgTable("workspaces", {
   id: text("id").primaryKey(),
   ownerUserId: text("owner_user_id"),
@@ -178,7 +178,7 @@ async function spawnOpenDbNode(): Promise<{
   const internalPort = await reserveFreePort();
   const tmpDir = join(repoRoot, ".worktrees", ".tmp-claude");
   mkdirSync(tmpDir, { recursive: true });
-  const dataDir = mkdtempSync(join(tmpDir, "entropiq-real-"));
+  const dataDir = mkdtempSync(join(tmpDir, "sentropic-real-"));
   const child: ChildProcessByStdio<null, Readable, Readable> = spawn(
     nodeBin,
     [
@@ -224,7 +224,7 @@ async function spawnOpenDbNode(): Promise<{
 }
 
 // --- DDL + seed -----------------------------------------------------------
-// CREATE TABLE statements match the migrations entropiq runs in prod.
+// CREATE TABLE statements match the migrations sentropic runs in prod.
 // Kept minimal (FK omitted) so seed is order-independent in this smoke; the
 // goal is SQL surface validation, not constraint replay.
 const CREATE_STATEMENTS: string[] = [
@@ -323,7 +323,7 @@ async function setupSchema(port: number): Promise<void> {
   }
 }
 
-// --- Real queries (verbatim from entropiq routes) -------------------------
+// --- Real queries (verbatim from sentropic routes) -------------------------
 async function runRealQueries(port: number): Promise<void> {
   // Drizzle wires a pg Pool; we use it to also surface the SQL text via
   // `.toSQL()` for the verdict report.
@@ -491,7 +491,7 @@ async function runRealQueries(port: number): Promise<void> {
         return { sql: q.toSQL().sql, rows: () => q };
       }
     },
-    // Sprint 16.B — DELETE .returning() (entropiq queue-clear pattern)
+    // Sprint 16.B — DELETE .returning() (sentropic queue-clear pattern)
     {
       id: "Q12",
       description: "queue-clear.ts — db.delete(t).returning()",
@@ -596,10 +596,10 @@ async function runRealQueries(port: number): Promise<void> {
 
 function renderVerdict(): string {
   const lines: string[] = [];
-  lines.push("# Entropiq corrective probe (Sprint 15.E) — " + new Date().toISOString().slice(0, 10));
+  lines.push("# Sentropic corrective probe (Sprint 15.E) — " + new Date().toISOString().slice(0, 10));
   lines.push("");
   lines.push(
-    "Rejeu de requêtes Drizzle copiées 1:1 depuis les routes entropiq, contre opendb-node, sans modification entropiq."
+    "Rejeu de requêtes Drizzle copiées 1:1 depuis les routes sentropic, contre opendb-node, sans modification sentropic."
   );
   lines.push("");
   lines.push("## Matrix");
@@ -623,7 +623,7 @@ function renderVerdict(): string {
   } else if (ratio <= 30) {
     lines.push("→ Décision : STOP Sprint 16. Audit chiffré des gaps réels avant tout sprint additionnel.");
   } else {
-    lines.push("→ Décision : ping user pour arbitrage. Le moteur SQL valide ~50% des requêtes entropiq mais reste insuffisant pour POC HTTP.");
+    lines.push("→ Décision : ping user pour arbitrage. Le moteur SQL valide ~50% des requêtes sentropic mais reste insuffisant pour POC HTTP.");
   }
   return lines.join("\n");
 }
@@ -643,7 +643,7 @@ async function main(): Promise<void> {
     repoRoot,
     "docs",
     "bench",
-    `entropiq-real-${new Date().toISOString().slice(0, 10)}.md`
+    `sentropic-real-${new Date().toISOString().slice(0, 10)}.md`
   );
   mkdirSync(dirname(reportPath), { recursive: true });
   const { writeFileSync } = await import("node:fs");

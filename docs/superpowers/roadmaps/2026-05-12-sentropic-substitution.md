@@ -1,4 +1,4 @@
-# OpenDB → Entropiq Substitution Roadmap
+# OpenDB → Sentropic Substitution Roadmap
 
 Date: 2026-05-12
 Target product: `/home/antoinefa/src/entropiq` (Drizzle ORM + PostgreSQL via
@@ -7,7 +7,7 @@ Target product: `/home/antoinefa/src/entropiq` (Drizzle ORM + PostgreSQL via
 ## Why this exists
 
 We want OpenDB to be able to host an existing production-shaped TypeScript
-service. Entropiq is the chosen pilot: it is a real workload we control end
+service. Sentropic is the chosen pilot: it is a real workload we control end
 to end, it uses Drizzle over pgwire (no Supabase-specific dependency), and
 its schema is representative (heavy JSONB, plenty of joins, transactions,
 indexes, foreign keys).
@@ -43,7 +43,7 @@ pk = …`. pgwire minimal. Range catalog with split/merge metadata typed,
 routing actif, root-stream logical range validation. Recovery contract +
 operator conditions live.
 
-The gap to entropiq is large enough that we plan it as nine sprints
+The gap to sentropic is large enough that we plan it as nine sprints
 post Sprint 5 (which closes the range-catalog runtime story, not the
 SQL surface).
 
@@ -55,17 +55,17 @@ one sprint = 2-5 active days of paired work).
 | # | Sprint                                                                 | Effort | Unlocks                                                       |
 |---|-----------------------------------------------------------------------|--------|---------------------------------------------------------------|
 | 5 | Range split/merge runtime (admin endpoint, allocator, condition)       | 2-3 d  | live split/merge on a running cluster                         |
-| 6 | Types: `BOOLEAN`, `TIMESTAMP`, `FLOAT64`, `NOT NULL`, `DEFAULT`, `DEFAULT now()` | 2-3 d  | enough scalar coverage to seed entropiq's metadata rows       |
-| 7 | `JSONB` storage + parser + pgwire serialization                        | 4-5 d  | 75 jsonb columns become representable; entropiq core unlocked |
+| 6 | Types: `BOOLEAN`, `TIMESTAMP`, `FLOAT64`, `NOT NULL`, `DEFAULT`, `DEFAULT now()` | 2-3 d  | enough scalar coverage to seed sentropic's metadata rows       |
+| 7 | `JSONB` storage + parser + pgwire serialization                        | 4-5 d  | 75 jsonb columns become representable; sentropic core unlocked |
 | 8 | `ALTER TABLE` (add/drop/rename column, add constraint) + `CREATE INDEX` + `DO $$` idempotency | 4-5 d  | drizzle-kit migrations apply unchanged                        |
 | 9 | `UNIQUE` + foreign keys + `ON DELETE CASCADE`                          | 3-4 d  | referential integrity matches drizzle assumptions             |
 | 10 | `SELECT` with `INNER`/`LEFT JOIN`, `WHERE` composé, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET` | 5-7 d  | 28 join sites and 4 groupBy use cases pass                    |
 | 11 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, snapshot isolation)         | 5-7 d  | 15 transaction sites compatible                               |
 | 12 | pgwire prepared-statement protocol + parameter binding + Drizzle compat | 4-5 d  | Drizzle client connects and runs unmodified queries           |
 | 12.5 | Benchmarks: OpenDB vs PostgreSQL (`tools/bench-pg.ts` ts-only via `pg`) — INSERT/SELECT throughput, JSONB roundtrip, named INSERT, transaction overhead. Numbers committed under `docs/bench/` | 3-4 d  | first quantitative comparison and regression baseline         |
-| 13 | POC entropiq read-only on 1-5 tables (e.g. `folders`, `initiatives`)   | 2-3 d  | first end-to-end proof against entropiq's HTTP API            |
-| 14 | POC élargi: 10-20 tables, writes + simple joins, no complex tx         | 3-5 d  | covers majority of entropiq's hot paths                       |
-| 15 | Substitution complète: full migrations replay + UAT entropiq full + perf-vs-PG report | 5-7 d  | drop-in DATABASE_URL swap with documented perf delta          |
+| 13 | POC sentropic read-only on 1-5 tables (e.g. `folders`, `initiatives`)   | 2-3 d  | first end-to-end proof against sentropic's HTTP API            |
+| 14 | POC élargi: 10-20 tables, writes + simple joins, no complex tx         | 3-5 d  | covers majority of sentropic's hot paths                       |
+| 15 | Substitution complète: full migrations replay + UAT sentropic full + perf-vs-PG report | 5-7 d  | drop-in DATABASE_URL swap with documented perf delta          |
 
 The bench harness lands in Sprint 12.5 but is **incrementally seeded from
 Sprint 7 onwards**: each sprint that introduces a SQL feature also adds a
@@ -90,7 +90,7 @@ those numbers translate to roughly:
 ## Decisions captured along the way
 
 - **No Python**: any tooling for JSONB tests, prepared-statement smoke,
-  and entropiq parity harness is TypeScript only (vitest), enforced by
+  and sentropic parity harness is TypeScript only (vitest), enforced by
   `npm run check:no-python`.
 - **No object storage during this roadmap**: archive metadata stays
   metadata-only until the substitution UAT is green.
@@ -110,6 +110,6 @@ Per-sprint spec + plan files land under
 `docs/superpowers/specs/YYYY-MM-DD-opendb-milestone-2-sprint-N-design.md`
 and
 `docs/superpowers/plans/YYYY-MM-DD-opendb-milestone-2-sprint-N.md`,
-following the format used since Sprint 1. The first entropiq-parity
-vitest file will live at `tests/parity/entropiq-mini.test.ts` and grow
+following the format used since Sprint 1. The first sentropic-parity
+vitest file will live at `tests/parity/sentropic-mini.test.ts` and grow
 across sprints 13-15.

@@ -4,7 +4,7 @@ Status: draft (2026-05-12)
 
 ## Goal
 
-Make `drizzle-kit generate` migrations apply unchanged. Entropiq's 28
+Make `drizzle-kit generate` migrations apply unchanged. Sentropic's 28
 migrations rely on `ALTER TABLE ADD COLUMN`, `ALTER TABLE ADD CONSTRAINT
 … FOREIGN KEY … REFERENCES …`, `CREATE INDEX IF NOT EXISTS … USING btree
 (…)`, and `DO $$ BEGIN … EXCEPTION WHEN duplicate_object THEN null;
@@ -21,7 +21,7 @@ path is wired (a full-table scan remains the only read path).
 - No foreign-key validation at INSERT/DELETE time (Sprint 9).
 - No physical secondary-index data structure (Sprint 10+).
 - No `ALTER TABLE … ALTER COLUMN SET DEFAULT/DROP DEFAULT` variants;
-  entropiq does not use them.
+  sentropic does not use them.
 - No `ALTER TABLE … VALIDATE CONSTRAINT`.
 
 ## Design Summary
@@ -125,7 +125,7 @@ sprint to keep the bench surface growing.
   --workspace` green.
 - `npm run check:ts`, `npm run check:no-python`, `npm run check:manifests`,
   `npm test` green.
-- A full entropiq Drizzle migration file (`0017_context_documents.sql`
+- A full sentropic Drizzle migration file (`0017_context_documents.sql`
   for the canary test) applies without error against opendb-node.
 - New `git log origin/main` commits do not increase the AI-attribution
   baseline.

@@ -1,6 +1,6 @@
-# Entropiq corrective probe (Sprint 15.E) — 2026-05-14
+# Sentropic corrective probe (Sprint 15.E) — 2026-05-14
 
-Rejeu de requêtes Drizzle copiées 1:1 depuis les routes entropiq, contre opendb-node, sans modification entropiq.
+Rejeu de requêtes Drizzle copiées 1:1 depuis les routes sentropic, contre opendb-node, sans modification sentropic.
 
 ## Matrix
 

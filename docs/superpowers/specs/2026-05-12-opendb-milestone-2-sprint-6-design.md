@@ -5,12 +5,12 @@ Author: opendb maintainers
 
 ## Goal
 
-Sprint 6 is the first sprint of the entropiq-substitution path. It extends
-the SQL type surface to cover the columns entropiq actually uses in its 28
+Sprint 6 is the first sprint of the sentropic-substitution path. It extends
+the SQL type surface to cover the columns sentropic actually uses in its 28
 Drizzle migrations: boolean, timestamp, float64 (a small minority — int,
 text are already done), plus the `NOT NULL`, `DEFAULT`, and `DEFAULT
 now()` modifiers, and the named-column form of `INSERT INTO t (a, b)
-VALUES (…)`. After this sprint, OpenDB can ingest enough of an entropiq
+VALUES (…)`. After this sprint, OpenDB can ingest enough of an sentropic
 schema to host a single read-mostly table end to end.
 
 Out of scope: `JSONB` (Sprint 7), `ALTER TABLE` (Sprint 8), `UNIQUE`/FK
@@ -29,7 +29,7 @@ After Sprint 5, OpenDB supports:
 - Active range catalog with runtime split/merge through the admin
   endpoint, and a `RangeCatalogStable` condition.
 
-Entropiq's actual schema uses (counts in the schema audit): 394 `text`,
+Sentropic's actual schema uses (counts in the schema audit): 394 `text`,
 104 `timestamp`, 75 `jsonb`, 21 `integer`, 12 `boolean`, plus
 `defaultNow()` on most timestamps and `default('completed')`-style
 literal defaults on a few text columns. The largest tables also use
@@ -43,7 +43,7 @@ PG extension.
   `integer()` to `INT`. We map both `INTEGER` and `INT` to `Int64`. The
   pgwire serialization keeps INT4 OID semantics for compatibility.
 - No `NUMERIC`, no `DECIMAL`, no `DATE`, no `TIME`, no `TIMESTAMPTZ`.
-  Only `TIMESTAMP WITHOUT TIME ZONE` (matching what entropiq's schema
+  Only `TIMESTAMP WITHOUT TIME ZONE` (matching what sentropic's schema
   emits) and as an alias `TIMESTAMP`.
 - No `DEFAULT` for arbitrary expressions. We support:
   - `DEFAULT <literal>` (`'completed'`, `0`, `false`, `null`).

@@ -5,7 +5,7 @@ Status: draft (2026-05-12)
 ## Goal
 
 Sprint 10 added ORDER BY / LIMIT / OFFSET. Sprint 10.5 closes the
-remaining JOIN gap from the original Sprint 10 scope. Entropiq uses 16
+remaining JOIN gap from the original Sprint 10 scope. Sentropic uses 16
 `INNER JOIN` and 12 `LEFT JOIN` sites in its TypeScript source; this
 sprint is the last big SELECT-surface piece before transactions
 (Sprint 11) and prepared statements (Sprint 12).
@@ -16,7 +16,7 @@ sprint is the last big SELECT-surface piece before transactions
 - No subqueries.
 - No alias projection — projection stays `SELECT *` only; column
   names in the result come back as `<table>.<column>`.
-- No GROUP BY or aggregates (kept deferred — entropiq does not need
+- No GROUP BY or aggregates (kept deferred — sentropic does not need
   them in hot paths).
 - No multiple JOINs in one query — Sprint 10.5 supports a single JOIN
   clause (left table JOIN right table). Multi-table joins go to Sprint

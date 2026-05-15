@@ -129,7 +129,7 @@ async function spawnOpenDbNode(): Promise<{
   const internalPort = await reserveFreePort();
   const tmpDir = join(repoRoot, ".worktrees", ".tmp-claude");
   mkdirSync(tmpDir, { recursive: true });
-  const dataDir = mkdtempSync(join(tmpDir, "entropiq-poc-"));
+  const dataDir = mkdtempSync(join(tmpDir, "sentropic-poc-"));
   const child: ChildProcessByStdio<null, Readable, Readable> = spawn(
     nodeBin,
     [
@@ -381,13 +381,13 @@ async function runProbes(port: number): Promise<void> {
 
 function renderVerdict(): string {
   const lines: string[] = [];
-  lines.push("# Entropiq POC smoke — 2026-05-13");
+  lines.push("# Sentropic POC smoke — 2026-05-13");
   lines.push("");
   lines.push(
-    "Empirical decision: can opendb-node's pgwire surface serve a Drizzle-backed read path against an entropiq-shaped table?"
+    "Empirical decision: can opendb-node's pgwire surface serve a Drizzle-backed read path against an sentropic-shaped table?"
   );
   lines.push("");
-  lines.push("Reproduce: `npm run poc:entropiq:smoke`.");
+  lines.push("Reproduce: `npm run poc:sentropic:smoke`.");
   lines.push("");
   lines.push("## Probe matrix");
   lines.push("");
@@ -449,13 +449,13 @@ function renderVerdict(): string {
     "2. **SQL surface micro-sprint (proposed Sprint 12.1)** — add no-FROM `SELECT <expr>` literals (and at minimum `SELECT 1`, `SELECT version()`) plus explicit column projection in `SELECT`. These are both pre-handshake probes pg/Drizzle emit unconditionally."
   );
   lines.push(
-    "3. **TIMESTAMP literal grammar** — accept Postgres-style `'2026-05-13 00:00:00'` and ISO-8601 `'2026-05-13T00:00:00Z'` in `INSERT` text values. Without this no realistic entropiq seed can be replayed."
+    "3. **TIMESTAMP literal grammar** — accept Postgres-style `'2026-05-13 00:00:00'` and ISO-8601 `'2026-05-13T00:00:00Z'` in `INSERT` text values. Without this no realistic sentropic seed can be replayed."
   );
   lines.push("");
   lines.push("## Next action (proposed)");
   lines.push("");
   lines.push(
-    "- Promote Sprint 12 out of the parked state and design Sprint 12.1 (SQL surface gaps surfaced here) at the same time. Land them together as a single PR before re-running this smoke; the smoke is the green-light gate for the table-level read-only POC (entropiq seed + HTTP route)."
+    "- Promote Sprint 12 out of the parked state and design Sprint 12.1 (SQL surface gaps surfaced here) at the same time. Land them together as a single PR before re-running this smoke; the smoke is the green-light gate for the table-level read-only POC (sentropic seed + HTTP route)."
   );
   return lines.join("\n");
 }
@@ -470,7 +470,7 @@ async function main(): Promise<void> {
   const verdict = renderVerdict();
   console.log("");
   console.log(verdict);
-  const reportPath = join(repoRoot, "docs", "bench", "entropiq-poc-2026-05-13.md");
+  const reportPath = join(repoRoot, "docs", "bench", "sentropic-poc-2026-05-13.md");
   mkdirSync(dirname(reportPath), { recursive: true });
   writeFileSync(reportPath, verdict + "\n", "utf8");
   console.log(`\n[ok] wrote ${reportPath}`);

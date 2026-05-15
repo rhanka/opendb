@@ -1,8 +1,8 @@
 # OpenDB Milestone 2 Sprint 12 Design — pgwire Extended Protocol
 
 Status: **active prerequisite for Sprint 13** (promoted 2026-05-13).
-The Sprint 13 smoke (`tools/entropiq-poc/smoke.ts`,
-`docs/bench/entropiq-poc-2026-05-13.md`) showed every Drizzle query
+The Sprint 13 smoke (`tools/sentropic-poc/smoke.ts`,
+`docs/bench/sentropic-poc-2026-05-13.md`) showed every Drizzle query
 path goes through Extended (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`)
 and opendb-node rejects each tag with `unsupported message tag`.
 Without Sprint 12, no Drizzle read can complete.

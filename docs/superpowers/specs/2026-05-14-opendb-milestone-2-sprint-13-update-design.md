@@ -1,8 +1,8 @@
 # OpenDB Milestone 2 Sprint 13 Design — UPDATE
 
 Status: active (2026-05-14). Triaged from
-`docs/superpowers/audits/2026-05-14-entropiq-substitution-gap.md`
-(126 `.update(...)` sites in entropiq, blocks ~25 % of HTTP routes).
+`docs/superpowers/audits/2026-05-14-sentropic-substitution-gap.md`
+(126 `.update(...)` sites in sentropic, blocks ~25 % of HTTP routes).
 
 ## Goal
 
@@ -62,4 +62,4 @@ WHERE <pk> = <literal>`.
 ## Acceptance
 
 Standard verifications green plus a new probe in
-`tools/entropiq-poc/smoke.ts` (D1) passes.
+`tools/sentropic-poc/smoke.ts` (D1) passes.

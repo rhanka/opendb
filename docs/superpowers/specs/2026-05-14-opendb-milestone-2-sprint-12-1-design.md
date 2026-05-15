@@ -1,11 +1,11 @@
 # OpenDB Milestone 2 Sprint 12.1 Design — SQL surface gaps for POC
 
 Status: active (2026-05-14). Triaged from
-`docs/bench/entropiq-poc-2026-05-13.md` probes A1, A3, A5.
+`docs/bench/sentropic-poc-2026-05-13.md` probes A1, A3, A5.
 
 ## Goal
 
-Close the three SQL-surface gaps surfaced by the entropiq POC smoke so
+Close the three SQL-surface gaps surfaced by the sentropic POC smoke so
 the simple-query handshake path returns sensible responses, and so the
 TIMESTAMP literal grammar accepts Postgres + ISO-8601 forms.
 
@@ -91,5 +91,5 @@ Probe → fix mapping:
 
 ## Acceptance
 
-Standard verifications green plus `npm run poc:entropiq:smoke` shows
+Standard verifications green plus `npm run poc:sentropic:smoke` shows
 A1/A3/A5 = PASS (B1/C1/C2 still FAIL pending Sprint 12).
