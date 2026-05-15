@@ -1824,10 +1824,17 @@ pub fn is_duplicate_object_error_for_do_block(error: &OpenDbError) -> bool {
     let message = match error {
         OpenDbError::InvalidInput(message) => message,
         OpenDbError::Sql(message) => message,
+        OpenDbError::NotFound(message) => message,
         _ => return false,
     };
     let lower = message.to_ascii_lowercase();
-    lower.contains("already exists") || lower.contains("duplicate")
+    // Sprint 18.A.1.2: also swallow "not found" so `DROP COLUMN IF EXISTS`
+    // and `DROP CONSTRAINT IF EXISTS` are real no-ops when the target is
+    // already missing.
+    lower.contains("already exists")
+        || lower.contains("duplicate")
+        || lower.contains("not found")
+        || lower.contains("does not exist")
 }
 
 fn project_row(

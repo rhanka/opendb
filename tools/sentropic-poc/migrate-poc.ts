@@ -142,12 +142,84 @@ async function spawnOpenDbNode(): Promise<{ port: number; cleanup: () => Promise
 }
 
 function splitDrizzleStatements(sql: string): string[] {
-  // Drizzle separator (literal). Statements may also contain raw `;` so we
-  // do NOT split on `;`. Each chunk is trimmed; empty chunks dropped.
-  return sql
+  // First-pass: split on Drizzle's explicit `--> statement-breakpoint`
+  // marker (used by `drizzle-kit generate`).
+  const primary = sql
     .split("--> statement-breakpoint")
     .map((chunk) => chunk.trim())
     .filter((chunk) => chunk.length > 0);
+  // Second-pass: hand-written migrations (0020, 0021) skip the marker and
+  // rely on raw `;` to separate statements. Re-split each primary chunk on
+  // top-level semicolons (outside single-quoted strings, $$-delimited
+  // bodies, and `--`/`/* */` comments). DO blocks contain semicolons inside
+  // their `$$ ... $$` bodies so that delimiter must be respected.
+  const out: string[] = [];
+  for (const chunk of primary) {
+    out.push(...splitOnTopLevelSemicolons(chunk));
+  }
+  return out;
+}
+
+function splitOnTopLevelSemicolons(input: string): string[] {
+  const result: string[] = [];
+  let buf = "";
+  let i = 0;
+  let inSingleQuote = false;
+  let inDollarBody = false;
+  while (i < input.length) {
+    const c = input[i];
+    if (!inSingleQuote && !inDollarBody) {
+      // `--` line comment skip
+      if (c === "-" && input[i + 1] === "-") {
+        while (i < input.length && input[i] !== "\n") {
+          buf += input[i];
+          i += 1;
+        }
+        continue;
+      }
+      // `/* */` block comment skip
+      if (c === "/" && input[i + 1] === "*") {
+        buf += "/*";
+        i += 2;
+        while (i + 1 < input.length && !(input[i] === "*" && input[i + 1] === "/")) {
+          buf += input[i];
+          i += 1;
+        }
+        if (i + 1 < input.length) {
+          buf += "*/";
+          i += 2;
+        }
+        continue;
+      }
+      // `$$` enter dollar-quoted body
+      if (c === "$" && input[i + 1] === "$") {
+        inDollarBody = true;
+        buf += "$$";
+        i += 2;
+        continue;
+      }
+    } else if (inDollarBody && c === "$" && input[i + 1] === "$") {
+      inDollarBody = false;
+      buf += "$$";
+      i += 2;
+      continue;
+    }
+    if (!inDollarBody && c === "'") {
+      inSingleQuote = !inSingleQuote;
+    }
+    if (c === ";" && !inSingleQuote && !inDollarBody) {
+      const trimmed = buf.trim();
+      if (trimmed.length > 0) result.push(trimmed);
+      buf = "";
+      i += 1;
+      continue;
+    }
+    buf += c;
+    i += 1;
+  }
+  const trailing = buf.trim();
+  if (trailing.length > 0) result.push(trailing);
+  return result;
 }
 
 async function runMigrations(port: number): Promise<void> {
