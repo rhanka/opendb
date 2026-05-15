@@ -80,7 +80,7 @@ impl SqlEngine {
                     .table(&table)
                     .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {table}")))?;
                 let columns = table_state.columns.clone();
-                let now_microseconds = (self.next_tx + 1) as i64;
+                let now_microseconds = wall_clock_microseconds();
                 let column_values = materialize_insert_values(
                     &table,
                     &columns,
@@ -232,8 +232,21 @@ impl SqlEngine {
                 order_by,
                 limit,
                 offset,
+                columns,
+                group_by,
+                having,
             } => self
-                .select_joined(left, join, where_clause, order_by, limit, offset)
+                .select_joined(
+                    left,
+                    join,
+                    where_clause,
+                    order_by,
+                    limit,
+                    offset,
+                    columns,
+                    group_by,
+                    having,
+                )
                 .map(|(result, route)| PreparedQuery::Read { result, route }),
             Statement::Begin => Ok(PreparedQuery::Read {
                 result: QueryResult::Command {
@@ -608,18 +621,35 @@ impl SqlEngine {
             })
             .collect();
         let all_columns = table_state.column_names();
+        // Sprint 15.F: a qualified `qualifier.col` reference is valid as long
+        // as `col` exists on the table; the qualifier check is only enforced
+        // in the joined aggregator. We compare by basename here.
+        let column_exists = |name: &str| -> bool {
+            let basename = column_basename(name);
+            all_columns.iter().any(|c| c == name || c == basename)
+        };
         // Validate group_by columns + bare projection columns belong to the table
         // and are listed in GROUP BY.
         for g in group_by {
-            if !all_columns.iter().any(|c| c == g) {
+            if !column_exists(g) {
                 return Err(OpenDbError::Sql(format!(
                     "GROUP BY column {g} not in table {table}"
                 )));
             }
         }
+        // Sprint 15.F: a projection column matches a GROUP BY entry by exact
+        // name OR by bare-suffix equality (so `status` matches `job_queue.status`
+        // and vice versa). Drizzle qualifies the GROUP BY but typically not
+        // the projection, or vice versa.
+        let in_group_by = |name: &str| -> bool {
+            let bare = column_basename(name);
+            group_by
+                .iter()
+                .any(|g| g == name || column_basename(g) == name || g == bare)
+        };
         for item in &projection.items {
             if let AggregateOrColumn::Column(name) = &item.expr {
-                if !group_by.iter().any(|g| g == name) {
+                if !in_group_by(name) {
                     return Err(OpenDbError::Sql(format!(
                         "column {name} must appear in GROUP BY"
                     )));
@@ -627,7 +657,7 @@ impl SqlEngine {
             }
             if let AggregateOrColumn::Aggregate(expr) = &item.expr {
                 if let AggregateArg::Column(name) = &expr.arg {
-                    if !all_columns.iter().any(|c| c == name) {
+                    if !column_exists(name) {
                         return Err(OpenDbError::Sql(format!(
                             "aggregate column {name} not in table {table}"
                         )));
@@ -670,10 +700,7 @@ impl SqlEngine {
                 continue;
             }
             matched_any = true;
-            let key_values: Vec<Value> = group_by
-                .iter()
-                .map(|g| row.get(g).cloned().unwrap_or(Value::Null))
-                .collect();
+            let key_values: Vec<Value> = group_by.iter().map(|g| row_lookup(row, g)).collect();
             let key_str = group_key_string(&key_values);
             let (_, states, having_states) = groups.entry(key_str).or_insert_with(|| {
                 (
@@ -690,7 +717,7 @@ impl SqlEngine {
                 if let AggregateOrColumn::Aggregate(expr) = &item.expr {
                     let value = match &expr.arg {
                         AggregateArg::Star => Value::Int64(1),
-                        AggregateArg::Column(name) => row.get(name).cloned().unwrap_or(Value::Null),
+                        AggregateArg::Column(name) => row_lookup(row, name),
                     };
                     slot.accumulate(expr.func, &value);
                 }
@@ -698,7 +725,7 @@ impl SqlEngine {
             for (slot, expr) in having_states.iter_mut().zip(having_aggs.iter()) {
                 let value = match &expr.arg {
                     AggregateArg::Star => Value::Int64(1),
-                    AggregateArg::Column(name) => row.get(name).cloned().unwrap_or(Value::Null),
+                    AggregateArg::Column(name) => row_lookup(row, name),
                 };
                 slot.accumulate(expr.func, &value);
             }
@@ -740,9 +767,10 @@ impl SqlEngine {
                     .zip(states.iter())
                     .map(|(item, state)| match &item.expr {
                         AggregateOrColumn::Column(name) => {
+                            let bare = column_basename(name);
                             let pos = group_by
                                 .iter()
-                                .position(|g| g == name)
+                                .position(|g| g == name || column_basename(g) == name || g == bare)
                                 .expect("validated above");
                             key_values.get(pos).cloned().unwrap_or(Value::Null)
                         }
@@ -933,6 +961,274 @@ impl AggregateState {
     }
 }
 
+/// Sprint 15.F: smart column lookup for non-joined rows. Tries the exact
+/// name first, then strips a `qualifier.` prefix and retries. Lets the
+/// aggregate fold accept Drizzle-style `"table"."col"` references against
+/// bare-keyed row maps.
+fn row_lookup(row: &std::collections::BTreeMap<String, Value>, name: &str) -> Value {
+    if let Some(v) = row.get(name) {
+        return v.clone();
+    }
+    if let Some(idx) = name.find('.') {
+        let bare = &name[idx + 1..];
+        if let Some(v) = row.get(bare) {
+            return v.clone();
+        }
+    }
+    Value::Null
+}
+
+/// Sprint 15.F: bare column name from a qualified `qualifier.column` form.
+/// Returns the input unchanged if there's no `.` separator.
+fn column_basename(qualified: &str) -> &str {
+    if let Some(idx) = qualified.rfind('.') {
+        &qualified[idx + 1..]
+    } else {
+        qualified
+    }
+}
+
+/// Sprint 15.F: shared finalization for joined SELECT — applies ORDER BY,
+/// LIMIT, OFFSET to a (columns, rows) pair and wraps in a `QueryResult`.
+fn finish_joined(
+    columns: Vec<String>,
+    mut rows: Vec<Vec<Value>>,
+    order_by: Option<&crate::ast::JoinedOrderBy>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    left_table: String,
+) -> OpenDbResult<(QueryResult, RouteIntent)> {
+    if let Some(ob) = order_by {
+        let pos = columns
+            .iter()
+            .position(|c| {
+                c == &ob.column
+                    || column_basename(c) == ob.column.as_str()
+                    || ob
+                        .qualifier
+                        .as_deref()
+                        .map(|q| format!("{}.{}", q, ob.column) == *c)
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                OpenDbError::Sql(format!(
+                    "ORDER BY column {} not in joined projection",
+                    ob.column
+                ))
+            })?;
+        rows.sort_by(|l, r| {
+            let lv = l.get(pos).cloned().unwrap_or(Value::Null);
+            let rv = r.get(pos).cloned().unwrap_or(Value::Null);
+            let ordering = compare_values(&lv, &rv);
+            match ob.direction {
+                crate::ast::OrderDirection::Asc => ordering,
+                crate::ast::OrderDirection::Desc => ordering.reverse(),
+            }
+        });
+    }
+    let off = offset.unwrap_or(0) as usize;
+    let lim = limit.unwrap_or(u64::MAX) as usize;
+    let final_rows: Vec<_> = rows.into_iter().skip(off).take(lim).collect();
+    Ok((
+        QueryResult::Rows {
+            columns,
+            column_types: Vec::new(),
+            rows: final_rows,
+        },
+        RouteIntent::Scan { table: left_table },
+    ))
+}
+
+/// Sprint 15.F: per-group aggregation over already-joined rows. Reuses the
+/// same `AggregateState` machinery as the simple-table aggregator. Column
+/// references in the projection / GROUP BY / HAVING are resolved against the
+/// joined output's qualified column names with bare-name fallback.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_joined_rows(
+    left_table: &str,
+    output_columns: &[String],
+    joined_rows: &[Vec<Value>],
+    projection: &crate::ast::AggregateProjection,
+    group_by: &[String],
+    having: &[crate::ast::HavingPredicate],
+    order_by: Option<&crate::ast::JoinedOrderBy>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> OpenDbResult<(QueryResult, RouteIntent)> {
+    use crate::ast::{AggregateArg, AggregateOrColumn};
+    // Resolve a projection / group-by column name against the joined output:
+    // try exact qualified match, then bare-suffix match.
+    let resolve = |name: &str| -> Option<usize> {
+        output_columns
+            .iter()
+            .position(|c| c == name || column_basename(c) == name)
+    };
+    // Validate group_by + projection columns exist.
+    for g in group_by {
+        if resolve(g).is_none() {
+            return Err(OpenDbError::Sql(format!(
+                "GROUP BY column {g} not found in joined projection"
+            )));
+        }
+    }
+    let in_group_by = |name: &str| -> bool {
+        let bare = column_basename(name);
+        group_by
+            .iter()
+            .any(|g| g == name || column_basename(g) == name || g == bare)
+    };
+    for item in &projection.items {
+        match &item.expr {
+            AggregateOrColumn::Column(name) => {
+                if !in_group_by(name) {
+                    return Err(OpenDbError::Sql(format!(
+                        "column {name} must appear in GROUP BY"
+                    )));
+                }
+                if resolve(name).is_none() {
+                    return Err(OpenDbError::Sql(format!(
+                        "column {name} not found in joined projection"
+                    )));
+                }
+            }
+            AggregateOrColumn::Aggregate(expr) => {
+                if let AggregateArg::Column(name) = &expr.arg {
+                    if resolve(name).is_none() {
+                        return Err(OpenDbError::Sql(format!(
+                            "aggregate column {name} not found in joined projection"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-resolve indices so the inner loop is O(rows * items).
+    let group_by_idx: Vec<usize> = group_by.iter().map(|g| resolve(g).unwrap()).collect();
+    let item_arg_idx: Vec<Option<usize>> = projection
+        .items
+        .iter()
+        .map(|item| match &item.expr {
+            AggregateOrColumn::Column(name) => resolve(name),
+            AggregateOrColumn::Aggregate(expr) => match &expr.arg {
+                AggregateArg::Star => None,
+                AggregateArg::Column(name) => resolve(name),
+            },
+        })
+        .collect();
+    let having_aggs: Vec<crate::ast::AggregateExpr> = having
+        .iter()
+        .filter_map(|p| match &p.expr {
+            AggregateOrColumn::Aggregate(e) => Some(e.clone()),
+            AggregateOrColumn::Column(_) => None,
+        })
+        .collect();
+    let having_arg_idx: Vec<Option<usize>> = having_aggs
+        .iter()
+        .map(|e| match &e.arg {
+            AggregateArg::Star => None,
+            AggregateArg::Column(name) => resolve(name),
+        })
+        .collect();
+
+    let mut groups: std::collections::BTreeMap<
+        String,
+        (Vec<Value>, Vec<AggregateState>, Vec<AggregateState>),
+    > = std::collections::BTreeMap::new();
+    for row in joined_rows {
+        let key_values: Vec<Value> = group_by_idx
+            .iter()
+            .map(|i| row.get(*i).cloned().unwrap_or(Value::Null))
+            .collect();
+        let key_str = group_key_string(&key_values);
+        let (_, states, having_states) = groups.entry(key_str).or_insert_with(|| {
+            (
+                key_values.clone(),
+                projection
+                    .items
+                    .iter()
+                    .map(|_| AggregateState::new())
+                    .collect(),
+                having_aggs.iter().map(|_| AggregateState::new()).collect(),
+            )
+        });
+        for (slot_idx, item) in projection.items.iter().enumerate() {
+            if let AggregateOrColumn::Aggregate(expr) = &item.expr {
+                let value = match (&expr.arg, item_arg_idx[slot_idx]) {
+                    (AggregateArg::Star, _) => Value::Int64(1),
+                    (AggregateArg::Column(_), Some(idx)) => {
+                        row.get(idx).cloned().unwrap_or(Value::Null)
+                    }
+                    (AggregateArg::Column(_), None) => Value::Null,
+                };
+                states[slot_idx].accumulate(expr.func, &value);
+            }
+        }
+        for (slot_idx, expr) in having_aggs.iter().enumerate() {
+            let value = match (&expr.arg, having_arg_idx[slot_idx]) {
+                (AggregateArg::Star, _) => Value::Int64(1),
+                (AggregateArg::Column(_), Some(idx)) => {
+                    row.get(idx).cloned().unwrap_or(Value::Null)
+                }
+                (AggregateArg::Column(_), None) => Value::Null,
+            };
+            having_states[slot_idx].accumulate(expr.func, &value);
+        }
+    }
+
+    // Emit one row per group (or a single empty-set row when no GROUP BY).
+    let mut output_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    let column_names: Vec<String> = projection
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| aggregate_item_default_name(item, idx))
+        .collect();
+    if groups.is_empty() && group_by.is_empty() {
+        let row = projection
+            .items
+            .iter()
+            .map(|item| match &item.expr {
+                AggregateOrColumn::Column(_) => Value::Null,
+                AggregateOrColumn::Aggregate(expr) => AggregateState::new().finalize(expr.func),
+            })
+            .collect();
+        output_rows.push(row);
+    } else {
+        for (_, (key_values, states, having_states)) in &groups {
+            if !having_matches(having, &having_aggs, group_by, key_values, having_states) {
+                continue;
+            }
+            let row: Vec<Value> = projection
+                .items
+                .iter()
+                .zip(states.iter())
+                .map(|(item, state)| match &item.expr {
+                    AggregateOrColumn::Column(name) => {
+                        let bare = column_basename(name);
+                        let pos = group_by
+                            .iter()
+                            .position(|g| g == name || column_basename(g) == name || g == bare)
+                            .expect("validated above");
+                        key_values.get(pos).cloned().unwrap_or(Value::Null)
+                    }
+                    AggregateOrColumn::Aggregate(expr) => state.finalize(expr.func),
+                })
+                .collect();
+            output_rows.push(row);
+        }
+    }
+
+    finish_joined(
+        column_names,
+        output_rows,
+        order_by,
+        limit,
+        offset,
+        left_table.to_owned(),
+    )
+}
+
 /// Sprint 15.C: evaluate the conjunction of HAVING predicates against a
 /// single group. `having_aggs` and `having_states` are aligned: index `i` in
 /// `having_aggs` matches state slot `i` (built during the main fold).
@@ -948,7 +1244,11 @@ fn having_matches(
     for pred in having {
         let lhs_value = match &pred.expr {
             AggregateOrColumn::Column(name) => {
-                let Some(pos) = group_by.iter().position(|g| g == name) else {
+                let bare = column_basename(name);
+                let Some(pos) = group_by
+                    .iter()
+                    .position(|g| g == name || column_basename(g) == name || g == bare)
+                else {
                     return false;
                 };
                 key_values.get(pos).cloned().unwrap_or(Value::Null)
@@ -1085,11 +1385,11 @@ impl SqlEngine {
                     "version".to_owned(),
                 ),
                 SelectExpr::Function(SelectFunction::Now) => (
-                    Value::Timestamp((self.next_tx + 1) as i64),
+                    Value::Timestamp(wall_clock_microseconds()),
                     "now".to_owned(),
                 ),
                 SelectExpr::Function(SelectFunction::CurrentTimestamp) => (
-                    Value::Timestamp((self.next_tx + 1) as i64),
+                    Value::Timestamp(wall_clock_microseconds()),
                     "current_timestamp".to_owned(),
                 ),
             };
@@ -1119,6 +1419,9 @@ impl SqlEngine {
         order_by: Option<crate::ast::JoinedOrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
+        columns: crate::ast::SelectColumns,
+        group_by: Vec<String>,
+        having: Vec<crate::ast::HavingPredicate>,
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
         let left_state = self
             .projection
@@ -1156,16 +1459,31 @@ impl SqlEngine {
                     .get(&join.right_column)
                     .cloned()
                     .unwrap_or(Value::Null);
-                if values_join_match(&left_join_value, &right_join_value) {
-                    matched = true;
-                    let projected = project_joined_row(
-                        &left_columns,
-                        left_row,
-                        &right_columns,
-                        Some(right_row),
-                    );
-                    joined_rows.push(projected);
+                if !values_join_match(&left_join_value, &right_join_value) {
+                    continue;
                 }
+                // Sprint 15.F: ON-clause extra predicates filter the right
+                // row. They typically reference the right table only
+                // (`right.col = literal`); LEFT JOIN semantics treat a
+                // failed extra-pred match as a non-match (left row stays,
+                // right side becomes NULL).
+                if !join.extra.iter().all(|pred| {
+                    let target = match pred.qualifier.as_deref() {
+                        Some(q) if q == join.right => right_row,
+                        Some(q) if q == left_table => left_row,
+                        _ => right_row,
+                    };
+                    target
+                        .get(&pred.column)
+                        .map(|value| values_join_match(value, &pred.value))
+                        .unwrap_or(false)
+                }) {
+                    continue;
+                }
+                matched = true;
+                let projected =
+                    project_joined_row(&left_columns, left_row, &right_columns, Some(right_row));
+                joined_rows.push(projected);
             }
             if !matched && matches!(join.kind, crate::ast::JoinKind::Left) {
                 let projected = project_joined_row(&left_columns, left_row, &right_columns, None);
@@ -1185,6 +1503,65 @@ impl SqlEngine {
                     .map(|value| values_join_match(value, &predicate.value))
                     .unwrap_or(false)
             });
+        }
+
+        // Sprint 15.F: aggregated projection over the joined rows.
+        if let crate::ast::SelectColumns::Aggregated(projection) = &columns {
+            return aggregate_joined_rows(
+                &left_table,
+                &output_columns,
+                &joined_rows,
+                projection,
+                &group_by,
+                &having,
+                order_by.as_ref(),
+                limit,
+                offset,
+            );
+        }
+        if !group_by.is_empty() || !having.is_empty() {
+            return Err(OpenDbError::Sql(
+                "GROUP BY / HAVING require an aggregated projection".to_owned(),
+            ));
+        }
+
+        // Sprint 15.F: explicit-column projection on a joined SELECT. The
+        // returned columns and rows are pruned to only the requested set.
+        if let crate::ast::SelectColumns::Explicit(requested) = &columns {
+            let mut indices: Vec<usize> = Vec::with_capacity(requested.len());
+            for name in requested {
+                let pos = output_columns
+                    .iter()
+                    .position(|c| c == name || column_basename(c) == name.as_str())
+                    .ok_or_else(|| {
+                        OpenDbError::Sql(format!("column {name} not found in joined projection"))
+                    })?;
+                indices.push(pos);
+            }
+            let projected_columns: Vec<String> = indices
+                .iter()
+                .map(|i| column_basename(&output_columns[*i]).to_owned())
+                .collect();
+            joined_rows = joined_rows
+                .into_iter()
+                .map(|row| {
+                    indices
+                        .iter()
+                        .map(|i| row.get(*i).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect();
+            // Replace output_columns with the projected list for downstream
+            // ORDER BY / LIMIT / OFFSET / serialization.
+            let _ = output_columns;
+            return finish_joined(
+                projected_columns,
+                joined_rows,
+                order_by.as_ref(),
+                limit,
+                offset,
+                left_table,
+            );
         }
 
         // ORDER BY
@@ -1489,6 +1866,17 @@ fn materialize_insert_values(
             Ok(result)
         }
     }
+}
+
+/// Sprint 15.G: real wall-clock microseconds-since-epoch for `DEFAULT NOW()`
+/// on omitted INSERT columns. Falls back to 0 if SystemTime panics, which is
+/// only theoretical (e.g., a clock running before UNIX_EPOCH).
+fn wall_clock_microseconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn default_value_for_column(
@@ -2416,7 +2804,15 @@ mod tests {
     }
 
     #[test]
-    fn named_insert_applies_default_now_as_logical_timestamp() {
+    fn named_insert_applies_default_now_as_wall_clock_timestamp() {
+        // Sprint 15.G: DEFAULT NOW() now resolves to a real wall-clock
+        // microseconds-since-epoch (was previously the tx counter, which
+        // showed up as 1970-01-01 in client outputs). Assert the value is
+        // within a reasonable window of "right now".
+        let before_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
         let mut engine = SqlEngine::default();
         engine
             .execute(
@@ -2429,6 +2825,10 @@ mod tests {
         engine
             .execute(parse("INSERT INTO t (id) VALUES (1)").expect("parse"))
             .expect("insert");
+        let after_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
 
         let last = engine.commits().last().expect("commit");
         let Mutation::InsertRow { values, .. } = &last.mutations[0] else {
@@ -2438,7 +2838,13 @@ mod tests {
             .iter()
             .find(|cv| cv.column == "created_at")
             .expect("created_at column");
-        assert_eq!(created_at.value, Value::Timestamp(last.tx_id.0 as i64));
+        let Value::Timestamp(t) = created_at.value else {
+            panic!("expected Timestamp value, got {:?}", created_at.value);
+        };
+        assert!(
+            t >= before_micros && t <= after_micros,
+            "DEFAULT NOW() value {t} not in [{before_micros}, {after_micros}]"
+        );
     }
 
     #[test]

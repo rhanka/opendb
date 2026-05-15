@@ -300,6 +300,19 @@ fn unqualified_column_name(raw: &str) -> String {
     unquote_identifier(last)
 }
 
+/// Sprint 15.F: like `unqualified_column_name` but preserves the qualifier
+/// when present, returning `qualifier.column` (both segments unquoted).
+/// Used by aggregate / GROUP BY / HAVING parsing because joined SELECTs need
+/// to distinguish e.g. `folders.id` from `initiatives.id`.
+fn qualified_column_name(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    if let Some((qual, col)) = trimmed.rsplit_once('.') {
+        format!("{}.{}", unquote_identifier(qual), unquote_identifier(col))
+    } else {
+        unquote_identifier(trimmed)
+    }
+}
+
 fn parse_referential_actions(tail: &str) -> OpenDbResult<(ReferentialAction, ReferentialAction)> {
     let upper = tail.to_ascii_uppercase();
     let mut on_delete = ReferentialAction::NoAction;
@@ -920,7 +933,10 @@ fn parse_group_by(text: &str) -> OpenDbResult<Vec<String>> {
         if trimmed.is_empty() {
             return Err(OpenDbError::Sql("empty GROUP BY column".to_owned()));
         }
-        columns.push(unqualified_column_name(trimmed));
+        // Sprint 15.F: keep the qualifier so joined SELECT can distinguish
+        // `folders.id` from `initiatives.id`. The simple-table aggregator
+        // strips qualifiers via `column_basename` at lookup time.
+        columns.push(qualified_column_name(trimmed));
     }
     if columns.is_empty() {
         return Err(OpenDbError::Sql(
@@ -949,65 +965,87 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
         let aggregated = tokens.iter().any(|token| token_is_aggregate(token));
         let synthetic = format!("SELECT * FROM {after_from}");
         let parsed = parse_select_all(&synthetic)?;
-        let Statement::SelectAll {
-            table,
-            predicate,
-            order_by,
-            limit,
-            offset,
-            group_by,
-            having,
-            ..
-        } = parsed
-        else {
-            return Err(OpenDbError::Sql(
-                "internal: SELECT projection inner parse mismatch".to_owned(),
-            ));
-        };
-        if aggregated {
+        // Build the desired SelectColumns once; reuse for both joined and
+        // simple variants below.
+        let new_columns = if aggregated {
             let items = tokens
                 .iter()
                 .map(|token| parse_aggregate_select_item(token))
                 .collect::<OpenDbResult<Vec<AggregateSelectItem>>>()?;
-            return Ok(Statement::SelectAll {
+            SelectColumns::Aggregated(AggregateProjection { items })
+        } else {
+            let columns = tokens
+                .into_iter()
+                .map(|token| {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+                        Err(OpenDbError::Sql(format!(
+                            "invalid SELECT column: {trimmed}"
+                        )))
+                    } else {
+                        Ok(unqualified_column_name(trimmed))
+                    }
+                })
+                .collect::<OpenDbResult<Vec<String>>>()?;
+            if columns.is_empty() {
+                return Err(OpenDbError::Sql(
+                    "SELECT projection must not be empty".to_owned(),
+                ));
+            }
+            SelectColumns::Explicit(columns)
+        };
+        match parsed {
+            Statement::SelectAll {
                 table,
                 predicate,
                 order_by,
                 limit,
                 offset,
-                columns: SelectColumns::Aggregated(AggregateProjection { items }),
                 group_by,
                 having,
-            });
+                ..
+            } => {
+                return Ok(Statement::SelectAll {
+                    table,
+                    predicate,
+                    order_by,
+                    limit,
+                    offset,
+                    columns: new_columns,
+                    group_by,
+                    having,
+                });
+            }
+            // Sprint 15.F: joined SELECT with explicit/aggregated projection.
+            Statement::Select {
+                left,
+                join,
+                where_clause,
+                order_by,
+                limit,
+                offset,
+                group_by,
+                having,
+                ..
+            } => {
+                return Ok(Statement::Select {
+                    left,
+                    join,
+                    where_clause,
+                    order_by,
+                    limit,
+                    offset,
+                    columns: new_columns,
+                    group_by,
+                    having,
+                });
+            }
+            _ => {
+                return Err(OpenDbError::Sql(
+                    "internal: SELECT projection inner parse mismatch".to_owned(),
+                ));
+            }
         }
-        let columns = tokens
-            .into_iter()
-            .map(|token| {
-                let trimmed = token.trim();
-                if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
-                    Err(OpenDbError::Sql(format!(
-                        "invalid SELECT column: {trimmed}"
-                    )))
-                } else {
-                    Ok(unqualified_column_name(trimmed))
-                }
-            })
-            .collect::<OpenDbResult<Vec<String>>>()?;
-        if columns.is_empty() {
-            return Err(OpenDbError::Sql(
-                "SELECT projection must not be empty".to_owned(),
-            ));
-        }
-        return Ok(Statement::SelectAll {
-            table,
-            predicate,
-            order_by,
-            limit,
-            offset,
-            columns: SelectColumns::Explicit(columns),
-            group_by,
-            having,
-        });
     }
 
     // No FROM → SELECT <expr> [AS alias] [, ...]
@@ -1085,7 +1123,7 @@ fn parse_aggregate_or_column(raw: &str) -> OpenDbResult<AggregateOrColumn> {
             } else if inner.is_empty() {
                 return Err(OpenDbError::Sql(format!("{name}) is missing an argument")));
             } else {
-                AggregateArg::Column(unqualified_column_name(inner))
+                AggregateArg::Column(qualified_column_name(inner))
             };
             return Ok(AggregateOrColumn::Aggregate(AggregateExpr { func, arg }));
         }
@@ -1094,7 +1132,7 @@ fn parse_aggregate_or_column(raw: &str) -> OpenDbResult<AggregateOrColumn> {
     if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
         return Err(OpenDbError::Sql(format!("invalid SELECT item: {trimmed}")));
     }
-    Ok(AggregateOrColumn::Column(unqualified_column_name(trimmed)))
+    Ok(AggregateOrColumn::Column(qualified_column_name(trimmed)))
 }
 
 fn parse_select_expr_item(raw: &str) -> OpenDbResult<SelectExprItem> {
@@ -1183,6 +1221,10 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
     let (rest, offset) = take_trailing_keyword_value(rest, " OFFSET ")?;
     let (rest, limit) = take_trailing_keyword_value(&rest, " LIMIT ")?;
     let (rest, order_by_text) = take_trailing_keyword(&rest, " ORDER BY ");
+    // Sprint 15.F: HAVING + GROUP BY also sit between WHERE and ORDER BY in a
+    // joined SELECT (same grammar as the simple SELECT path).
+    let (rest, having_text) = take_trailing_keyword(&rest, " HAVING ");
+    let (rest, group_by_text) = take_trailing_keyword(&rest, " GROUP BY ");
     let upper_rest = rest.to_ascii_uppercase();
     let (rest, where_text) = if let Some(pos) = upper_rest.find(" WHERE ") {
         let head = rest[..pos].trim_end().to_owned();
@@ -1206,16 +1248,43 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
     let join_pos = upper_rest
         .find(join_keyword)
         .ok_or_else(|| OpenDbError::Sql("join keyword".to_owned()))?;
-    let left_table = rest[..join_pos].trim().to_owned();
+    let left_table = unquote_identifier(rest[..join_pos].trim());
     let right_clause = rest[join_pos + join_keyword.len()..].trim();
     let upper_right = right_clause.to_ascii_uppercase();
     let on_pos = upper_right
         .find(" ON ")
         .ok_or_else(|| OpenDbError::Sql("join requires ON".to_owned()))?;
-    let right_table = right_clause[..on_pos].trim().to_owned();
+    let right_table = unquote_identifier(right_clause[..on_pos].trim());
     let on_expr = right_clause[on_pos + " ON ".len()..].trim();
 
-    let (left_qualified, right_qualified) = parse_join_equality(on_expr)?;
+    // Sprint 15.F: ON expression may be a single equi-join `a = b` OR a
+    // conjunction `a = b AND col = lit [AND ...]`. We split on top-level
+    // `AND` (outside parens/quotes) and require exactly one of the parts to
+    // be the equi-join; the rest are pushed down as right-side filters.
+    let on_unwrapped = strip_optional_outer_parens(on_expr);
+    let on_parts = split_top_level_and(on_unwrapped)?;
+    let mut equi_join: Option<(QualifiedColumn, QualifiedColumn)> = None;
+    let mut extra: Vec<JoinedPredicate> = Vec::new();
+    for part in on_parts {
+        let part = part.trim();
+        // Try to interpret as equi-join (col = col, both qualified).
+        if let Ok((lhs, rhs)) = parse_join_equality(part) {
+            // Prefer the equi-join interpretation only when both sides are
+            // column references. Literal RHS falls through to the predicate
+            // branch below.
+            let both_qualified = lhs.qualifier.is_some() && rhs.qualifier.is_some();
+            if both_qualified && equi_join.is_none() {
+                equi_join = Some((lhs, rhs));
+                continue;
+            }
+        }
+        // Otherwise: parse as `qual.col = literal` predicate to filter right side.
+        let pred = parse_joined_predicate(part)?;
+        extra.push(pred);
+    }
+    let (left_qualified, right_qualified) = equi_join.ok_or_else(|| {
+        OpenDbError::Sql(format!("JOIN ON requires an equi-join clause: {on_expr}"))
+    })?;
     if left_qualified.qualifier.as_deref() != Some(left_table.as_str())
         && right_qualified.qualifier.as_deref() != Some(left_table.as_str())
     {
@@ -1236,6 +1305,7 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         right: right_table,
         left_column,
         right_column,
+        extra,
     };
 
     let where_clause = match where_text {
@@ -1247,6 +1317,14 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         None => None,
     };
 
+    let group_by = match group_by_text.as_deref() {
+        Some(text) => parse_group_by(text)?,
+        None => Vec::new(),
+    };
+    let having = match having_text.as_deref() {
+        Some(text) => parse_having(text)?,
+        None => Vec::new(),
+    };
     Ok(Statement::Select {
         left: left_table,
         join,
@@ -1254,6 +1332,9 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         order_by,
         limit,
         offset,
+        columns: SelectColumns::Star,
+        group_by,
+        having,
     })
 }
 
@@ -1278,15 +1359,45 @@ fn parse_qualified_column(raw: &str) -> OpenDbResult<QualifiedColumn> {
     let trimmed = raw.trim();
     if let Some((qualifier, column)) = trimmed.split_once('.') {
         Ok(QualifiedColumn {
-            qualifier: Some(qualifier.trim().to_owned()),
-            column: column.trim().to_owned(),
+            qualifier: Some(unquote_identifier(qualifier.trim())),
+            column: unquote_identifier(column.trim()),
         })
     } else {
         Ok(QualifiedColumn {
             qualifier: None,
-            column: trimmed.to_owned(),
+            column: unquote_identifier(trimmed),
         })
     }
+}
+
+/// Sprint 15.F: if `expr` is wrapped in a single matching pair of parens that
+/// span the whole expression, strip them. Drizzle wraps `ON` conjunctions
+/// like `ON (a = b AND c = d)`. No-op for `a = b`.
+fn strip_optional_outer_parens(expr: &str) -> &str {
+    let trimmed = expr.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return trimmed;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    // Verify the outer parens actually balance across the entire span: walk
+    // and ensure depth never drops to 0 before the end.
+    let mut depth: i32 = 1;
+    let mut in_quote = false;
+    let bytes = inner.as_bytes();
+    for (i, ch) in bytes.iter().enumerate() {
+        match *ch {
+            b'\'' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => {
+                depth -= 1;
+                if depth == 0 && i + 1 != bytes.len() {
+                    return trimmed; // outer parens don't span the whole expr
+                }
+            }
+            _ => {}
+        }
+    }
+    inner.trim()
 }
 
 fn parse_joined_predicate(raw: &str) -> OpenDbResult<JoinedPredicate> {

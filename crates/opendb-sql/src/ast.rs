@@ -137,6 +137,16 @@ pub enum Statement {
         order_by: Option<JoinedOrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
+        /// Sprint 15.F: explicit projection. `Star` keeps the legacy
+        /// `SELECT *` joined behavior; `Explicit` selects qualified columns;
+        /// `Aggregated` triggers per-group aggregation over the joined rows.
+        columns: SelectColumns,
+        /// Sprint 15.F: optional `GROUP BY` projecting onto the joined rows.
+        /// Empty = no grouping. Required when `columns` is `Aggregated` and
+        /// the projection includes any non-aggregate column.
+        group_by: Vec<String>,
+        /// Sprint 15.F: optional `HAVING` filter applied post-aggregation.
+        having: Vec<HavingPredicate>,
     },
     Begin,
     Commit,
@@ -149,6 +159,12 @@ pub struct JoinClause {
     pub right: String,
     pub left_column: String,
     pub right_column: String,
+    /// Sprint 15.F: extra `col = literal` predicates that appear inside
+    /// `ON (... AND ...)`. Drizzle emits these for tenant-scoped joins
+    /// (`ON (a.fk = b.pk AND b.workspace_id = $1)`), so we filter the right
+    /// side during the join. Empty = legacy `ON a.x = b.y` only.
+    #[doc(hidden)]
+    pub extra: Vec<JoinedPredicate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
