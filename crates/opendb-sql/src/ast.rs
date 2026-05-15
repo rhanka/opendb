@@ -139,8 +139,14 @@ pub enum Statement {
     },
     Select {
         left: String,
-        join: JoinClause,
-        where_clause: Option<JoinedPredicate>,
+        /// Sprint 18.C.1: a chain of one or more JOINs applied left-to-right.
+        /// Index 0 joins `left` with `join.right`; index 1 joins the result
+        /// with `joins[1].right`; etc. Drizzle migrations and route handlers
+        /// frequently emit `T1 LEFT JOIN T2 ... LEFT JOIN T3 ...`.
+        joins: Vec<JoinClause>,
+        /// Sprint 18.C: joined-SELECT WHERE accepts a conjunction of
+        /// `qualifier.col = literal` predicates. Empty = no WHERE.
+        where_clause: Vec<JoinedPredicate>,
         order_by: Option<JoinedOrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,

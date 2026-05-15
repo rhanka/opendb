@@ -143,6 +143,10 @@ poc-migrate: ## Sprint 18.A: rejoue les 27 migrations Drizzle sentropic contre o
 poc-seed: ## Sprint 18.B: migrations + seed minimal Drizzle (workspaces/orgs/folders/initiatives)
 	cd $(WORKTREE) && $(NPM) run poc:sentropic:seed
 
+.PHONY: poc-http
+poc-http: ## Sprint 18.C: HTTP route /api/folders bout-en-bout sur opendb-node
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:http
+
 .PHONY: smoke-k3s
 smoke-k3s: ## Run the k3s cluster smoke (non-destructive default)
 	cd $(WORKTREE) && $(NPM) run smoke:k3s

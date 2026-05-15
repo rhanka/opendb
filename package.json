@@ -21,7 +21,8 @@
     "poc:sentropic:smoke": "tsx tools/sentropic-poc/smoke.ts",
     "poc:sentropic:real": "tsx tools/sentropic-poc/real-smoke.ts",
     "poc:sentropic:migrate": "tsx tools/sentropic-poc/migrate-poc.ts",
-    "poc:sentropic:seed": "tsx tools/sentropic-poc/seed-poc.ts"
+    "poc:sentropic:seed": "tsx tools/sentropic-poc/seed-poc.ts",
+    "poc:sentropic:http": "tsx tools/sentropic-poc/http-poc.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -32,5 +33,9 @@
     "typescript": "^5.0.0",
     "vitest": "^3.0.0",
     "yaml": "^2.0.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.2",
+    "hono": "^4.12.18"
   }
 }

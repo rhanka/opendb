@@ -256,7 +256,7 @@ impl SqlEngine {
             }
             Statement::Select {
                 left,
-                join,
+                joins,
                 where_clause,
                 order_by,
                 limit,
@@ -267,7 +267,7 @@ impl SqlEngine {
             } => self
                 .select_joined(
                     left,
-                    join,
+                    joins,
                     where_clause,
                     order_by,
                     limit,
@@ -1527,8 +1527,8 @@ impl SqlEngine {
     fn select_joined(
         &self,
         left_table: String,
-        join: crate::ast::JoinClause,
-        where_clause: Option<crate::ast::JoinedPredicate>,
+        joins: Vec<crate::ast::JoinClause>,
+        where_clause: Vec<crate::ast::JoinedPredicate>,
         order_by: Option<crate::ast::JoinedOrderBy>,
         limit: Option<u64>,
         offset: Option<u64>,
@@ -1536,85 +1536,141 @@ impl SqlEngine {
         group_by: Vec<String>,
         having: Vec<crate::ast::HavingPredicate>,
     ) -> OpenDbResult<(QueryResult, RouteIntent)> {
+        if joins.is_empty() {
+            return Err(OpenDbError::Sql(
+                "Select requires at least one JOIN".to_owned(),
+            ));
+        }
         let left_state = self
             .projection
             .table(&left_table)
             .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {left_table}")))?;
-        let right_state = self
-            .projection
-            .table(&join.right)
-            .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", join.right)))?;
 
+        // Sprint 18.C.1: build the joined view by walking each JOIN in order.
+        // `output_columns` tracks the fully-qualified `table.col` names so
+        // WHERE / ORDER BY / aggregate column lookups can resolve by suffix.
+        // `joined_rows` is the current cross-product as Vec<Vec<Value>>
+        // indexed by `output_columns`.
         let mut output_columns: Vec<String> = left_state
             .columns
             .iter()
             .map(|column| format!("{left_table}.{}", column.name))
             .collect();
-        output_columns.extend(
-            right_state
-                .columns
+        let mut joined_rows: Vec<Vec<Value>> = left_state
+            .rows
+            .values()
+            .map(|row| {
+                left_state
+                    .column_names()
+                    .iter()
+                    .map(|name| row.get(name).cloned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect();
+
+        for join in &joins {
+            let right_state = self
+                .projection
+                .table(&join.right)
+                .ok_or_else(|| OpenDbError::NotFound(format!("table not found: {}", join.right)))?;
+            let right_column_names = right_state.column_names();
+            // The "left column index" in the current joined view: any
+            // qualified name whose basename matches join.left_column.
+            // Prefer an exact suffix match; if multiple match (rare), fall
+            // back to the first that has any qualifier appearing among
+            // tables seen so far.
+            let left_idx = output_columns
                 .iter()
-                .map(|column| format!("{}.{}", join.right, column.name)),
-        );
-
-        let left_columns = left_state.column_names();
-        let right_columns = right_state.column_names();
-
-        let mut joined_rows: Vec<Vec<Value>> = Vec::new();
-        for (_left_key, left_row) in left_state.rows.iter() {
-            let left_join_value = left_row
-                .get(&join.left_column)
-                .cloned()
-                .unwrap_or(Value::Null);
-            let mut matched = false;
-            for (_right_key, right_row) in right_state.rows.iter() {
-                let right_join_value = right_row
-                    .get(&join.right_column)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                if !values_join_match(&left_join_value, &right_join_value) {
-                    continue;
+                .position(|c| column_basename(c) == join.left_column.as_str())
+                .ok_or_else(|| {
+                    OpenDbError::Sql(format!(
+                        "JOIN ON references unknown left column {}",
+                        join.left_column
+                    ))
+                })?;
+            let mut next_rows: Vec<Vec<Value>> = Vec::with_capacity(joined_rows.len());
+            for row in &joined_rows {
+                let left_value = row.get(left_idx).cloned().unwrap_or(Value::Null);
+                let mut matched = false;
+                for right_row in right_state.rows.values() {
+                    let right_value = right_row
+                        .get(&join.right_column)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if !values_join_match(&left_value, &right_value) {
+                        continue;
+                    }
+                    if !join.extra.iter().all(|pred| {
+                        let target_value = match pred.qualifier.as_deref() {
+                            Some(q) if q == join.right => {
+                                right_row.get(&pred.column).cloned().unwrap_or(Value::Null)
+                            }
+                            Some(_q) => {
+                                let idx = output_columns
+                                    .iter()
+                                    .position(|c| {
+                                        c == &format!(
+                                            "{}.{}",
+                                            pred.qualifier.as_deref().unwrap_or(""),
+                                            pred.column
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        output_columns.iter().position(|c| {
+                                            column_basename(c) == pred.column.as_str()
+                                        })
+                                    });
+                                match idx {
+                                    Some(i) => row.get(i).cloned().unwrap_or(Value::Null),
+                                    None => Value::Null,
+                                }
+                            }
+                            None => right_row.get(&pred.column).cloned().unwrap_or(Value::Null),
+                        };
+                        values_join_match(&target_value, &pred.value)
+                    }) {
+                        continue;
+                    }
+                    matched = true;
+                    let mut extended = row.clone();
+                    for name in &right_column_names {
+                        extended.push(right_row.get(name).cloned().unwrap_or(Value::Null));
+                    }
+                    next_rows.push(extended);
                 }
-                // Sprint 15.F: ON-clause extra predicates filter the right
-                // row. They typically reference the right table only
-                // (`right.col = literal`); LEFT JOIN semantics treat a
-                // failed extra-pred match as a non-match (left row stays,
-                // right side becomes NULL).
-                if !join.extra.iter().all(|pred| {
-                    let target = match pred.qualifier.as_deref() {
-                        Some(q) if q == join.right => right_row,
-                        Some(q) if q == left_table => left_row,
-                        _ => right_row,
-                    };
-                    target
-                        .get(&pred.column)
-                        .map(|value| values_join_match(value, &pred.value))
-                        .unwrap_or(false)
-                }) {
-                    continue;
+                if !matched && matches!(join.kind, crate::ast::JoinKind::Left) {
+                    let mut extended = row.clone();
+                    for _ in &right_column_names {
+                        extended.push(Value::Null);
+                    }
+                    next_rows.push(extended);
                 }
-                matched = true;
-                let projected =
-                    project_joined_row(&left_columns, left_row, &right_columns, Some(right_row));
-                joined_rows.push(projected);
             }
-            if !matched && matches!(join.kind, crate::ast::JoinKind::Left) {
-                let projected = project_joined_row(&left_columns, left_row, &right_columns, None);
-                joined_rows.push(projected);
+            for name in &right_column_names {
+                output_columns.push(format!("{}.{}", join.right, name));
             }
+            joined_rows = next_rows;
         }
 
-        // WHERE
-        if let Some(predicate) = &where_clause {
-            let index = find_qualified_column_position(
-                &output_columns,
-                predicate.qualifier.as_deref(),
-                &predicate.column,
-            )?;
+        // WHERE — Sprint 18.C: conjunction of `qualifier.col = literal`
+        // predicates. Pre-resolve each predicate's column index once so the
+        // retain loop is O(rows × preds) without re-walking output_columns.
+        let where_indices: Vec<usize> = where_clause
+            .iter()
+            .map(|p| {
+                find_qualified_column_position(&output_columns, p.qualifier.as_deref(), &p.column)
+            })
+            .collect::<OpenDbResult<Vec<usize>>>()?;
+        if !where_clause.is_empty() {
             joined_rows.retain(|row| {
-                row.get(index)
-                    .map(|value| values_join_match(value, &predicate.value))
-                    .unwrap_or(false)
+                where_clause
+                    .iter()
+                    .zip(where_indices.iter())
+                    .all(|(p, idx)| {
+                        row.get(*idx)
+                            .map(|value| values_join_match(value, &p.value))
+                            .unwrap_or(false)
+                    })
             });
         }
 

@@ -1688,7 +1688,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
             // Sprint 15.F: joined SELECT with explicit/aggregated projection.
             Statement::Select {
                 left,
-                join,
+                joins,
                 where_clause,
                 order_by,
                 limit,
@@ -1699,7 +1699,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
             } => {
                 return Ok(Statement::Select {
                     left,
-                    join,
+                    joins,
                     where_clause,
                     order_by,
                     limit,
@@ -1903,83 +1903,108 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         (rest, None)
     };
 
-    let (join_kind, join_keyword) = if rest.to_ascii_uppercase().contains(" INNER JOIN ") {
-        (JoinKind::Inner, " INNER JOIN ")
-    } else if rest.to_ascii_uppercase().contains(" LEFT JOIN ") {
-        (JoinKind::Left, " LEFT JOIN ")
-    } else if rest.to_ascii_uppercase().contains(" JOIN ") {
-        (JoinKind::Inner, " JOIN ")
-    } else {
+    // Sprint 18.C.1: walk all JOIN clauses left-to-right, building a chain.
+    // Recognised keywords (in priority order): ` INNER JOIN `, ` LEFT JOIN `,
+    // bare ` JOIN ` (treated as INNER per SQL spec).
+    let join_positions = find_join_keyword_positions(&rest);
+    if join_positions.is_empty() {
         return Err(OpenDbError::Sql("expected JOIN clause".to_owned()));
-    };
-
-    let upper_rest = rest.to_ascii_uppercase();
-    let join_pos = upper_rest
-        .find(join_keyword)
-        .ok_or_else(|| OpenDbError::Sql("join keyword".to_owned()))?;
-    let left_table = unquote_identifier(rest[..join_pos].trim());
-    let right_clause = rest[join_pos + join_keyword.len()..].trim();
-    let upper_right = right_clause.to_ascii_uppercase();
-    let on_pos = upper_right
-        .find(" ON ")
-        .ok_or_else(|| OpenDbError::Sql("join requires ON".to_owned()))?;
-    let right_table = unquote_identifier(right_clause[..on_pos].trim());
-    let on_expr = right_clause[on_pos + " ON ".len()..].trim();
-
-    // Sprint 15.F: ON expression may be a single equi-join `a = b` OR a
-    // conjunction `a = b AND col = lit [AND ...]`. We split on top-level
-    // `AND` (outside parens/quotes) and require exactly one of the parts to
-    // be the equi-join; the rest are pushed down as right-side filters.
-    let on_unwrapped = strip_optional_outer_parens(on_expr);
-    let on_parts = split_top_level_and(on_unwrapped)?;
-    let mut equi_join: Option<(QualifiedColumn, QualifiedColumn)> = None;
-    let mut extra: Vec<JoinedPredicate> = Vec::new();
-    for part in on_parts {
-        let part = part.trim();
-        // Try to interpret as equi-join (col = col, both qualified).
-        if let Ok((lhs, rhs)) = parse_join_equality(part) {
-            // Prefer the equi-join interpretation only when both sides are
-            // column references. Literal RHS falls through to the predicate
-            // branch below.
-            let both_qualified = lhs.qualifier.is_some() && rhs.qualifier.is_some();
-            if both_qualified && equi_join.is_none() {
-                equi_join = Some((lhs, rhs));
-                continue;
+    }
+    let left_table = unquote_identifier(rest[..join_positions[0].pos].trim());
+    let known_tables: Vec<String> = std::iter::once(left_table.clone())
+        .chain(join_positions.iter().filter_map(|hit| {
+            // We'll fill these in once we extract right_table per join below.
+            let _ = hit;
+            None
+        }))
+        .collect();
+    let _ = known_tables;
+    // Compute the end of each join-segment as the start of the next join
+    // keyword (or end-of-input for the last segment).
+    let mut joins: Vec<JoinClause> = Vec::with_capacity(join_positions.len());
+    let mut tables_seen: Vec<String> = vec![left_table.clone()];
+    for (i, hit) in join_positions.iter().enumerate() {
+        let seg_start = hit.pos + hit.keyword.len();
+        let seg_end = join_positions
+            .get(i + 1)
+            .map(|h| h.pos)
+            .unwrap_or(rest.len());
+        let segment = rest[seg_start..seg_end].trim();
+        let upper_segment = segment.to_ascii_uppercase();
+        let on_pos = upper_segment
+            .find(" ON ")
+            .ok_or_else(|| OpenDbError::Sql("join requires ON".to_owned()))?;
+        let right_table = unquote_identifier(segment[..on_pos].trim());
+        let on_expr = segment[on_pos + " ON ".len()..].trim();
+        let on_unwrapped = strip_optional_outer_parens(on_expr);
+        let on_parts = split_top_level_and(on_unwrapped)?;
+        let mut equi_join: Option<(QualifiedColumn, QualifiedColumn)> = None;
+        let mut extra: Vec<JoinedPredicate> = Vec::new();
+        for part in on_parts {
+            let part = part.trim();
+            if let Ok((lhs, rhs)) = parse_join_equality(part) {
+                let both_qualified = lhs.qualifier.is_some() && rhs.qualifier.is_some();
+                if both_qualified && equi_join.is_none() {
+                    equi_join = Some((lhs, rhs));
+                    continue;
+                }
             }
+            let pred = parse_joined_predicate(part)?;
+            extra.push(pred);
         }
-        // Otherwise: parse as `qual.col = literal` predicate to filter right side.
-        let pred = parse_joined_predicate(part)?;
-        extra.push(pred);
-    }
-    let (left_qualified, right_qualified) = equi_join.ok_or_else(|| {
-        OpenDbError::Sql(format!("JOIN ON requires an equi-join clause: {on_expr}"))
-    })?;
-    if left_qualified.qualifier.as_deref() != Some(left_table.as_str())
-        && right_qualified.qualifier.as_deref() != Some(left_table.as_str())
-    {
-        return Err(OpenDbError::Sql(format!(
-            "JOIN ON clause must reference the left table {left_table}"
-        )));
-    }
-    // Normalize so left_column comes from left_table.
-    let (left_column, right_column) =
-        if left_qualified.qualifier.as_deref() == Some(left_table.as_str()) {
-            (left_qualified.column, right_qualified.column)
-        } else {
-            (right_qualified.column, left_qualified.column)
+        let (qual_a, qual_b) = equi_join.ok_or_else(|| {
+            OpenDbError::Sql(format!("JOIN ON requires an equi-join clause: {on_expr}"))
+        })?;
+        // For a chained join, the "left side" of this equi-join may be any
+        // previously-seen table (T1.col = Tnew.col), and the "right side"
+        // must be the newly-introduced right_table. Normalize so the
+        // JoinClause stores left_column from a previously-seen table and
+        // right_column from `right_table`.
+        let a_is_prev = qual_a
+            .qualifier
+            .as_deref()
+            .map(|q| tables_seen.iter().any(|t| t == q))
+            .unwrap_or(false);
+        let b_is_prev = qual_b
+            .qualifier
+            .as_deref()
+            .map(|q| tables_seen.iter().any(|t| t == q))
+            .unwrap_or(false);
+        let (left_column, right_column) = match (a_is_prev, b_is_prev) {
+            (true, _) if qual_b.qualifier.as_deref() == Some(right_table.as_str()) => {
+                (qual_a.column, qual_b.column)
+            }
+            (_, true) if qual_a.qualifier.as_deref() == Some(right_table.as_str()) => {
+                (qual_b.column, qual_a.column)
+            }
+            _ => {
+                return Err(OpenDbError::Sql(format!(
+                    "JOIN ON clause must reference a previously-seen table and {right_table}"
+                )));
+            }
         };
-
-    let join = JoinClause {
-        kind: join_kind,
-        right: right_table,
-        left_column,
-        right_column,
-        extra,
-    };
+        joins.push(JoinClause {
+            kind: hit.kind,
+            right: right_table.clone(),
+            left_column,
+            right_column,
+            extra,
+        });
+        tables_seen.push(right_table);
+    }
 
     let where_clause = match where_text {
-        Some(text) => Some(parse_joined_predicate(&text)?),
-        None => None,
+        Some(text) => {
+            // Sprint 18.C.1: Drizzle wraps multi-clause WHERE in parens,
+            // e.g. `WHERE ("a" = 1 AND "b" = 2)`. Strip the outer parens
+            // before splitting so the conjunction is visible at top level.
+            let unwrapped = strip_optional_outer_parens(text.trim()).to_owned();
+            split_top_level_and(&unwrapped)?
+                .into_iter()
+                .map(parse_joined_predicate)
+                .collect::<OpenDbResult<Vec<_>>>()?
+        }
+        None => Vec::new(),
     };
     let order_by = match order_by_text {
         Some(text) => Some(parse_joined_order_by(&text)?),
@@ -1996,7 +2021,7 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
     };
     Ok(Statement::Select {
         left: left_table,
-        join,
+        joins,
         where_clause,
         order_by,
         limit,
@@ -2005,6 +2030,56 @@ fn parse_select_with_join(rest: &str) -> OpenDbResult<Statement> {
         group_by,
         having,
     })
+}
+
+/// Sprint 18.C.1: find every JOIN-keyword position in a clause. Returns hits
+/// sorted by `pos` ascending so callers can slice in order. `INNER JOIN` and
+/// `LEFT JOIN` are matched before bare `JOIN` so we don't double-count
+/// `INNER JOIN` as a bare JOIN.
+struct JoinKeywordHit {
+    pos: usize,
+    kind: JoinKind,
+    keyword: &'static str,
+}
+fn find_join_keyword_positions(rest: &str) -> Vec<JoinKeywordHit> {
+    let upper = rest.to_ascii_uppercase();
+    let mut hits: Vec<JoinKeywordHit> = Vec::new();
+    let bytes = upper.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // ` INNER JOIN ` (12 bytes)
+        if i + 12 <= bytes.len() && &bytes[i..i + 12] == b" INNER JOIN " {
+            hits.push(JoinKeywordHit {
+                pos: i,
+                kind: JoinKind::Inner,
+                keyword: " INNER JOIN ",
+            });
+            i += 12;
+            continue;
+        }
+        // ` LEFT JOIN ` (11 bytes)
+        if i + 11 <= bytes.len() && &bytes[i..i + 11] == b" LEFT JOIN " {
+            hits.push(JoinKeywordHit {
+                pos: i,
+                kind: JoinKind::Left,
+                keyword: " LEFT JOIN ",
+            });
+            i += 11;
+            continue;
+        }
+        // ` JOIN ` (6 bytes) — only when not preceded by INNER/LEFT keyword.
+        if i + 6 <= bytes.len() && &bytes[i..i + 6] == b" JOIN " {
+            hits.push(JoinKeywordHit {
+                pos: i,
+                kind: JoinKind::Inner,
+                keyword: " JOIN ",
+            });
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+    hits
 }
 
 #[derive(Debug)]
