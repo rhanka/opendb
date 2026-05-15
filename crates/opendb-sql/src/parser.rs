@@ -11,7 +11,12 @@ use opendb_storage::commit_stream::{
 };
 
 pub fn parse(sql: &str) -> OpenDbResult<Statement> {
-    let trimmed = sql.trim();
+    // Sprint 18.A.1.1: strip SQL comments before any keyword sniffing.
+    // Drizzle migrations routinely lead with `-- migration description` lines
+    // or interleave `/* ... */` notes; the rest of the parser would otherwise
+    // see the comment as the statement and reject it as `unsupported SQL`.
+    let stripped = strip_sql_comments(sql);
+    let trimmed = stripped.trim();
     let normalized = if let Some(without_terminator) = trimmed.strip_suffix(';') {
         if without_terminator.trim_end().ends_with(';') {
             return Err(OpenDbError::Sql(
@@ -53,6 +58,73 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     } else {
         Err(OpenDbError::Sql(format!("unsupported SQL: {normalized}")))
     }
+}
+
+/// Sprint 18.A.1.1: strip SQL line comments (`-- ... \n`) and block comments
+/// (`/* ... */`) outside of single-quoted string literals. Quoted strings are
+/// preserved verbatim so a literal like `'foo -- bar'` keeps its content.
+/// Operates byte-by-byte (safe for ASCII syntax; UTF-8 inside literals or
+/// identifiers is passed through unchanged).
+fn strip_sql_comments(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quote {
+            out.push(c as char);
+            if c == b'\'' {
+                // Postgres doubled-quote escape: `''` stays inside the literal.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            in_quote = true;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        // Line comment: `-- ... \n` (or end-of-input).
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            // Replace the comment span with a single space so adjacent tokens
+            // don't accidentally fuse (`SELECT 1--c\nFROM t` → `SELECT 1 FROM t`).
+            out.push(' ');
+            continue;
+        }
+        // Block comment: `/* ... */`. Postgres allows nesting; we follow.
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
 }
 
 /// Sprint 13: `UPDATE <table> SET <col1> = <lit1> [, ...] WHERE <pk> = <literal>`.
