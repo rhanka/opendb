@@ -1,6 +1,6 @@
 // Sprint 18.C: end-to-end HTTP POC for the sentropic `GET /api/folders`
 // route, served entirely by opendb-node. The handler logic is replicated
-// verbatim from `/home/antoinefa/src/entropiq/api/src/routes/api/folders.ts`
+// verbatim from `/home/antoinefa/src/sentropic/api/src/routes/api/folders.ts`
 // lines 139-198 so the SQL hitting opendb is byte-for-byte the production
 // query. We do NOT spawn the full sentropic server — its startup performs
 // LISTEN/NOTIFY, admin-approval sweeps, index ensures, etc. that hit
@@ -31,7 +31,7 @@ const nodeBin = join(
   "debug",
   process.platform === "win32" ? "opendb-node.exe" : "opendb-node"
 );
-const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/entropiq/api/drizzle";
+const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/sentropic/api/drizzle";
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // --- Drizzle schema (exact subset, same as seed-poc) -----------------------
@@ -445,6 +445,69 @@ function buildFoldersRouter(db: ReturnType<typeof drizzle>) {
     // GROUP BY surface.
     return c.json({ items: [] });
   });
+
+  // Sprint 19.A: GET /folders/:id (api/src/routes/api/folders.ts:346-385)
+  // — single folder with LEFT JOIN organizations + WHERE id=$1 AND ws=$2.
+  app.get("/folders/:id", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const targetWorkspaceId = user.workspaceId;
+    const id = c.req.param("id");
+    const [folder] = await db
+      .select({
+        id: folders.id,
+        name: folders.name,
+        description: folders.description,
+        organizationId: folders.organizationId,
+        organizationName: organizations.name,
+        matrixConfig: folders.matrixConfig,
+        executiveSummary: folders.executiveSummary,
+        status: folders.status,
+        createdAt: folders.createdAt
+      })
+      .from(folders)
+      .leftJoin(
+        organizations,
+        and(
+          eq(folders.organizationId, organizations.id),
+          eq(organizations.workspaceId, targetWorkspaceId)
+        )
+      )
+      .where(and(eq(folders.id, id), eq(folders.workspaceId, targetWorkspaceId)));
+    if (!folder) return c.json({ message: "Not found" }, 404);
+    return c.json(folder);
+  });
+
+  // Sprint 19.A: GET /organizations (api/src/routes/api/organizations.ts:146-153)
+  app.get("/organizations", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const rows = await db
+      .select()
+      .from(organizations)
+      .where(eq(organizations.workspaceId, user.workspaceId));
+    return c.json({ items: rows });
+  });
+
+  // Sprint 19.A: GET /initiatives (api/src/routes/api/initiatives.ts:390-399)
+  // — optional folder_id query filter narrows the WHERE conjunction.
+  app.get("/initiatives", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const folderId = c.req.query("folder_id");
+    const rows = folderId
+      ? await db
+          .select()
+          .from(initiatives)
+          .where(
+            and(
+              eq(initiatives.workspaceId, user.workspaceId),
+              eq(initiatives.folderId, folderId)
+            )
+          )
+      : await db
+          .select()
+          .from(initiatives)
+          .where(eq(initiatives.workspaceId, user.workspaceId));
+    return c.json({ items: rows });
+  });
   return app;
 }
 
@@ -545,6 +608,88 @@ async function main(): Promise<void> {
         const items = (json as { items: unknown[] }).items;
         if (!Array.isArray(items)) return `items not an array`;
         if (items.length !== 3) return `expected 3 folders (all in org-poc), got ${items.length}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.A: H3 — GET /folders/:id (single folder + leftJoin orgs)
+    await probeHttp(
+      httpPort,
+      "/folders/fld-1",
+      "GET /api/folders/fld-1",
+      "H3",
+      (json) => {
+        const obj = json as { id?: string; organizationName?: string; name?: string };
+        if (obj.id !== "fld-1") return `expected id=fld-1, got ${obj.id}`;
+        if (obj.organizationName !== "POC Org") return `org-join mismatch: ${obj.organizationName}`;
+        if (obj.name !== "Folder Alpha") return `name mismatch: ${obj.name}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.A: H4 — GET /folders/:id with unknown id → 404
+    try {
+      const r404 = await fetch(`http://127.0.0.1:${httpPort}/folders/does-not-exist`);
+      if (r404.status === 404) {
+        record("H4", "GET /api/folders/does-not-exist (expect 404)", {
+          kind: "pass",
+          details: "status=404"
+        });
+      } else {
+        record("H4", "GET /api/folders/does-not-exist (expect 404)", {
+          kind: "fail",
+          details: `expected 404, got ${r404.status}`
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      record("H4", "GET /api/folders/does-not-exist (expect 404)", {
+        kind: "fail",
+        details: message
+      });
+    }
+
+    // Sprint 19.A: H5 — GET /organizations
+    await probeHttp(
+      httpPort,
+      "/organizations",
+      "GET /api/organizations",
+      "H5",
+      (json) => {
+        const items = (json as { items: unknown[] }).items;
+        if (!Array.isArray(items)) return `items not an array`;
+        if (items.length !== 1) return `expected 1 org in workspace, got ${items.length}`;
+        const first = items[0] as { id: string; name: string };
+        if (first.id !== "org-poc") return `org id mismatch: ${first.id}`;
+        if (first.name !== "POC Org") return `org name mismatch: ${first.name}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.A: H6 — GET /initiatives (5 total in workspace)
+    await probeHttp(
+      httpPort,
+      "/initiatives",
+      "GET /api/initiatives",
+      "H6",
+      (json) => {
+        const items = (json as { items: unknown[] }).items;
+        if (!Array.isArray(items)) return `items not an array`;
+        if (items.length !== 5) return `expected 5 initiatives, got ${items.length}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.A: H7 — GET /initiatives?folder_id=fld-1 (3 initiatives)
+    await probeHttp(
+      httpPort,
+      "/initiatives?folder_id=fld-1",
+      "GET /api/initiatives?folder_id=fld-1",
+      "H7",
+      (json) => {
+        const items = (json as { items: unknown[] }).items;
+        if (!Array.isArray(items)) return `items not an array`;
+        if (items.length !== 3) return `expected 3 initiatives in fld-1, got ${items.length}`;
         return null;
       }
     );

@@ -200,7 +200,7 @@ db-status: ## Check whether the local opendb-node is up
 
 # ----- Audit (cross-repo grep helpers) --------------------------------------
 
-SENTROPIC_ROOT ?= /home/antoinefa/src/entropiq/api
+SENTROPIC_ROOT ?= /home/antoinefa/src/sentropic/api
 
 .PHONY: audit-sentropic-tables
 audit-sentropic-tables: ## Count Drizzle pgTable() declarations in sentropic

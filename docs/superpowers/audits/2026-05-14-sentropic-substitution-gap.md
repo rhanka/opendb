@@ -8,7 +8,7 @@ exécute `SELECT * / SELECT col WHERE eq(...)` end-to-end.
 **zéro modification côté sentropic**. Drizzle + `pg` + 50 tables +
 toutes les routes HTTP.
 
-## Audit chiffré sur `/home/antoinefa/src/entropiq/api/`
+## Audit chiffré sur `/home/antoinefa/src/sentropic/api/`
 
 ### Schéma DDL
 

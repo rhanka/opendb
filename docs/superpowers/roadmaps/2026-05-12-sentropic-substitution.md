@@ -1,7 +1,7 @@
 # OpenDB → Sentropic Substitution Roadmap
 
 Date: 2026-05-12
-Target product: `/home/antoinefa/src/entropiq` (Drizzle ORM + PostgreSQL via
+Target product: `/home/antoinefa/src/sentropic` (Drizzle ORM + PostgreSQL via
 `pg` Pool, 50 tables, 28 migrations).
 
 ## Why this exists

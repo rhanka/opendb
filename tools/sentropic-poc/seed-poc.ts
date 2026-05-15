@@ -31,7 +31,7 @@ const nodeBin = join(
   "debug",
   process.platform === "win32" ? "opendb-node.exe" : "opendb-node"
 );
-const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/entropiq/api/drizzle";
+const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/sentropic/api/drizzle";
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // --- Drizzle schema mirror — exact subset of api/src/db/schema.ts used by

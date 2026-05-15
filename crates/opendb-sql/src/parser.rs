@@ -1643,6 +1643,10 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
                 .collect::<OpenDbResult<Vec<AggregateSelectItem>>>()?;
             SelectColumns::Aggregated(AggregateProjection { items })
         } else {
+            // Sprint 19.A: keep the qualifier (e.g., `organizations.name`)
+            // so multi-JOIN projections that surface two columns with the
+            // same bare suffix (`folders.name` vs `organizations.name`) can
+            // be resolved unambiguously by the executor.
             let columns = tokens
                 .into_iter()
                 .map(|token| {
@@ -1652,7 +1656,7 @@ fn parse_select_with_projection(sql: &str) -> OpenDbResult<Statement> {
                             "invalid SELECT column: {trimmed}"
                         )))
                     } else {
-                        Ok(unqualified_column_name(trimmed))
+                        Ok(qualified_column_name(trimmed))
                     }
                 })
                 .collect::<OpenDbResult<Vec<String>>>()?;
@@ -2305,7 +2309,10 @@ fn parse_predicate(raw: &str) -> OpenDbResult<Predicate> {
 
 /// Sprint 14.B: parse a conjunctive WHERE clause (`a = 1 AND b > 2 AND ...`).
 fn parse_predicate_conjunction(raw: &str) -> OpenDbResult<Vec<Predicate>> {
-    split_top_level_and(raw)?
+    // Sprint 19.A: Drizzle wraps conjunctions in parens (`(a=1 AND b=2)`);
+    // strip them before splitting on AND so the parts are recognised.
+    let unwrapped = strip_optional_outer_parens(raw.trim());
+    split_top_level_and(unwrapped)?
         .into_iter()
         .map(|part| parse_predicate(part.trim()))
         .collect()

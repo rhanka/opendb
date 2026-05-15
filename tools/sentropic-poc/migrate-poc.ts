@@ -1,6 +1,6 @@
 // Sprint 18.A: replay sentropic's actual Drizzle migrations against
 // opendb-node and produce a per-migration verdict. Reads the SQL files
-// directly from /home/antoinefa/src/entropiq/api/drizzle/ (no modification
+// directly from /home/antoinefa/src/sentropic/api/drizzle/ (no modification
 // to the sentropic repo).
 //
 // Each migration file is a sequence of statements separated by Drizzle's
@@ -25,7 +25,7 @@ const nodeBin = join(
   "debug",
   process.platform === "win32" ? "opendb-node.exe" : "opendb-node"
 );
-const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/entropiq/api/drizzle";
+const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/sentropic/api/drizzle";
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 

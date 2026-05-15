@@ -597,14 +597,21 @@ impl SqlEngine {
         let column_names = match columns {
             crate::ast::SelectColumns::Star => all_columns.clone(),
             crate::ast::SelectColumns::Explicit(requested) => {
+                // Sprint 19.A: the parser now keeps `qualifier.col` in the
+                // Explicit list so multi-JOIN projections disambiguate. For
+                // a non-joined SELECT, strip the qualifier when looking up
+                // the bare column on the table.
+                let mut resolved = Vec::with_capacity(requested.len());
                 for name in requested {
-                    if !all_columns.iter().any(|column| column == name) {
+                    let bare = column_basename(name);
+                    if !all_columns.iter().any(|c| c == name || c == bare) {
                         return Err(OpenDbError::Sql(format!(
                             "column {name} not in table {table}"
                         )));
                     }
+                    resolved.push(bare.to_owned());
                 }
-                requested.clone()
+                resolved
             }
             crate::ast::SelectColumns::Aggregated(_) => unreachable!("handled above"),
         };

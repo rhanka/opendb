@@ -1,6 +1,6 @@
 # Sentropic migration replay (Sprint 18.A) — 2026-05-15
 
-Source: `/home/antoinefa/src/entropiq/api/drizzle` (read-only, no modification to sentropic repo).
+Source: `/home/antoinefa/src/sentropic/api/drizzle` (read-only, no modification to sentropic repo).
 
 ## Per-migration verdict
 
