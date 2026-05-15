@@ -441,6 +441,64 @@ async function runRealQueries(port: number): Promise<void> {
           .where(eq(initiatives.status, "completed"));
         return { sql: q.toSQL().sql, rows: () => q };
       }
+    },
+    // Sprint 16.A — INSERT .returning() (no projection: returns all cols)
+    {
+      id: "Q9",
+      description: "folders.ts — db.insert(folders).values(...).returning()",
+      build: () => {
+        const q = db
+          .insert(folders)
+          .values({
+            id: "f-q9",
+            workspaceId: "w1",
+            name: "Q9 folder",
+            status: "completed",
+            createdAt: new Date("2026-05-20T00:00:00Z")
+          })
+          .returning();
+        return { sql: q.toSQL().sql, rows: () => q };
+      }
+    },
+    // Sprint 16.A — INSERT .returning({ id: t.id }) — projection-only
+    {
+      id: "Q10",
+      description:
+        "challenge-manager.ts — db.insert(t).values(...).returning({ id: t.id })",
+      build: () => {
+        const q = db
+          .insert(folders)
+          .values({
+            id: "f-q10",
+            workspaceId: "w1",
+            name: "Q10 folder"
+          })
+          .returning({ id: folders.id });
+        return { sql: q.toSQL().sql, rows: () => q };
+      }
+    },
+    // Sprint 16.B — UPDATE .returning({ matrixConfig: t.matrixConfig })
+    // verbatim from folders.ts: matrix config swap returning the new value.
+    {
+      id: "Q11",
+      description: "folders.ts — db.update(t).set(...).where(...).returning(...)",
+      build: () => {
+        const q = db
+          .update(folders)
+          .set({ matrixConfig: '{"x":1}' })
+          .where(eq(folders.id, "f-q9"))
+          .returning({ matrixConfig: folders.matrixConfig });
+        return { sql: q.toSQL().sql, rows: () => q };
+      }
+    },
+    // Sprint 16.B — DELETE .returning() (entropiq queue-clear pattern)
+    {
+      id: "Q12",
+      description: "queue-clear.ts — db.delete(t).returning()",
+      build: () => {
+        const q = db.delete(folders).where(eq(folders.id, "f-q10")).returning();
+        return { sql: q.toSQL().sql, rows: () => q };
+      }
     }
   ];
 

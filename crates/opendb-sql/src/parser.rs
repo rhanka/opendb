@@ -1,8 +1,8 @@
 use crate::ast::{
     AggregateArg, AggregateExpr, AggregateFunction, AggregateOrColumn, AggregateProjection,
     AggregateSelectItem, HavingPredicate, JoinClause, JoinKind, JoinedOrderBy, JoinedPredicate,
-    OrderBy, OrderDirection, Predicate, SelectColumns, SelectExpr, SelectExprItem, SelectFunction,
-    Statement, WhereOp,
+    OrderBy, OrderDirection, Predicate, ReturningClause, SelectColumns, SelectExpr, SelectExprItem,
+    SelectFunction, Statement, WhereOp,
 };
 use opendb_common::{OpenDbError, OpenDbResult};
 use opendb_storage::commit_stream::{
@@ -60,6 +60,10 @@ fn parse_update(sql: &str) -> OpenDbResult<Statement> {
     let rest = strip_keyword_prefix(sql, "UPDATE ")
         .ok_or_else(|| OpenDbError::Sql("invalid UPDATE".to_owned()))?
         .trim();
+    // Sprint 16.B: peel off optional `RETURNING ...` first so the WHERE
+    // parser doesn't try to interpret it as a literal.
+    let (rest, returning) = split_off_returning(rest)?;
+    let rest = rest.trim();
     let upper_rest = rest.to_ascii_uppercase();
     let set_pos = upper_rest
         .find(" SET ")
@@ -93,6 +97,7 @@ fn parse_update(sql: &str) -> OpenDbResult<Statement> {
         table: unquote_identifier(table),
         predicate: predicates,
         assignments,
+        returning,
     })
 }
 
@@ -120,16 +125,31 @@ fn parse_delete(sql: &str) -> OpenDbResult<Statement> {
     let rest = strip_keyword_prefix(sql, "DELETE FROM ")
         .ok_or_else(|| OpenDbError::Sql("invalid DELETE".to_owned()))?
         .trim();
+    // Sprint 16.B: peel off optional `RETURNING ...` before any other parsing.
+    let (rest, returning) = split_off_returning(rest)?;
+    let rest = rest.trim();
     let upper_rest = rest.to_ascii_uppercase();
-    let where_pos = upper_rest
-        .find(" WHERE ")
-        .ok_or_else(|| OpenDbError::Sql("DELETE requires WHERE primary-key equality".to_owned()))?;
-    let table = rest[..where_pos].trim().to_owned();
-    let predicate_text = rest[where_pos + " WHERE ".len()..].trim();
-    let predicates = parse_predicate_conjunction(predicate_text)?;
+    // Sprint 16.B: support `DELETE FROM t RETURNING ...` (no WHERE) — Drizzle
+    // emits this for `db.delete(t).returning()` to wipe + return all rows.
+    let (table_text, predicate_text) = if let Some(where_pos) = upper_rest.find(" WHERE ") {
+        (
+            rest[..where_pos].trim(),
+            Some(rest[where_pos + " WHERE ".len()..].trim()),
+        )
+    } else {
+        (rest, None)
+    };
+    if table_text.is_empty() {
+        return Err(OpenDbError::Sql("DELETE requires a table".to_owned()));
+    }
+    let predicates = match predicate_text {
+        Some(text) => parse_predicate_conjunction(text)?,
+        None => Vec::new(),
+    };
     Ok(Statement::DeleteWhere {
-        table: unquote_identifier(&table),
+        table: unquote_identifier(table_text),
         predicate: predicates,
+        returning,
     })
 }
 
@@ -682,6 +702,11 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
         return Err(OpenDbError::Sql("INSERT requires table".to_owned()));
     }
     let values_part = sql[values_pos + values_marker.len()..].trim();
+    // Sprint 16.A: peel an optional `RETURNING ...` suffix off the end first
+    // so the rest of the parser keeps its strict "trailing input is an error"
+    // contract.
+    let (values_part, returning) = split_off_returning(values_part)?;
+    let values_part = values_part.trim();
     let open = values_part
         .find('(')
         .ok_or_else(|| OpenDbError::Sql("missing values open paren".to_owned()))?;
@@ -694,15 +719,103 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
     if !values_part[..open].trim().is_empty() || !values_part[close + 1..].trim().is_empty() {
         return Err(OpenDbError::Sql("trailing input after INSERT".to_owned()));
     }
-    let values = split_values(&values_part[open + 1..close])?
-        .into_iter()
-        .map(parse_value)
-        .collect::<OpenDbResult<Vec<_>>>()?;
+    let raw_values = split_values(&values_part[open + 1..close])?;
+    // Sprint 16.A: Drizzle emits an explicit `DEFAULT` keyword for omitted
+    // columns inside the values tuple. Strip those slots from both the named
+    // column list and the values vector so the executor's
+    // `materialize_insert_values` path uses the column's DEFAULT.
+    let mut filtered_values: Vec<Value> = Vec::with_capacity(raw_values.len());
+    let mut filtered_columns: Option<Vec<String>> = columns
+        .as_ref()
+        .map(|c| Vec::with_capacity(c.len()));
+    for (idx, raw) in raw_values.iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("DEFAULT") {
+            // Skip both the value and the named column at this position.
+            // Without a named column list we can't drop a positional value, so
+            // require the named form (which Drizzle always emits anyway).
+            if columns.is_none() {
+                return Err(OpenDbError::Sql(
+                    "DEFAULT in unnamed VALUES tuple is not supported".to_owned(),
+                ));
+            }
+            // filtered_columns is Some(...) when columns is Some
+            continue;
+        }
+        filtered_values.push(parse_value(raw)?);
+        if let (Some(src), Some(dst)) = (columns.as_ref(), filtered_columns.as_mut()) {
+            if let Some(name) = src.get(idx) {
+                dst.push(name.clone());
+            }
+        }
+    }
+    let values = filtered_values;
+    let columns = filtered_columns.or(columns);
     Ok(Statement::Insert {
         table,
         columns,
         values,
+        returning,
     })
+}
+
+/// Sprint 16.A: split an SQL fragment on the trailing `RETURNING ...` clause
+/// (case-insensitive, outside quotes/parens). Returns `(rest, None)` if no
+/// `RETURNING` is present. The returned `rest` is left un-trimmed because
+/// callers reuse their own trim/strip semantics.
+fn split_off_returning(input: &str) -> OpenDbResult<(&str, Option<ReturningClause>)> {
+    let upper = input.to_ascii_uppercase();
+    // Look for ` RETURNING ` outside quotes/parens; scan right-to-left so we
+    // pick the actual top-level clause if a literal contains the substring.
+    let bytes = upper.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let mut found: Option<usize> = None;
+    let needle = b" RETURNING ";
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\'' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => depth -= 1,
+            _ => {}
+        }
+        if !in_quote
+            && depth == 0
+            && i + needle.len() <= bytes.len()
+            && &bytes[i..i + needle.len()] == needle
+        {
+            found = Some(i);
+        }
+    }
+    let Some(pos) = found else {
+        return Ok((input, None));
+    };
+    let head = &input[..pos];
+    let tail = input[pos + needle.len()..].trim();
+    if tail.is_empty() {
+        return Err(OpenDbError::Sql(
+            "RETURNING requires at least one column or *".to_owned(),
+        ));
+    }
+    let returning = if tail == "*" {
+        ReturningClause::Star
+    } else {
+        let columns = split_top_level_commas(tail)?
+            .into_iter()
+            .map(|t| {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    Err(OpenDbError::Sql(
+                        "RETURNING column list contains empty entry".to_owned(),
+                    ))
+                } else {
+                    Ok(qualified_column_name(trimmed))
+                }
+            })
+            .collect::<OpenDbResult<Vec<String>>>()?;
+        ReturningClause::Columns(columns)
+    };
+    Ok((head, Some(returning)))
 }
 
 fn split_values(raw: &str) -> OpenDbResult<Vec<&str>> {
@@ -1717,6 +1830,7 @@ mod tests {
                 table: "accounts".to_owned(),
                 columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
+                returning: None,
             }
         );
         assert_eq!(
@@ -1743,6 +1857,7 @@ mod tests {
                 table: "accounts".to_owned(),
                 columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
+                returning: None,
             }
         );
         assert_eq!(
@@ -1759,6 +1874,7 @@ mod tests {
                 table: "accounts".to_owned(),
                 columns: None,
                 values: vec![Value::Int64(1), Value::Text("Ada, Lovelace".to_owned())],
+                returning: None,
             }
         );
     }
@@ -1941,6 +2057,7 @@ mod tests {
                 table: "accounts".to_owned(),
                 columns: Some(vec!["id".to_owned(), "name".to_owned()]),
                 values: vec![Value::Int64(1), Value::Text("Ada".to_owned())],
+                returning: None,
             }
         );
     }
@@ -2072,6 +2189,7 @@ mod tests {
             table,
             predicate,
             assignments,
+            ..
         } = stmt
         else {
             panic!("expected UpdateWhere");
@@ -2096,7 +2214,10 @@ mod tests {
         let stmt = parse("DELETE FROM accounts WHERE id = 1").expect("delete");
         // Sprint 14.D: parser unconditionally emits `DeleteWhere`; the
         // executor handles the PK fast path.
-        let Statement::DeleteWhere { table, predicate } = stmt else {
+        let Statement::DeleteWhere {
+            table, predicate, ..
+        } = stmt
+        else {
             panic!("expected DeleteWhere");
         };
         assert_eq!(table, "accounts");
@@ -2106,11 +2227,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_without_where_predicate() {
-        assert!(matches!(
-            parse("DELETE FROM accounts"),
-            Err(OpenDbError::Sql(_))
-        ));
+    fn parses_delete_without_where_clears_table() {
+        // Sprint 16.B: `DELETE FROM t` (no WHERE) is now legal — Drizzle
+        // emits this for `db.delete(t)` to truncate. The executor honors
+        // the empty predicate set as "match all rows".
+        let stmt = parse("DELETE FROM accounts").expect("delete all");
+        let Statement::DeleteWhere {
+            table, predicate, ..
+        } = stmt
+        else {
+            panic!("expected DeleteWhere");
+        };
+        assert_eq!(table, "accounts");
+        assert!(predicate.is_empty());
     }
 
     #[test]

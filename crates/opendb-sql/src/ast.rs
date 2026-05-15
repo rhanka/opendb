@@ -75,6 +75,9 @@ pub enum Statement {
         table: String,
         columns: Option<Vec<String>>,
         values: Vec<Value>,
+        /// Sprint 16.A: optional `RETURNING ...` clause. `None` keeps the
+        /// legacy command-tag-only behavior.
+        returning: Option<ReturningClause>,
     },
     SelectAll {
         table: String,
@@ -113,22 +116,26 @@ pub enum Statement {
     DeleteRow {
         table: String,
         key: String,
+        returning: Option<ReturningClause>,
     },
     UpdateRow {
         table: String,
         key: String,
         assignments: Vec<(String, Value)>,
+        returning: Option<ReturningClause>,
     },
     /// Sprint 14.D: multi-row DELETE with a conjunctive WHERE clause.
     DeleteWhere {
         table: String,
         predicate: Vec<Predicate>,
+        returning: Option<ReturningClause>,
     },
     /// Sprint 14.D: multi-row UPDATE with a conjunctive WHERE clause.
     UpdateWhere {
         table: String,
         predicate: Vec<Predicate>,
         assignments: Vec<(String, Value)>,
+        returning: Option<ReturningClause>,
     },
     Select {
         left: String,
@@ -245,6 +252,15 @@ pub struct HavingPredicate {
     pub expr: AggregateOrColumn,
     pub op: WhereOp,
     pub value: Value,
+}
+
+/// Sprint 16.A: parsed `RETURNING` clause for INSERT / UPDATE / DELETE.
+/// `Star` mirrors `RETURNING *` (Drizzle `.returning()` no-arg) and
+/// `Columns(...)` mirrors `.returning({col: t.col, ...})`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReturningClause {
+    Star,
+    Columns(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

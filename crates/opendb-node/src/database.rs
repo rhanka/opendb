@@ -181,6 +181,7 @@ impl Database {
                 mut record,
                 tag,
                 route,
+                returning_result,
             } => {
                 self.ensure_leader_for_client_query().await?;
                 record.range_id = self.resolve_route(&route)?;
@@ -190,7 +191,11 @@ impl Database {
                     })
                     .await?;
                 self.engine.apply_committed(record)?;
-                Ok(QueryResult::Command { tag })
+                if let Some(rows) = returning_result {
+                    Ok(rows)
+                } else {
+                    Ok(QueryResult::Command { tag })
+                }
             }
         }
     }

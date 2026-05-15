@@ -22,6 +22,11 @@ pub enum PreparedQuery {
         record: CommitRecord,
         tag: String,
         route: RouteIntent,
+        /// Sprint 16.A: optional RETURNING projection. When `Some`, the
+        /// caller emits these `QueryResult::Rows` instead of the
+        /// CommandComplete tag — matching Postgres semantics for
+        /// `INSERT ... RETURNING ...`.
+        returning_result: Option<QueryResult>,
     },
 }
 
@@ -56,9 +61,18 @@ impl SqlEngine {
         }
         match self.prepare(statement)? {
             PreparedQuery::Read { result, .. } => Ok(result),
-            PreparedQuery::Write { record, tag, .. } => {
+            PreparedQuery::Write {
+                record,
+                tag,
+                returning_result,
+                ..
+            } => {
                 self.apply_committed(record)?;
-                Ok(QueryResult::Command { tag })
+                if let Some(rows) = returning_result {
+                    Ok(rows)
+                } else {
+                    Ok(QueryResult::Command { tag })
+                }
             }
         }
     }
@@ -74,6 +88,7 @@ impl SqlEngine {
                 table,
                 columns: named_columns,
                 values,
+                returning,
             } => {
                 let table_state = self
                     .projection
@@ -116,7 +131,15 @@ impl SqlEngine {
                     table: table.clone(),
                     key: route_key(&table, &row_key),
                 };
-                self.prepare_write(
+                // Sprint 16.A: build the RETURNING projection from the
+                // freshly-materialized column values (defaults already
+                // applied by `materialize_insert_values`).
+                let returning_result = if let Some(spec) = &returning {
+                    Some(project_returning(&columns, &column_values, spec)?)
+                } else {
+                    None
+                };
+                self.prepare_write_with_returning(
                     vec![Mutation::InsertRow {
                         table,
                         key: row_key,
@@ -124,6 +147,7 @@ impl SqlEngine {
                     }],
                     "INSERT 0 1",
                     route,
+                    returning_result,
                 )
             }
             Statement::SelectAll {
@@ -169,7 +193,11 @@ impl SqlEngine {
             Statement::DoBlock { .. } => Err(OpenDbError::Sql(
                 "DO blocks must be executed via SqlEngine::execute".to_owned(),
             )),
-            Statement::DeleteRow { table, key } => {
+            Statement::DeleteRow {
+                table,
+                key,
+                returning: _,
+            } => {
                 let route_key_value = route_key(&table, &key);
                 self.prepare_write(
                     vec![Mutation::DeleteRow {
@@ -187,6 +215,7 @@ impl SqlEngine {
                 table,
                 key,
                 assignments,
+                returning: _,
             } => {
                 let route_key_value = route_key(&table, &key);
                 // Coerce each assigned value against the declared column type
@@ -266,14 +295,17 @@ impl SqlEngine {
                 },
                 route: RouteIntent::Root,
             }),
-            Statement::DeleteWhere { table, predicate } => {
-                self.prepare_delete_where(table, predicate)
-            }
+            Statement::DeleteWhere {
+                table,
+                predicate,
+                returning,
+            } => self.prepare_delete_where(table, predicate, returning),
             Statement::UpdateWhere {
                 table,
                 predicate,
                 assignments,
-            } => self.prepare_update_where(table, predicate, assignments),
+                returning,
+            } => self.prepare_update_where(table, predicate, assignments, returning),
         }
     }
 
@@ -282,6 +314,7 @@ impl SqlEngine {
         &self,
         table: String,
         predicates: Vec<Predicate>,
+        returning: Option<crate::ast::ReturningClause>,
     ) -> OpenDbResult<PreparedQuery> {
         let table_state = self
             .projection
@@ -306,27 +339,53 @@ impl SqlEngine {
         let primary_key = table_state.primary_key_column().ok_or_else(|| {
             OpenDbError::InvalidInput(format!("table {table} has no primary key"))
         })?;
-        let matching_keys: Vec<String> = table_state
+        // Sprint 16.B: capture the matching pre-mutation rows so DELETE
+        // RETURNING can echo them. We materialize the lookup once and reuse
+        // it for both the mutation list and the RETURNING projection.
+        let matching: Vec<(String, std::collections::BTreeMap<String, Value>)> = table_state
             .rows
             .iter()
             .filter(|(_, row)| predicates.iter().all(|p| evaluate_predicate(row, p)))
-            .map(|(key, _)| key.clone())
+            .map(|(key, row)| (key.clone(), row.clone()))
             .collect();
         let _ = primary_key;
-        let row_count = matching_keys.len();
-        let mutations: Vec<Mutation> = matching_keys
+        let row_count = matching.len();
+        let returning_result = if let Some(spec) = &returning {
+            let rows: Vec<_> = matching.iter().map(|(_, row)| row.clone()).collect();
+            Some(project_returning_rows(&table_state.columns, &rows, spec)?)
+        } else {
+            None
+        };
+        // Sprint 16.B: a WHERE that matches zero rows is a valid no-op.
+        // Storage rejects empty mutation lists, so short-circuit to a Read.
+        if row_count == 0 {
+            let result = match returning_result {
+                Some(rows) => rows,
+                None => QueryResult::Command {
+                    tag: format!("DELETE {row_count}"),
+                },
+            };
+            return Ok(PreparedQuery::Read {
+                result,
+                route: RouteIntent::Scan {
+                    table: table.clone(),
+                },
+            });
+        }
+        let mutations: Vec<Mutation> = matching
             .into_iter()
-            .map(|key| Mutation::DeleteRow {
+            .map(|(key, _)| Mutation::DeleteRow {
                 table: table.clone(),
                 key,
             })
             .collect();
-        self.prepare_write(
+        self.prepare_write_with_returning(
             mutations,
             &format!("DELETE {row_count}"),
             RouteIntent::Scan {
                 table: table.clone(),
             },
+            returning_result,
         )
     }
 
@@ -336,6 +395,7 @@ impl SqlEngine {
         table: String,
         predicates: Vec<Predicate>,
         assignments: Vec<(String, Value)>,
+        returning: Option<crate::ast::ReturningClause>,
     ) -> OpenDbResult<PreparedQuery> {
         let table_state = self
             .projection
@@ -374,27 +434,65 @@ impl SqlEngine {
                 })
             })
             .collect::<OpenDbResult<Vec<_>>>()?;
-        let matching_keys: Vec<String> = table_state
+        let matching: Vec<(String, std::collections::BTreeMap<String, Value>)> = table_state
             .rows
             .iter()
             .filter(|(_, row)| predicates.iter().all(|p| evaluate_predicate(row, p)))
-            .map(|(key, _)| key.clone())
+            .map(|(key, row)| (key.clone(), row.clone()))
             .collect();
-        let row_count = matching_keys.len();
-        let mutations: Vec<Mutation> = matching_keys
+        let row_count = matching.len();
+        // Sprint 16.B: synthesize the post-update row by overlaying the
+        // assignments on top of the captured pre-update row. UPDATE
+        // RETURNING in Postgres returns the post-state.
+        let returning_result = if let Some(spec) = &returning {
+            let post_rows: Vec<std::collections::BTreeMap<String, Value>> = matching
+                .iter()
+                .map(|(_, row)| {
+                    let mut next = row.clone();
+                    for cv in &coerced_assignments {
+                        next.insert(cv.column.clone(), cv.value.clone());
+                    }
+                    next
+                })
+                .collect();
+            Some(project_returning_rows(
+                &table_state.columns,
+                &post_rows,
+                spec,
+            )?)
+        } else {
+            None
+        };
+        // Sprint 16.B: 0-row UPDATE is a valid no-op (same rationale as DELETE).
+        if row_count == 0 {
+            let result = match returning_result {
+                Some(rows) => rows,
+                None => QueryResult::Command {
+                    tag: format!("UPDATE {row_count}"),
+                },
+            };
+            return Ok(PreparedQuery::Read {
+                result,
+                route: RouteIntent::Scan {
+                    table: table.clone(),
+                },
+            });
+        }
+        let mutations: Vec<Mutation> = matching
             .into_iter()
-            .map(|key| Mutation::UpdateRow {
+            .map(|(key, _)| Mutation::UpdateRow {
                 table: table.clone(),
                 key,
                 assignments: coerced_assignments.clone(),
             })
             .collect();
-        self.prepare_write(
+        self.prepare_write_with_returning(
             mutations,
             &format!("UPDATE {row_count}"),
             RouteIntent::Scan {
                 table: table.clone(),
             },
+            returning_result,
         )
     }
 
@@ -428,6 +526,20 @@ impl SqlEngine {
         tag: &str,
         route: RouteIntent,
     ) -> OpenDbResult<PreparedQuery> {
+        self.prepare_write_with_returning(mutations, tag, route, None)
+    }
+
+    /// Sprint 16.A: prepare a write whose result is the projected RETURNING
+    /// rows. `returning_result` is wrapped into the `PreparedQuery::Write`
+    /// payload and surfaces in `execute()` as `QueryResult::Rows` instead of
+    /// the legacy CommandComplete tag.
+    fn prepare_write_with_returning(
+        &self,
+        mutations: Vec<Mutation>,
+        tag: &str,
+        route: RouteIntent,
+        returning_result: Option<QueryResult>,
+    ) -> OpenDbResult<PreparedQuery> {
         let record = self.build_next_record(mutations);
         let mut validated_projection = self.projection.clone();
         validated_projection.apply(&record)?;
@@ -435,6 +547,7 @@ impl SqlEngine {
             record,
             tag: tag.to_owned(),
             route,
+            returning_result,
         })
     }
 
@@ -1868,6 +1981,81 @@ fn materialize_insert_values(
     }
 }
 
+/// Sprint 16.A: build a `QueryResult::Rows` for an INSERT-style RETURNING
+/// from a single freshly-materialized row (`columns` + `column_values` are
+/// aligned). For UPDATE/DELETE, see `project_returning_rows`.
+fn project_returning(
+    columns: &[ColumnDefinition],
+    column_values: &[ColumnValue],
+    spec: &crate::ast::ReturningClause,
+) -> OpenDbResult<QueryResult> {
+    let row: std::collections::BTreeMap<String, Value> = column_values
+        .iter()
+        .map(|cv| (cv.column.clone(), cv.value.clone()))
+        .collect();
+    let column_names = column_names_for_returning(columns, spec)?;
+    let row_values: Vec<Value> = column_names
+        .iter()
+        .map(|name| row.get(name).cloned().unwrap_or(Value::Null))
+        .collect();
+    Ok(QueryResult::Rows {
+        columns: column_names,
+        column_types: Vec::new(),
+        rows: vec![row_values],
+    })
+}
+
+/// Sprint 16.B: build a `QueryResult::Rows` for UPDATE/DELETE RETURNING from
+/// a vector of post-/pre-mutation row maps.
+fn project_returning_rows(
+    columns: &[ColumnDefinition],
+    rows: &[std::collections::BTreeMap<String, Value>],
+    spec: &crate::ast::ReturningClause,
+) -> OpenDbResult<QueryResult> {
+    let column_names = column_names_for_returning(columns, spec)?;
+    let materialized: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|row| {
+            column_names
+                .iter()
+                .map(|name| row.get(name).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    Ok(QueryResult::Rows {
+        columns: column_names,
+        column_types: Vec::new(),
+        rows: materialized,
+    })
+}
+
+fn column_names_for_returning(
+    columns: &[ColumnDefinition],
+    spec: &crate::ast::ReturningClause,
+) -> OpenDbResult<Vec<String>> {
+    match spec {
+        crate::ast::ReturningClause::Star => Ok(columns.iter().map(|c| c.name.clone()).collect()),
+        crate::ast::ReturningClause::Columns(names) => {
+            // Drizzle qualifies RETURNING entries (`"folders"."id"`); accept
+            // bare-name suffix match against the table schema.
+            let mut resolved = Vec::with_capacity(names.len());
+            for name in names {
+                let bare = column_basename(name);
+                let exists = columns
+                    .iter()
+                    .any(|c| c.name == name.as_str() || c.name == bare);
+                if !exists {
+                    return Err(OpenDbError::Sql(format!(
+                        "RETURNING column {name} not in table"
+                    )));
+                }
+                resolved.push(bare.to_owned());
+            }
+            Ok(resolved)
+        }
+    }
+}
+
 /// Sprint 15.G: real wall-clock microseconds-since-epoch for `DEFAULT NOW()`
 /// on omitted INSERT columns. Falls back to 0 if SystemTime panics, which is
 /// only theoretical (e.g., a clock running before UNIX_EPOCH).
@@ -2605,7 +2793,10 @@ mod tests {
                 .is_err()
         );
 
-        let PreparedQuery::Write { record, tag, route } = prepared_create else {
+        let PreparedQuery::Write {
+            record, tag, route, ..
+        } = prepared_create
+        else {
             panic!("create should prepare as write");
         };
         assert_eq!(tag, "CREATE TABLE");
