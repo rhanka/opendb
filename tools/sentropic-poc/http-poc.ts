@@ -487,6 +487,52 @@ function buildFoldersRouter(db: ReturnType<typeof drizzle>) {
     return c.json({ items: rows });
   });
 
+  // Sprint 19.B: GET /folders/list/with-matrices (folders.ts:531)
+  // — simple read, full folders for the workspace.
+  app.get("/folders/list/with-matrices", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const rows = await db
+      .select()
+      .from(folders)
+      .where(eq(folders.workspaceId, user.workspaceId));
+    return c.json({ items: rows });
+  });
+
+  // Sprint 19.B: GET /folders/:id/matrix (folders.ts:505) — read folder +
+  // resolve workspace type for default matrix.
+  app.get("/folders/:id/matrix", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const id = c.req.param("id");
+    const [folder] = await db
+      .select()
+      .from(folders)
+      .where(and(eq(folders.id, id), eq(folders.workspaceId, user.workspaceId)));
+    if (!folder) return c.json({ message: "Not found" }, 404);
+    const [ws] = await db
+      .select({ type: workspaces.type })
+      .from(workspaces)
+      .where(eq(workspaces.id, user.workspaceId));
+    const workspaceType = ws?.type ?? "ai-ideas";
+    // Replicate the route's "matrix or default-by-type" semantics with a
+    // tiny inlined default. The actual sentropic defaults live in
+    // api/src/config/default-matrix*.ts and aren't exercised here — we
+    // assert the SQL surface, not the matrix content.
+    const matrix = folder.matrixConfig
+      ? JSON.parse(folder.matrixConfig)
+      : { defaults_by: workspaceType };
+    return c.json(matrix);
+  });
+
+  // Sprint 19.B: GET /folders/matrix/default (folders.ts:524)
+  app.get("/folders/matrix/default", async (c) => {
+    const user = c.get("user") as { workspaceId: string };
+    const [ws] = await db
+      .select({ type: workspaces.type })
+      .from(workspaces)
+      .where(eq(workspaces.id, user.workspaceId));
+    return c.json({ defaults_by: ws?.type ?? "ai-ideas" });
+  });
+
   // Sprint 19.A: GET /initiatives (api/src/routes/api/initiatives.ts:390-399)
   // — optional folder_id query filter narrows the WHERE conjunction.
   app.get("/initiatives", async (c) => {
@@ -690,6 +736,51 @@ async function main(): Promise<void> {
         const items = (json as { items: unknown[] }).items;
         if (!Array.isArray(items)) return `items not an array`;
         if (items.length !== 3) return `expected 3 initiatives in fld-1, got ${items.length}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.B: H8 — GET /folders/list/with-matrices
+    await probeHttp(
+      httpPort,
+      "/folders/list/with-matrices",
+      "GET /api/folders/list/with-matrices",
+      "H8",
+      (json) => {
+        const items = (json as { items: unknown[] }).items;
+        if (!Array.isArray(items)) return `items not an array`;
+        if (items.length !== 3) return `expected 3 folders, got ${items.length}`;
+        return null;
+      }
+    );
+
+    // Sprint 19.B: H9 — GET /folders/:id/matrix (returns default matrix when
+    // matrixConfig is null, like our seeded fld-1).
+    await probeHttp(
+      httpPort,
+      "/folders/fld-1/matrix",
+      "GET /api/folders/fld-1/matrix",
+      "H9",
+      (json) => {
+        const obj = json as { defaults_by?: string };
+        if (obj.defaults_by !== "ai-ideas") {
+          return `expected defaults_by=ai-ideas, got ${obj.defaults_by}`;
+        }
+        return null;
+      }
+    );
+
+    // Sprint 19.B: H10 — GET /folders/matrix/default (resolves workspace type).
+    await probeHttp(
+      httpPort,
+      "/folders/matrix/default",
+      "GET /api/folders/matrix/default",
+      "H10",
+      (json) => {
+        const obj = json as { defaults_by?: string };
+        if (obj.defaults_by !== "ai-ideas") {
+          return `expected defaults_by=ai-ideas, got ${obj.defaults_by}`;
+        }
         return null;
       }
     );
