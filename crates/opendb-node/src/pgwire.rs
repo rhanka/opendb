@@ -581,6 +581,14 @@ async fn write_data_row(stream: &mut TcpStream, row: &[Value]) -> anyhow::Result
             .to_be_bytes(),
     );
     for value in row {
+        // Sprint 17.5: pgwire DataRow encodes SQL NULL as a field length of
+        // -1 (i32 big-endian) with no payload bytes. Writing length 0 with
+        // no payload is treated as an empty string by pg clients, which
+        // surfaced as `gateConfig: ""` / `description: ""` on Drizzle.
+        if matches!(value, Value::Null) {
+            payload.extend_from_slice(&(-1_i32).to_be_bytes());
+            continue;
+        }
         let text = value_to_text(value);
         payload.extend_from_slice(
             &i32::try_from(text.len())

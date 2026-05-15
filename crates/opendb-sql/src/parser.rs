@@ -725,9 +725,8 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
     // column list and the values vector so the executor's
     // `materialize_insert_values` path uses the column's DEFAULT.
     let mut filtered_values: Vec<Value> = Vec::with_capacity(raw_values.len());
-    let mut filtered_columns: Option<Vec<String>> = columns
-        .as_ref()
-        .map(|c| Vec::with_capacity(c.len()));
+    let mut filtered_columns: Option<Vec<String>> =
+        columns.as_ref().map(|c| Vec::with_capacity(c.len()));
     for (idx, raw) in raw_values.iter().enumerate() {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("DEFAULT") {
