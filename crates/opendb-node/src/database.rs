@@ -47,6 +47,25 @@ pub struct Database {
     range_catalog: RangeCatalog,
     peer_server: Option<Arc<RootRangePeerServer>>,
     recovery_status: DatabaseRecoveryStatus,
+    /// Sprint 17: open-transaction state. `None` = autocommit (each write
+    /// hits storage immediately, legacy behavior). `Some(...)` = in a
+    /// transaction; writes apply to the engine in-memory but are deferred
+    /// from the storage WAL until COMMIT (or discarded on ROLLBACK).
+    transaction: Option<TransactionBuffer>,
+}
+
+/// Sprint 17: per-Database in-memory transaction buffer. Currently shared
+/// across all sessions because `Database` is wrapped in `Arc<Mutex<...>>` at
+/// the pgwire boundary; concurrent BEGIN from a second session is rejected.
+#[derive(Debug)]
+struct TransactionBuffer {
+    /// Engine state captured at BEGIN — used to undo in-memory mutations on
+    /// ROLLBACK.
+    engine_snapshot: SqlEngine,
+    /// CommitRecords produced by writes during the transaction. They are
+    /// applied to the engine immediately (so subsequent SELECTs see them)
+    /// but only flushed to `root_range` on COMMIT.
+    pending_records: Vec<CommitRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +129,7 @@ impl Database {
             range_catalog,
             peer_server: None,
             recovery_status,
+            transaction: None,
         })
     }
 
@@ -133,17 +153,32 @@ impl Database {
             range_catalog,
             peer_server: Some(peer_server),
             recovery_status,
+            transaction: None,
         })
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
+        // Sprint 17: explicit transaction control statements drive
+        // `self.transaction` directly; they never flow through
+        // `engine.prepare()` which would otherwise return a Command tag and
+        // ignore the buffer.
+        match &statement {
+            Statement::Begin => return self.begin_transaction(),
+            Statement::Commit => return self.commit_transaction().await,
+            Statement::Rollback => return self.rollback_transaction(),
+            _ => {}
+        }
         // Records may arrive on this replica via OpenRaft replication
         // (`apply_to_state_machine` → `root_range.apply_committed`) without
         // ever going through `Database::execute`. Refresh the SQL engine from
         // the canonical commit stream before every query so that the engine
         // never lags behind the WAL — required for a follower that just won an
         // election to be able to read records the previous leader committed.
-        self.refresh_engine_from_wal().await?;
+        // Skip the refresh while a transaction is open; otherwise we would
+        // overwrite the in-memory engine and discard pending writes.
+        if self.transaction.is_none() {
+            self.refresh_engine_from_wal().await?;
+        }
 
         if let Statement::DoBlock {
             inner,
@@ -185,12 +220,22 @@ impl Database {
             } => {
                 self.ensure_leader_for_client_query().await?;
                 record.range_id = self.resolve_route(&route)?;
-                self.root_range
-                    .submit(RootRangeCommand {
-                        record: record.clone(),
-                    })
-                    .await?;
-                self.engine.apply_committed(record)?;
+                // Sprint 17: defer the storage submit while a transaction is
+                // open. The record is already validated by the engine's
+                // `prepare` (which cloned + applied the projection); we
+                // commit it in-memory now so subsequent reads in the tx
+                // observe it, and stash the record for COMMIT to flush.
+                if let Some(buffer) = self.transaction.as_mut() {
+                    self.engine.apply_committed(record.clone())?;
+                    buffer.pending_records.push(record);
+                } else {
+                    self.root_range
+                        .submit(RootRangeCommand {
+                            record: record.clone(),
+                        })
+                        .await?;
+                    self.engine.apply_committed(record)?;
+                }
                 if let Some(rows) = returning_result {
                     Ok(rows)
                 } else {
@@ -198,6 +243,64 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Sprint 17: open a transaction. Errors if one is already open (we don't
+    /// support nested transactions yet — Drizzle uses savepoints for nesting).
+    fn begin_transaction(&mut self) -> OpenDbResult<QueryResult> {
+        if self.transaction.is_some() {
+            return Err(OpenDbError::Sql(
+                "BEGIN: a transaction is already open".to_owned(),
+            ));
+        }
+        self.transaction = Some(TransactionBuffer {
+            engine_snapshot: self.engine.clone(),
+            pending_records: Vec::new(),
+        });
+        Ok(QueryResult::Command {
+            tag: "BEGIN".to_owned(),
+        })
+    }
+
+    /// Sprint 17: flush the buffered records to storage atomically. If any
+    /// submit fails, the engine is rolled back to the BEGIN snapshot and the
+    /// buffer is dropped — the transaction is treated as aborted.
+    async fn commit_transaction(&mut self) -> OpenDbResult<QueryResult> {
+        let Some(buffer) = self.transaction.take() else {
+            // COMMIT outside a transaction is a no-op in Postgres (with a
+            // warning); we mirror that as a successful command.
+            return Ok(QueryResult::Command {
+                tag: "COMMIT".to_owned(),
+            });
+        };
+        for record in &buffer.pending_records {
+            if let Err(error) = self
+                .root_range
+                .submit(RootRangeCommand {
+                    record: record.clone(),
+                })
+                .await
+            {
+                // Restore the snapshot so the engine doesn't keep the
+                // half-committed state in memory.
+                self.engine = buffer.engine_snapshot;
+                return Err(error);
+            }
+        }
+        Ok(QueryResult::Command {
+            tag: "COMMIT".to_owned(),
+        })
+    }
+
+    /// Sprint 17: discard the buffered records and restore the engine to its
+    /// pre-BEGIN state. Pure in-memory operation (no storage round-trip).
+    fn rollback_transaction(&mut self) -> OpenDbResult<QueryResult> {
+        if let Some(buffer) = self.transaction.take() {
+            self.engine = buffer.engine_snapshot;
+        }
+        Ok(QueryResult::Command {
+            tag: "ROLLBACK".to_owned(),
+        })
     }
 
     pub async fn propose_range_split(

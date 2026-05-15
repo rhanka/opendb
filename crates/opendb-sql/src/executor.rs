@@ -30,7 +30,7 @@ pub enum PreparedQuery {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SqlEngine {
     next_tx: u64,
     projection: RowProjection,

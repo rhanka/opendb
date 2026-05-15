@@ -501,6 +501,80 @@ async function runRealQueries(port: number): Promise<void> {
       }
     }
   ];
+  // Sprint 17 probes — Drizzle .transaction() pattern. Drizzle issues
+  // `BEGIN; ...; COMMIT;` over a single session; we use the raw `pg.Pool`
+  // here to capture both SQL and per-statement outcomes.
+  const txProbes: Array<{
+    id: string;
+    description: string;
+    run: () => Promise<{ sql: string; result: unknown }>;
+  }> = [
+    {
+      id: "Q13",
+      description: "db.transaction — INSERT then SELECT inside, COMMIT (happy path)",
+      run: async () => {
+        const sql =
+          "BEGIN; INSERT INTO folders (id, workspace_id, name) VALUES ('f-q13', 'w1', 'Q13 in-tx') RETURNING id; SELECT id FROM folders WHERE id = 'f-q13'; COMMIT;";
+        const result = await db.transaction(async (tx) => {
+          const inserted = await tx
+            .insert(folders)
+            .values({ id: "f-q13", workspaceId: "w1", name: "Q13 in-tx" })
+            .returning({ id: folders.id });
+          const selected = await tx
+            .select({ id: folders.id })
+            .from(folders)
+            .where(eq(folders.id, "f-q13"));
+          return { inserted, selected };
+        });
+        return { sql, result };
+      }
+    },
+    {
+      id: "Q14",
+      description: "db.transaction — INSERT then throw, expect ROLLBACK + row gone",
+      run: async () => {
+        const sql =
+          "BEGIN; INSERT INTO folders (id, workspace_id, name) VALUES ('f-q14', 'w1', 'Q14 rollback'); throw; ROLLBACK; SELECT id FROM folders WHERE id = 'f-q14'";
+        let rolled_back = false;
+        try {
+          await db.transaction(async (tx) => {
+            await tx
+              .insert(folders)
+              .values({ id: "f-q14", workspaceId: "w1", name: "Q14 rollback" });
+            throw new Error("intentional rollback");
+          });
+        } catch (e) {
+          rolled_back = e instanceof Error && e.message === "intentional rollback";
+        }
+        const after = await db
+          .select({ id: folders.id })
+          .from(folders)
+          .where(eq(folders.id, "f-q14"));
+        // Sprint 17 contract: ROLLBACK must un-do the INSERT. If the row is
+        // still present, transactions are non-atomic — fail the probe.
+        if (after.length !== 0) {
+          throw new Error(
+            `non-atomic ROLLBACK: row f-q14 still present (rolled_back=${rolled_back})`
+          );
+        }
+        return { sql, result: { rolled_back, after_count: after.length } };
+      }
+    }
+  ];
+
+  for (const { id, description, run } of txProbes) {
+    try {
+      const { sql, result } = await run();
+      record(id, description, sql, {
+        kind: "pass",
+        details: `result=${JSON.stringify(result).slice(0, 240)}`
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      record(id, description, `(captured below)`, { kind: "fail", details: message });
+    }
+  }
 
   for (const { id, description, build } of queries) {
     const { sql: text, rows } = build();
