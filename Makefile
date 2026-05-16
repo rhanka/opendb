@@ -147,6 +147,14 @@ poc-seed: ## Sprint 18.B: migrations + seed minimal Drizzle (workspaces/orgs/fol
 poc-http: ## Sprint 18.C: HTTP route /api/folders bout-en-bout sur opendb-node
 	cd $(WORKTREE) && $(NPM) run poc:sentropic:http
 
+.PHONY: poc-image
+poc-image: poc-musl ## Sprint 19.C.2: docker build static-musl alpine image (opendb-node:poc-local)
+	cd $(WORKTREE) && docker build -t opendb-node:poc-local -f Dockerfile.alpine .
+
+.PHONY: poc-musl
+poc-musl: ## Sprint 19.C.1: cargo build --release --target x86_64-unknown-linux-musl (no docker)
+	cd $(WORKTREE) && CC=musl-gcc $(CARGO) build --release --target x86_64-unknown-linux-musl -p opendb-node
+
 .PHONY: smoke-k3s
 smoke-k3s: ## Run the k3s cluster smoke (non-destructive default)
 	cd $(WORKTREE) && $(NPM) run smoke:k3s

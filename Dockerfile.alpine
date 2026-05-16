@@ -1,0 +1,39 @@
+# Sprint 19.C: minimal alpine image wrapping a pre-built static-musl
+# opendb-node binary. The build is split in two:
+#
+#   1. Host side: `make poc-musl` (or `cargo build --release --target
+#      x86_64-unknown-linux-musl -p opendb-node`) produces a fully-static
+#      ~9 MB binary in `target/x86_64-unknown-linux-musl/release/`.
+#   2. Image side: this Dockerfile just `COPY`s that binary into an alpine
+#      runtime — no cargo, no toolchain in the image. Fast + reproducible.
+#
+# Why split: the opendb workspace uses edition2024 (cargo ≥ 1.85) and the
+# alpine `rust:` images on Docker Hub lag the toolchain. Building host-side
+# avoids chasing the image tag. The host build is cached by cargo across
+# image rebuilds.
+#
+# Usage:
+#   make poc-musl      # build the binary host-side
+#   make poc-image     # build this image
+#   docker run --rm -p 25432:5432 -p 28080:8080 opendb-node:poc-local \
+#     --node-id 1 \
+#     --pgwire-addr 0.0.0.0:5432 \
+#     --health-addr 0.0.0.0:8080
+#
+# Then point sentropic at it:
+#   DATABASE_URL=postgres://opendb:opendb@<host>:25432/opendb
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S opendb && adduser -S -G opendb opendb && \
+    mkdir -p /var/lib/opendb && chown opendb:opendb /var/lib/opendb
+
+# Pre-built static-musl binary (see top-of-file note). The build context is
+# expected to be the repo root and the binary path is relative to it.
+COPY target/x86_64-unknown-linux-musl/release/opendb-node /usr/local/bin/opendb-node
+
+USER opendb
+EXPOSE 5432 8080 7300 9100
+ENTRYPOINT ["/usr/local/bin/opendb-node"]
+CMD ["--help"]

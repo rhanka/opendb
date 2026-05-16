@@ -46,6 +46,19 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
     if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" || upper == "ABORT" {
         return Ok(Statement::Rollback);
     }
+    // Sprint 19.C: LISTEN / UNLISTEN / NOTIFY are pgwire-level
+    // pub/sub primitives. opendb does not implement async notifications, but
+    // sentropic's `purgeAllLocksAtStartup` and chat lock SSE flow issue them
+    // unconditionally. Accept them as no-ops so the bootstrap doesn't crash.
+    if upper.starts_with("LISTEN ")
+        || upper.starts_with("UNLISTEN ")
+        || upper.starts_with("NOTIFY ")
+    {
+        return Ok(Statement::DoBlock {
+            inner: Vec::new(),
+            swallow_duplicate: true,
+        });
+    }
     if upper.starts_with("CREATE TABLE ") {
         parse_create_table(normalized)
     } else if upper.starts_with("CREATE UNIQUE INDEX ") || upper.starts_with("CREATE INDEX ") {
