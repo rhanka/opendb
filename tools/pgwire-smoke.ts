@@ -179,9 +179,10 @@ try {
   if (filteredRows.length !== 1 || filteredRow === undefined || !rowText(filteredRow).includes("Ada")) {
     throw new Error(`primary-key filtered select returned unexpected rows: ${filteredRows.map(rowText).join(";")}`);
   }
-  const unsupportedPredicateError = await execExpectError(`SELECT * FROM ${tableName} WHERE name = 'Ada'`);
-  if (!unsupportedPredicateError.includes("primary key equality")) {
-    throw new Error(`non-primary-key predicate was not rejected as expected: ${unsupportedPredicateError}`);
+  const textFilteredRows = await exec(`SELECT * FROM ${tableName} WHERE name = 'Ada'`);
+  const textFilteredRow = textFilteredRows[0];
+  if (textFilteredRows.length !== 1 || textFilteredRow === undefined || !rowText(textFilteredRow).includes("Ada")) {
+    throw new Error(`text filtered select returned unexpected rows: ${textFilteredRows.map(rowText).join(";")}`);
   }
   const duplicateError = await execExpectError(`INSERT INTO ${tableName} VALUES (1, 'Grace')`);
   if (!duplicateError.includes("row already exists")) {

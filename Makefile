@@ -151,6 +151,10 @@ poc-http: ## Sprint 18.C: HTTP route /api/folders bout-en-bout sur opendb-node
 poc-image: poc-musl ## Sprint 19.C.2: docker build static-musl alpine image (opendb-node:poc-local)
 	cd $(WORKTREE) && docker build -t opendb-node:poc-local -f Dockerfile.alpine .
 
+.PHONY: poc-bench
+poc-bench: ## Sprint 20: side-by-side latency bench opendb-node vs postgres:16-alpine
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:bench
+
 .PHONY: poc-musl
 poc-musl: ## Sprint 19.C.1: cargo build --release --target x86_64-unknown-linux-musl (no docker)
 	cd $(WORKTREE) && CC=musl-gcc $(CARGO) build --release --target x86_64-unknown-linux-musl -p opendb-node

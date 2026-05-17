@@ -34,6 +34,9 @@ const nodeBin = join(
 const SENTROPIC_MIGRATIONS_DIR = "/home/antoinefa/src/sentropic/api/drizzle";
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+type PocUser = { workspaceId: string; role: "admin" };
+type PocHonoEnv = { Variables: { user: PocUser } };
+
 // --- Drizzle schema (exact subset, same as seed-poc) -----------------------
 const workspaces = pgTable("workspaces", {
   id: text("id").primaryKey(),
@@ -343,7 +346,7 @@ async function seedFixtures(port: number): Promise<void> {
 
 // --- HTTP route (replica of api/src/routes/api/folders.ts:139-198) -------
 function buildFoldersRouter(db: ReturnType<typeof drizzle>) {
-  const app = new Hono();
+  const app = new Hono<PocHonoEnv>();
   // Stub auth middleware: out-of-scope for the SQL/HTTP POC, the real
   // sentropic requireAuth performs ~5 DB calls (validateSession, workspace
   // lookups, role checks). The contract we're proving here is "the route
@@ -786,7 +789,6 @@ async function main(): Promise<void> {
     );
   } finally {
     if (httpServer) {
-      // @ts-expect-error — Hono node-server has close() at runtime
       httpServer.close?.();
     }
     await node.cleanup();
