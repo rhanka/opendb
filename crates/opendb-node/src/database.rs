@@ -158,6 +158,14 @@ impl Database {
     }
 
     pub async fn execute(&mut self, statement: Statement) -> OpenDbResult<QueryResult> {
+        Box::pin(self.execute_with_refresh(statement, true)).await
+    }
+
+    async fn execute_with_refresh(
+        &mut self,
+        statement: Statement,
+        refresh_before_execute: bool,
+    ) -> OpenDbResult<QueryResult> {
         // Sprint 17: explicit transaction control statements drive
         // `self.transaction` directly; they never flow through
         // `engine.prepare()` which would otherwise return a Command tag and
@@ -176,7 +184,7 @@ impl Database {
         // election to be able to read records the previous leader committed.
         // Skip the refresh while a transaction is open; otherwise we would
         // overwrite the in-memory engine and discard pending writes.
-        if self.transaction.is_none() {
+        if refresh_before_execute && self.transaction.is_none() {
             self.refresh_engine_from_wal().await?;
         }
 
@@ -186,7 +194,7 @@ impl Database {
         } = statement
         {
             for inner_statement in inner {
-                match Box::pin(self.execute(inner_statement)).await {
+                match Box::pin(self.execute_with_refresh(inner_statement, false)).await {
                     Ok(_) => {}
                     Err(error) => {
                         if swallow_duplicate
