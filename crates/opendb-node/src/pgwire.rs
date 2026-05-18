@@ -51,6 +51,9 @@ async fn handle_connection(
     mut stream: TcpStream,
     database: Arc<Mutex<Database>>,
 ) -> anyhow::Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("disable Nagle on pgwire client socket")?;
     loop {
         let startup = read_untagged_frame(&mut stream).await?;
         let code = read_i32(&startup)?;
