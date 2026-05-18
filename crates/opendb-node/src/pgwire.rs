@@ -234,24 +234,7 @@ async fn execute_extended_query(
         Err(error) => Err(error),
     };
 
-    match result {
-        Ok(QueryResult::Command { tag }) => write_command_complete(stream, &tag).await?,
-        Ok(QueryResult::Rows {
-            columns,
-            column_types,
-            rows,
-        }) => {
-            let row_count = rows.len();
-            let resolved_types = resolve_row_description_types(&columns, &column_types, &rows);
-            write_row_description(stream, &columns, &resolved_types).await?;
-            for row in rows {
-                write_data_row(stream, &row).await?;
-            }
-            write_command_complete(stream, &format!("SELECT {row_count}")).await?;
-        }
-        Err(error) => write_open_db_error_response(stream, &error).await?,
-    }
-    Ok(())
+    write_query_result(stream, result, false).await
 }
 
 /// Sprint 12: substitute `$1`/`$2`/... placeholders with the parameter
@@ -401,25 +384,7 @@ async fn execute_simple_query(
         Err(error) => Err(error),
     };
 
-    match result {
-        Ok(QueryResult::Command { tag }) => write_command_complete(stream, &tag).await?,
-        Ok(QueryResult::Rows {
-            columns,
-            column_types,
-            rows,
-        }) => {
-            let row_count = rows.len();
-            let resolved_types = resolve_row_description_types(&columns, &column_types, &rows);
-            write_row_description(stream, &columns, &resolved_types).await?;
-            for row in rows {
-                write_data_row(stream, &row).await?;
-            }
-            write_command_complete(stream, &format!("SELECT {row_count}")).await?;
-        }
-        Err(error) => write_open_db_error_response(stream, &error).await?,
-    }
-
-    write_ready_for_query(stream).await
+    write_query_result(stream, result, true).await
 }
 
 async fn read_untagged_frame(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
@@ -501,17 +466,24 @@ async fn write_parameter_status(
 }
 
 async fn write_ready_for_query(stream: &mut TcpStream) -> anyhow::Result<()> {
-    write_message(stream, b'Z', b"I").await
+    let mut buffer = Vec::new();
+    push_ready_for_query(&mut buffer)?;
+    stream.write_all(&buffer).await?;
+    Ok(())
 }
 
-async fn write_command_complete(stream: &mut TcpStream, tag: &str) -> anyhow::Result<()> {
+fn push_ready_for_query(buffer: &mut Vec<u8>) -> anyhow::Result<()> {
+    push_message(buffer, b'Z', b"I")
+}
+
+fn push_command_complete(buffer: &mut Vec<u8>, tag: &str) -> anyhow::Result<()> {
     let mut payload = Vec::from(tag.as_bytes());
     payload.push(0);
-    write_message(stream, b'C', &payload).await
+    push_message(buffer, b'C', &payload)
 }
 
-async fn write_row_description(
-    stream: &mut TcpStream,
+fn push_row_description(
+    buffer: &mut Vec<u8>,
     columns: &[String],
     column_types: &[opendb_storage::commit_stream::ColumnType],
 ) -> anyhow::Result<()> {
@@ -535,7 +507,7 @@ async fn write_row_description(
         payload.extend_from_slice(&(-1_i32).to_be_bytes());
         payload.extend_from_slice(&0_i16.to_be_bytes());
     }
-    write_message(stream, b'T', &payload).await
+    push_message(buffer, b'T', &payload)
 }
 
 fn oid_for_column_type(column_type: &opendb_storage::commit_stream::ColumnType) -> i32 {
@@ -576,7 +548,7 @@ fn resolve_row_description_types(
     resolved
 }
 
-async fn write_data_row(stream: &mut TcpStream, row: &[Value]) -> anyhow::Result<()> {
+fn push_data_row(buffer: &mut Vec<u8>, row: &[Value]) -> anyhow::Result<()> {
     let mut payload = Vec::new();
     payload.extend_from_slice(
         &u16::try_from(row.len())
@@ -600,7 +572,7 @@ async fn write_data_row(stream: &mut TcpStream, row: &[Value]) -> anyhow::Result
         );
         payload.extend_from_slice(text.as_bytes());
     }
-    write_message(stream, b'D', &payload).await
+    push_message(buffer, b'D', &payload)
 }
 
 fn value_to_text(value: &Value) -> String {
@@ -629,14 +601,14 @@ fn format_timestamp_micros(micros: i64) -> String {
 }
 
 async fn write_error_response(stream: &mut TcpStream, message: &str) -> anyhow::Result<()> {
-    write_error_response_with_sqlstate(stream, "XX000", message).await
+    let mut buffer = Vec::new();
+    push_error_response_with_sqlstate(&mut buffer, "XX000", message)?;
+    stream.write_all(&buffer).await?;
+    Ok(())
 }
 
-async fn write_open_db_error_response(
-    stream: &mut TcpStream,
-    error: &OpenDbError,
-) -> anyhow::Result<()> {
-    write_error_response_with_sqlstate(stream, sqlstate(error), &error.to_string()).await
+fn push_open_db_error_response(buffer: &mut Vec<u8>, error: &OpenDbError) -> anyhow::Result<()> {
+    push_error_response_with_sqlstate(buffer, sqlstate(error), &error.to_string())
 }
 
 fn sqlstate(error: &OpenDbError) -> &'static str {
@@ -649,8 +621,8 @@ fn sqlstate(error: &OpenDbError) -> &'static str {
     }
 }
 
-async fn write_error_response_with_sqlstate(
-    stream: &mut TcpStream,
+fn push_error_response_with_sqlstate(
+    buffer: &mut Vec<u8>,
     sqlstate: &str,
     message: &str,
 ) -> anyhow::Result<()> {
@@ -665,18 +637,55 @@ async fn write_error_response_with_sqlstate(
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
     payload.push(0);
-    write_message(stream, b'E', &payload).await
+    push_message(buffer, b'E', &payload)
 }
 
 async fn write_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> anyhow::Result<()> {
+    let mut buffer = Vec::new();
+    push_message(&mut buffer, tag, payload)?;
+    stream.write_all(&buffer).await?;
+    Ok(())
+}
+
+fn push_message(buffer: &mut Vec<u8>, tag: u8, payload: &[u8]) -> anyhow::Result<()> {
     let len = payload
         .len()
         .checked_add(4)
         .and_then(|len| u32::try_from(len).ok())
         .context("pgwire message too large")?;
-    stream.write_all(&[tag]).await?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(payload).await?;
+    buffer.push(tag);
+    buffer.extend_from_slice(&len.to_be_bytes());
+    buffer.extend_from_slice(payload);
+    Ok(())
+}
+
+async fn write_query_result(
+    stream: &mut TcpStream,
+    result: Result<QueryResult, OpenDbError>,
+    ready_for_query: bool,
+) -> anyhow::Result<()> {
+    let mut buffer = Vec::new();
+    match result {
+        Ok(QueryResult::Command { tag }) => push_command_complete(&mut buffer, &tag)?,
+        Ok(QueryResult::Rows {
+            columns,
+            column_types,
+            rows,
+        }) => {
+            let row_count = rows.len();
+            let resolved_types = resolve_row_description_types(&columns, &column_types, &rows);
+            push_row_description(&mut buffer, &columns, &resolved_types)?;
+            for row in rows {
+                push_data_row(&mut buffer, &row)?;
+            }
+            push_command_complete(&mut buffer, &format!("SELECT {row_count}"))?;
+        }
+        Err(error) => push_open_db_error_response(&mut buffer, &error)?,
+    }
+    if ready_for_query {
+        push_ready_for_query(&mut buffer)?;
+    }
+    stream.write_all(&buffer).await?;
     Ok(())
 }
 
@@ -698,6 +707,15 @@ mod tests {
             "SELECT * FROM accounts"
         );
         assert!(cstring_payload(b"SELECT * FROM accounts").is_err());
+    }
+
+    #[test]
+    fn push_message_encodes_pgwire_frame() {
+        let mut buffer = Vec::new();
+
+        push_message(&mut buffer, b'Z', b"I").expect("encode ready frame");
+
+        assert_eq!(buffer, vec![b'Z', 0, 0, 0, 5, b'I']);
     }
 
     #[test]
