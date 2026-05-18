@@ -70,13 +70,26 @@ impl Wal {
     }
 
     pub async fn read_all(&self) -> OpenDbResult<Vec<CommitRecord>> {
+        Ok(self.read_all_with_len().await?.0)
+    }
+
+    pub async fn read_all_with_len(&self) -> OpenDbResult<(Vec<CommitRecord>, u64)> {
         let bytes = match fs::read(&self.path).await {
             Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(error) => return Err(storage_error(&self.path, "read wal file", error)),
         };
 
-        Ok(decode_records(&self.path, &bytes)?.records)
+        let byte_len = bytes.len() as u64;
+        Ok((decode_records(&self.path, &bytes)?.records, byte_len))
+    }
+
+    pub async fn byte_len(&self) -> OpenDbResult<u64> {
+        match fs::metadata(&self.path).await {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(storage_error(&self.path, "stat wal file", error)),
+        }
     }
 }
 

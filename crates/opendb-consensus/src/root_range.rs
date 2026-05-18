@@ -274,7 +274,11 @@ impl RootRange {
     }
 
     pub async fn replay(&self) -> OpenDbResult<Vec<CommitRecord>> {
-        let records = self.wal.read_all().await?;
+        Ok(self.replay_with_wal_len().await?.0)
+    }
+
+    pub async fn replay_with_wal_len(&self) -> OpenDbResult<(Vec<CommitRecord>, u64)> {
+        let (records, wal_len) = self.wal.read_all_with_len().await?;
         for (index, record) in records.iter().enumerate() {
             self.validate_replayed_record(index, record)?;
         }
@@ -295,7 +299,11 @@ impl RootRange {
             ))
         })?;
         validate_record_routes(&records)?;
-        Ok(records)
+        Ok((records, wal_len))
+    }
+
+    pub async fn wal_byte_len(&self) -> OpenDbResult<u64> {
+        self.wal.byte_len().await
     }
 
     fn validate_apply_record(&self, record: &CommitRecord) -> OpenDbResult<()> {

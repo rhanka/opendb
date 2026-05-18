@@ -45,6 +45,9 @@ pub struct Database {
     root_range: RootRange,
     engine: SqlEngine,
     range_catalog: RangeCatalog,
+    last_replayed_wal_len: u64,
+    #[cfg(test)]
+    refresh_engine_from_wal_replay_count: usize,
     peer_server: Option<Arc<RootRangePeerServer>>,
     recovery_status: DatabaseRecoveryStatus,
     /// Sprint 17: open-transaction state. `None` = autocommit (each write
@@ -118,7 +121,7 @@ impl Database {
             Err(OpenDbError::NotLeader { .. }) => {}
             Err(error) => return Err(error),
         }
-        let records = root_range.replay().await?;
+        let (records, last_replayed_wal_len) = root_range.replay_with_wal_len().await?;
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
@@ -127,6 +130,9 @@ impl Database {
             root_range,
             engine,
             range_catalog,
+            last_replayed_wal_len,
+            #[cfg(test)]
+            refresh_engine_from_wal_replay_count: 0,
             peer_server: None,
             recovery_status,
             transaction: None,
@@ -142,7 +148,7 @@ impl Database {
             Err(OpenDbError::NotLeader { .. }) => {}
             Err(error) => return Err(error),
         }
-        let records = root_range.replay().await?;
+        let (records, last_replayed_wal_len) = root_range.replay_with_wal_len().await?;
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
@@ -151,6 +157,9 @@ impl Database {
             root_range,
             engine,
             range_catalog,
+            last_replayed_wal_len,
+            #[cfg(test)]
+            refresh_engine_from_wal_replay_count: 0,
             peer_server: Some(peer_server),
             recovery_status,
             transaction: None,
@@ -242,6 +251,7 @@ impl Database {
                             record: record.clone(),
                         })
                         .await?;
+                    self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
                     self.engine.apply_committed(record)?;
                 }
                 if let Some(rows) = returning_result {
@@ -295,6 +305,7 @@ impl Database {
                 return Err(error);
             }
         }
+        self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
         Ok(QueryResult::Command {
             tag: "COMMIT".to_owned(),
         })
@@ -394,7 +405,7 @@ impl Database {
             })
             .await?;
         self.engine.apply_committed(record)?;
-        self.refresh_engine_from_wal().await?;
+        self.rebuild_engine_from_wal().await?;
 
         Ok(RangeSplitProposalResult {
             left_range_id,
@@ -496,7 +507,7 @@ impl Database {
             })
             .await?;
         self.engine.apply_committed(record)?;
-        self.refresh_engine_from_wal().await?;
+        self.rebuild_engine_from_wal().await?;
 
         Ok(RangeMergeProposalResult {
             merged_range_id,
@@ -519,10 +530,33 @@ impl Database {
     /// Used before every `execute` so that records committed via OpenRaft
     /// replication (which bypass `Database::execute`) are observed on reads.
     async fn refresh_engine_from_wal(&mut self) -> OpenDbResult<()> {
-        let records = self.root_range.replay().await?;
+        let wal_len = self.root_range.wal_byte_len().await?;
+        if wal_len == self.last_replayed_wal_len {
+            return Ok(());
+        }
+        self.rebuild_engine_from_wal().await
+    }
+
+    async fn rebuild_engine_from_wal(&mut self) -> OpenDbResult<()> {
+        #[cfg(test)]
+        {
+            self.refresh_engine_from_wal_replay_count += 1;
+        }
+        let (records, wal_len) = self.root_range.replay_with_wal_len().await?;
         self.range_catalog = RangeCatalog::rebuild(&records)?;
         self.engine = SqlEngine::from_commits(records)?;
+        self.last_replayed_wal_len = wal_len;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn reset_refresh_replay_count_for_test(&mut self) {
+        self.refresh_engine_from_wal_replay_count = 0;
+    }
+
+    #[cfg(test)]
+    fn refresh_replay_count_for_test(&self) -> usize {
+        self.refresh_engine_from_wal_replay_count
     }
 
     async fn ensure_leader_for_client_query(&self) -> OpenDbResult<()> {
@@ -832,6 +866,76 @@ mod tests {
 
         let records = local_root_range.replay().await.expect("replay");
         assert_eq!(records.last().expect("last record").range_id, RangeId(2));
+    }
+
+    #[tokio::test]
+    async fn repeated_reads_skip_wal_replay_when_commit_stream_is_unchanged() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let mut database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+        database
+            .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
+            .await
+            .expect("insert");
+
+        database.reset_refresh_replay_count_for_test();
+        database
+            .execute(parse("SELECT * FROM accounts WHERE id = 1").expect("parse"))
+            .await
+            .expect("first select");
+        database
+            .execute(parse("SELECT * FROM accounts WHERE id = 1").expect("parse"))
+            .await
+            .expect("second select");
+
+        assert_eq!(
+            database.refresh_replay_count_for_test(),
+            0,
+            "unchanged WAL should not be replayed for repeated reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_refreshes_when_external_wal_append_changes_commit_stream() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let mut database = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open database");
+        database
+            .execute(parse("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)").expect("parse"))
+            .await
+            .expect("create");
+
+        let mut external = Database::open_with_root_range(RootRange::new(temp_dir.path()))
+            .await
+            .expect("open external database");
+        external
+            .execute(parse("INSERT INTO accounts VALUES (1, 'Ada')").expect("parse"))
+            .await
+            .expect("external insert");
+
+        database.reset_refresh_replay_count_for_test();
+        assert_eq!(
+            database
+                .execute(parse("SELECT * FROM accounts WHERE id = 1").expect("parse"))
+                .await
+                .expect("select after external append"),
+            QueryResult::Rows {
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                column_types: vec![],
+                rows: vec![vec![Value::Int64(1), Value::Text("Ada".to_owned())]],
+            }
+        );
+        assert_eq!(
+            database.refresh_replay_count_for_test(),
+            1,
+            "changed WAL must be replayed exactly once before the read"
+        );
     }
 
     #[tokio::test]
