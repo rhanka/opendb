@@ -27,6 +27,10 @@ impl Wal {
     }
 
     pub async fn append(&self, record: &CommitRecord) -> OpenDbResult<()> {
+        self.append_with_len(record).await.map(|_| ())
+    }
+
+    pub async fn append_with_len(&self, record: &CommitRecord) -> OpenDbResult<u64> {
         let _guard = self.append_lock.lock().await;
         let parent = containing_dir(&self.path);
 
@@ -66,7 +70,7 @@ impl Wal {
             sync_directory(&self.path, parent).await?;
         }
 
-        Ok(())
+        Ok(append_offset + frame.len() as u64)
     }
 
     pub async fn read_all(&self) -> OpenDbResult<Vec<CommitRecord>> {

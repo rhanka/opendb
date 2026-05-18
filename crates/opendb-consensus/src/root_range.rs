@@ -13,6 +13,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 // Milestone 1 keeps the public consensus boundary here. OpenRaft integration
@@ -77,8 +79,25 @@ pub struct RootRange {
     wal: Wal,
     proposal_path: RootRangeProposalPath,
     semantic_append_lock: Arc<Mutex<()>>,
+    semantic_append_cache: Arc<Mutex<SemanticAppendCache>>,
     openraft_submit_lock: Arc<Mutex<()>>,
     bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
+    #[cfg(test)]
+    semantic_validation_rebuild_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SemanticAppendCache {
+    snapshot: Option<SemanticAppendSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticAppendSnapshot {
+    wal_len: u64,
+    records: Vec<CommitRecord>,
+    projection: RowProjection,
+    range_catalog: RangeCatalog,
+    archive_manifest: ArchiveManifest,
 }
 
 impl RootRange {
@@ -102,8 +121,11 @@ impl RootRange {
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::Local(authority),
             semantic_append_lock: Arc::new(Mutex::new(())),
+            semantic_append_cache: Arc::new(Mutex::new(SemanticAppendCache::default())),
             openraft_submit_lock: Arc::new(Mutex::new(())),
             bootstrap_replica_node_ids,
+            #[cfg(test)]
+            semantic_validation_rebuild_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -133,8 +155,11 @@ impl RootRange {
             wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
             proposal_path: RootRangeProposalPath::OpenRaft(Arc::clone(&raft)),
             semantic_append_lock: Arc::new(Mutex::new(())),
+            semantic_append_cache: Arc::new(Mutex::new(SemanticAppendCache::default())),
             openraft_submit_lock: Arc::new(Mutex::new(())),
             bootstrap_replica_node_ids,
+            #[cfg(test)]
+            semantic_validation_rebuild_count: Arc::new(AtomicUsize::new(0)),
         };
 
         Ok((root_range, RootRangePeerServer { raft }))
@@ -226,8 +251,11 @@ impl RootRange {
     pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
         self.validate_apply_record(record)?;
         let _guard = self.semantic_append_lock.lock().await;
-        self.validate_semantic_append(record).await?;
-        self.wal.append(record).await
+        let semantic_snapshot = self.validate_semantic_append(record).await?;
+        let wal_len = self.wal.append_with_len(record).await?;
+        self.commit_semantic_append_snapshot(semantic_snapshot, wal_len)
+            .await;
+        Ok(())
     }
 
     /// Compatibility wrapper for existing plan-era callers.
@@ -248,7 +276,7 @@ impl RootRange {
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(raft) => {
                 let _guard = self.openraft_submit_lock.lock().await;
-                self.validate_semantic_append(&command.record).await?;
+                let _semantic_snapshot = self.validate_semantic_append(&command.record).await?;
                 let response = raft.submit(command).await?;
                 if response == RootRangeResponse::Applied {
                     Ok(())
@@ -278,32 +306,55 @@ impl RootRange {
     }
 
     pub async fn replay_with_wal_len(&self) -> OpenDbResult<(Vec<CommitRecord>, u64)> {
+        let snapshot = self.load_semantic_snapshot_from_wal().await?;
+        Ok((snapshot.records, snapshot.wal_len))
+    }
+
+    async fn load_semantic_snapshot_from_wal(&self) -> OpenDbResult<SemanticAppendSnapshot> {
         let (records, wal_len) = self.wal.read_all_with_len().await?;
         for (index, record) in records.iter().enumerate() {
             self.validate_replayed_record(index, record)?;
         }
         self.validate_replay_sequence(&records)?;
-        RowProjection::rebuild(&records).map_err(|error| {
+        let projection = RowProjection::rebuild(&records).map_err(|error| {
             OpenDbError::Storage(format!(
                 "root range WAL failed semantic replay validation: {error}"
             ))
         })?;
-        RangeCatalog::rebuild(&records).map_err(|error| {
+        let range_catalog = RangeCatalog::rebuild(&records).map_err(|error| {
             OpenDbError::Storage(format!(
                 "root range WAL failed range catalog replay validation: {error}"
             ))
         })?;
-        ArchiveManifest::rebuild(&records).map_err(|error| {
+        let archive_manifest = ArchiveManifest::rebuild(&records).map_err(|error| {
             OpenDbError::Storage(format!(
                 "root range WAL failed archive manifest replay validation: {error}"
             ))
         })?;
         validate_record_routes(&records)?;
-        Ok((records, wal_len))
+        Ok(SemanticAppendSnapshot {
+            wal_len,
+            records,
+            projection,
+            range_catalog,
+            archive_manifest,
+        })
     }
 
     pub async fn wal_byte_len(&self) -> OpenDbResult<u64> {
         self.wal.byte_len().await
+    }
+
+    #[cfg(test)]
+    fn reset_semantic_validation_rebuild_count(&self) {
+        self.semantic_validation_rebuild_count
+            .store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn semantic_validation_rebuild_count(&self) -> usize {
+        self.semantic_validation_rebuild_count
+            .load(Ordering::SeqCst)
     }
 
     fn validate_apply_record(&self, record: &CommitRecord) -> OpenDbResult<()> {
@@ -317,22 +368,56 @@ impl RootRange {
         Ok(())
     }
 
-    async fn validate_semantic_append(&self, record: &CommitRecord) -> OpenDbResult<()> {
+    async fn semantic_snapshot_for_append(&self) -> OpenDbResult<SemanticAppendSnapshot> {
+        let wal_len = self.wal.byte_len().await?;
+        {
+            let cache = self.semantic_append_cache.lock().await;
+            if let Some(snapshot) = &cache.snapshot
+                && snapshot.wal_len == wal_len
+            {
+                return Ok(snapshot.clone());
+            }
+        }
+
+        let snapshot = self.load_semantic_snapshot_from_wal().await?;
+        #[cfg(test)]
+        self.semantic_validation_rebuild_count
+            .fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.semantic_append_cache.lock().await;
+        cache.snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn commit_semantic_append_snapshot(
+        &self,
+        mut snapshot: SemanticAppendSnapshot,
+        wal_len: u64,
+    ) {
+        snapshot.wal_len = wal_len;
+        let mut cache = self.semantic_append_cache.lock().await;
+        cache.snapshot = Some(snapshot);
+    }
+
+    async fn validate_semantic_append(
+        &self,
+        record: &CommitRecord,
+    ) -> OpenDbResult<SemanticAppendSnapshot> {
         validate_metadata_record_range(record).map_err(sequence_validation_error_for_append)?;
-        let mut records = self.replay().await?;
-        if records.is_empty() && !record.is_root_bootstrap() {
+        let mut snapshot = self.semantic_snapshot_for_append().await?;
+        if snapshot.records.is_empty() && !record.is_root_bootstrap() {
             return Err(OpenDbError::InvalidInput(
                 "root descriptor bootstrap must be committed before user records".to_string(),
             ));
         }
-        records.push(record.clone());
-        self.validate_replay_sequence(&records)
+        self.validate_next_replay_record(&snapshot.records, record)
             .map_err(sequence_validation_error_for_append)?;
-        RowProjection::rebuild(&records)?;
-        RangeCatalog::rebuild(&records)?;
-        ArchiveManifest::rebuild(&records)?;
-        validate_record_routes(&records).map_err(sequence_validation_error_for_append)?;
-        Ok(())
+        snapshot.projection.apply(record)?;
+        snapshot.range_catalog.apply(record)?;
+        snapshot.archive_manifest.apply(record)?;
+        validate_record_route_with_catalog(&snapshot.range_catalog, record)
+            .map_err(sequence_validation_error_for_append)?;
+        snapshot.records.push(record.clone());
+        Ok(snapshot)
     }
 
     fn validate_replayed_record(&self, index: usize, record: &CommitRecord) -> OpenDbResult<()> {
@@ -422,6 +507,54 @@ impl RootRange {
 
         Ok(())
     }
+
+    fn validate_next_replay_record(
+        &self,
+        records: &[CommitRecord],
+        record: &CommitRecord,
+    ) -> OpenDbResult<()> {
+        let index = records.len();
+        if index == 0 {
+            return self.validate_replay_sequence(std::slice::from_ref(record));
+        }
+
+        if record.is_root_bootstrap() || record.tx_id == opendb_common::TransactionId(0) {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} repeats root descriptor bootstrap tx_id"
+            )));
+        }
+        if record.ts == opendb_common::LogicalTimestamp(0) {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} repeats root descriptor bootstrap timestamp"
+            )));
+        }
+        if record.mutations.is_empty() {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} must contain at least one mutation"
+            )));
+        }
+        if record.actor.trim().is_empty() || record.actor != record.actor.trim() {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} actor must not be empty or padded"
+            )));
+        }
+
+        let previous = records
+            .last()
+            .expect("non-empty records have a previous record");
+        if record.tx_id <= previous.tx_id {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} must have strictly increasing tx_id"
+            )));
+        }
+        if record.ts <= previous.ts {
+            return Err(OpenDbError::Storage(format!(
+                "root range record {index} must have strictly increasing ts"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 fn validate_record_routes(records: &[CommitRecord]) -> OpenDbResult<()> {
@@ -429,21 +562,29 @@ fn validate_record_routes(records: &[CommitRecord]) -> OpenDbResult<()> {
     for record in records {
         validate_metadata_record_range(record)?;
         catalog.apply(record)?;
-        for mutation in &record.mutations {
-            if let Mutation::InsertRow { table, key, .. } = mutation {
-                let route_key = format!("{table}/{key}");
-                let expected = catalog
-                    .route_key(&route_key)
-                    .map(|descriptor| descriptor.range_id)
-                    .ok_or_else(|| {
-                        OpenDbError::Storage(format!("no range route for key {route_key}"))
-                    })?;
-                if record.range_id != expected {
-                    return Err(OpenDbError::Storage(format!(
-                        "row route key {route_key} expected range {:?}, got {:?}",
-                        expected, record.range_id
-                    )));
-                }
+        validate_record_route_with_catalog(&catalog, record)?;
+    }
+    Ok(())
+}
+
+fn validate_record_route_with_catalog(
+    catalog: &RangeCatalog,
+    record: &CommitRecord,
+) -> OpenDbResult<()> {
+    for mutation in &record.mutations {
+        if let Mutation::InsertRow { table, key, .. } = mutation {
+            let route_key = format!("{table}/{key}");
+            let expected = catalog
+                .route_key(&route_key)
+                .map(|descriptor| descriptor.range_id)
+                .ok_or_else(|| {
+                    OpenDbError::Storage(format!("no range route for key {route_key}"))
+                })?;
+            if record.range_id != expected {
+                return Err(OpenDbError::Storage(format!(
+                    "row route key {route_key} expected range {:?}, got {:?}",
+                    expected, record.range_id
+                )));
             }
         }
     }
@@ -1039,6 +1180,92 @@ mod tests {
             records == with_bootstrap(&root_range, vec![first])
                 || records == with_bootstrap(&root_range, vec![second]),
             "unexpected committed record: {records:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_reuses_semantic_validation_for_consecutive_appends() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
+        root_range.reset_semantic_validation_rebuild_count();
+
+        root_range
+            .apply_committed(&CommitRecord::new(
+                TransactionId(10),
+                LogicalTimestamp(14),
+                vec![Mutation::CreateTable {
+                    table: "events".to_string(),
+                    columns: id_columns(),
+                }],
+            ))
+            .await
+            .expect("append first record");
+        root_range
+            .apply_committed(&CommitRecord::new(
+                TransactionId(11),
+                LogicalTimestamp(15),
+                vec![Mutation::CreateTable {
+                    table: "orders".to_string(),
+                    columns: id_columns(),
+                }],
+            ))
+            .await
+            .expect("append second record");
+
+        assert!(
+            root_range.semantic_validation_rebuild_count() <= 1,
+            "consecutive appends should reuse semantic validation state; rebuilt {} times",
+            root_range.semantic_validation_rebuild_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_refreshes_semantic_validation_after_external_append() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root_range = RootRange::new(temp_dir.path());
+        bootstrap(&root_range).await;
+        root_range
+            .apply_committed(&CommitRecord::new(
+                TransactionId(10),
+                LogicalTimestamp(14),
+                vec![Mutation::CreateTable {
+                    table: "events".to_string(),
+                    columns: id_columns(),
+                }],
+            ))
+            .await
+            .expect("warm semantic validation cache");
+        root_range.reset_semantic_validation_rebuild_count();
+
+        let external_root_range = RootRange::new(temp_dir.path());
+        external_root_range
+            .apply_committed(&CommitRecord::new(
+                TransactionId(11),
+                LogicalTimestamp(15),
+                vec![Mutation::CreateTable {
+                    table: "orders".to_string(),
+                    columns: id_columns(),
+                }],
+            ))
+            .await
+            .expect("append through another root range instance");
+        root_range
+            .apply_committed(&CommitRecord::new(
+                TransactionId(12),
+                LogicalTimestamp(16),
+                vec![Mutation::CreateTable {
+                    table: "audit_log".to_string(),
+                    columns: id_columns(),
+                }],
+            ))
+            .await
+            .expect("append after external WAL change");
+
+        assert_eq!(
+            root_range.semantic_validation_rebuild_count(),
+            1,
+            "external WAL changes must force one semantic validation refresh"
         );
     }
 
