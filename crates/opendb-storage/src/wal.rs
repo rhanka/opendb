@@ -17,13 +17,19 @@ const FRAME_RESERVED: u16 = 0;
 pub struct Wal {
     path: PathBuf,
     append_lock: Arc<Mutex<()>>,
+    durable_len: Arc<Mutex<Option<u64>>>,
 }
 
 impl Wal {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let append_lock = append_lock_for_path(&path);
-        Self { path, append_lock }
+        let durable_len = durable_len_cache_for_path(&path);
+        Self {
+            path,
+            append_lock,
+            durable_len,
+        }
     }
 
     pub async fn append(&self, record: &CommitRecord) -> OpenDbResult<()> {
@@ -43,7 +49,15 @@ impl Wal {
             Err(error) => return Err(storage_error(&self.path, "check wal existence", error)),
         };
 
-        let append_offset = durable_prefix_len(&self.path).await?;
+        let mut cached = self.durable_len.lock().await;
+        let append_offset = match *cached {
+            Some(len) => len,
+            None => {
+                let len = durable_prefix_len(&self.path).await?;
+                *cached = Some(len);
+                len
+            }
+        };
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -70,7 +84,9 @@ impl Wal {
             sync_directory(&self.path, parent).await?;
         }
 
-        Ok(append_offset + frame.len() as u64)
+        let new_len = append_offset + frame.len() as u64;
+        *cached = Some(new_len);
+        Ok(new_len)
     }
 
     pub async fn read_all(&self) -> OpenDbResult<Vec<CommitRecord>> {
@@ -100,6 +116,10 @@ impl Wal {
 static WAL_APPEND_LOCKS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
 
+static WAL_DURABLE_LEN_CACHES: OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<Option<u64>>>>>,
+> = OnceLock::new();
+
 fn append_lock_for_path(path: &PathBuf) -> Arc<Mutex<()>> {
     let locks = WAL_APPEND_LOCKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
     let mut locks = locks.lock().expect("wal append lock registry poisoned");
@@ -109,6 +129,19 @@ fn append_lock_for_path(path: &PathBuf) -> Arc<Mutex<()>> {
     let lock = Arc::new(Mutex::new(()));
     locks.insert(path.clone(), Arc::downgrade(&lock));
     lock
+}
+
+fn durable_len_cache_for_path(path: &PathBuf) -> Arc<Mutex<Option<u64>>> {
+    let caches = WAL_DURABLE_LEN_CACHES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let mut caches = caches
+        .lock()
+        .expect("wal durable len cache registry poisoned");
+    if let Some(cache) = caches.get(path).and_then(Weak::upgrade) {
+        return cache;
+    }
+    let cache = Arc::new(Mutex::new(None));
+    caches.insert(path.clone(), Arc::downgrade(&cache));
+    cache
 }
 
 #[derive(Debug)]
@@ -810,6 +843,60 @@ mod tests {
                 .await
                 .expect("read after truncating torn tail"),
             vec![first, replacement]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_caches_durable_len_across_consecutive_appends() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let records: Vec<CommitRecord> = (0..16)
+            .map(|i| insert_record(i + 1, 100 + i as u64, &format!("{i}"), &format!("name{i}")))
+            .collect();
+
+        let mut expected_len = 0u64;
+        for record in &records {
+            let frame = encode_frame(record).expect("encode");
+            expected_len += frame.len() as u64;
+            let returned = wal
+                .append_with_len(record)
+                .await
+                .expect("append returns cached len");
+            assert_eq!(returned, expected_len);
+            let cached = wal.durable_len.lock().await;
+            assert_eq!(*cached, Some(expected_len));
+        }
+        assert_eq!(
+            wal.read_all().await.expect("read after cached appends"),
+            records
+        );
+    }
+
+    #[tokio::test]
+    async fn append_recomputes_durable_len_after_drop_for_fresh_wal_instance() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let first = insert_record(1, 10, "1", "Ada");
+        let second = insert_record(2, 11, "2", "Grace");
+
+        {
+            let wal = Wal::new(&wal_path);
+            wal.append(&first).await.expect("append first");
+        }
+
+        let wal_b = Wal::new(&wal_path);
+        {
+            let cached = wal_b.durable_len.lock().await;
+            assert!(
+                cached.is_none(),
+                "fresh Wal instance should start with empty cache"
+            );
+        }
+        wal_b.append(&second).await.expect("append second");
+        assert_eq!(
+            wal_b.read_all().await.expect("read after fresh wal append"),
+            vec![first, second]
         );
     }
 
