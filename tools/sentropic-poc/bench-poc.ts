@@ -228,52 +228,102 @@ async function stopPostgresContainer(container: string): Promise<void> {
   });
 }
 
-async function applySchemaAndSeed(factory: ClientFactory, label: string): Promise<number> {
+type SeedBreakdown = {
+  ddlMs: number;
+  rootsMs: number;
+  foldersMs: number;
+  initiativesMs: number;
+  refreshMs: number;
+  refreshLabel: string;
+  totalMs: number;
+};
+
+async function timePhase<T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> {
+  const t0 = process.hrtime.bigint();
+  const value = await fn();
+  const t1 = process.hrtime.bigint();
+  return { value, ms: Number(t1 - t0) / 1_000_000 };
+}
+
+async function applySchemaAndSeed(factory: ClientFactory, label: string): Promise<SeedBreakdown> {
   console.log(`[${label}] applying schema + seed (${FOLDERS} folders, ${FOLDERS * INITIATIVES_PER_FOLDER} initiatives)`);
-  const startedAt = Date.now();
   const client = await factory();
   try {
-    for (const stmt of SCHEMA) await client.query(stmt);
-    console.log(`[${label}] schema applied`);
-    // Seed one workspace + one organization
-    await client.query(
-      `INSERT INTO workspaces (id, name, type) VALUES ('ws-bench', 'Bench WS', 'ai-ideas')`
-    );
-    await client.query(
-      `INSERT INTO organizations (id, workspace_id, name) VALUES ('org-bench', 'ws-bench', 'Bench Org')`
-    );
-    // Folders + initiatives in batches (multi-row INSERT) — keep tuples small
-    // so opendb's parser stays within reasonable line lengths.
-    for (let i = 0; i < FOLDERS; i += BATCH_FOLDERS) {
-      const tuples: string[] = [];
-      for (let j = i; j < Math.min(i + BATCH_FOLDERS, FOLDERS); j += 1) {
-        tuples.push(`('fld-${j}', 'ws-bench', 'Folder ${j}', 'org-bench', 'completed')`);
-      }
+    // Phase 1 — DDL: CREATE TABLE for the 4 tables.
+    const ddl = await timePhase(async () => {
+      for (const stmt of SCHEMA) await client.query(stmt);
+    });
+    console.log(`[${label}] schema applied (${ddl.ms.toFixed(1)} ms)`);
+
+    // Phase 2 — Roots: workspaces + organizations (fixed, small).
+    const roots = await timePhase(async () => {
       await client.query(
-        `INSERT INTO folders (id, workspace_id, name, organization_id, status) VALUES ${tuples.join(",")}`
+        `INSERT INTO workspaces (id, name, type) VALUES ('ws-bench', 'Bench WS', 'ai-ideas')`
       );
-      console.log(`[${label}] folders ${Math.min(i + BATCH_FOLDERS, FOLDERS)}/${FOLDERS}`);
-    }
-    // Faster: build all initiative tuples upfront then batch
+      await client.query(
+        `INSERT INTO organizations (id, workspace_id, name) VALUES ('org-bench', 'ws-bench', 'Bench Org')`
+      );
+    });
+    console.log(`[${label}] roots inserted (${roots.ms.toFixed(1)} ms)`);
+
+    // Phase 3 — Folders insert loop (batched multi-row INSERT, keeps tuples
+    // small so opendb's parser stays within reasonable line lengths).
+    const folders = await timePhase(async () => {
+      for (let i = 0; i < FOLDERS; i += BATCH_FOLDERS) {
+        const tuples: string[] = [];
+        for (let j = i; j < Math.min(i + BATCH_FOLDERS, FOLDERS); j += 1) {
+          tuples.push(`('fld-${j}', 'ws-bench', 'Folder ${j}', 'org-bench', 'completed')`);
+        }
+        await client.query(
+          `INSERT INTO folders (id, workspace_id, name, organization_id, status) VALUES ${tuples.join(",")}`
+        );
+        console.log(`[${label}] folders ${Math.min(i + BATCH_FOLDERS, FOLDERS)}/${FOLDERS}`);
+      }
+    });
+    console.log(`[${label}] folders done (${folders.ms.toFixed(1)} ms)`);
+
+    // Phase 4 — Initiatives insert loop.
     const total = FOLDERS * INITIATIVES_PER_FOLDER;
     const progressStep = Math.max(BATCH_INITIATIVES, 100);
-    for (let start = 0; start < total; start += BATCH_INITIATIVES) {
-      const end = Math.min(start + BATCH_INITIATIVES, total);
-      const tuples: string[] = [];
-      for (let n = start; n < end; n += 1) {
-        const folderIdx = Math.floor(n / INITIATIVES_PER_FOLDER);
-        tuples.push(`('i-${n}', 'ws-bench', 'fld-${folderIdx}', 'completed')`);
+    const initiatives = await timePhase(async () => {
+      for (let start = 0; start < total; start += BATCH_INITIATIVES) {
+        const end = Math.min(start + BATCH_INITIATIVES, total);
+        const tuples: string[] = [];
+        for (let n = start; n < end; n += 1) {
+          const folderIdx = Math.floor(n / INITIATIVES_PER_FOLDER);
+          tuples.push(`('i-${n}', 'ws-bench', 'fld-${folderIdx}', 'completed')`);
+        }
+        await client.query(
+          `INSERT INTO initiatives (id, workspace_id, folder_id, status) VALUES ${tuples.join(",")}`
+        );
+        if (end === total || end % progressStep === 0) {
+          console.log(`[${label}] initiatives ${end}/${total}`);
+        }
       }
-      await client.query(
-        `INSERT INTO initiatives (id, workspace_id, folder_id, status) VALUES ${tuples.join(",")}`
-      );
-      if (end === total || end % progressStep === 0) {
-        console.log(`[${label}] initiatives ${end}/${total}`);
-      }
-    }
-    const durationSeconds = (Date.now() - startedAt) / 1000;
-    console.log(`[${label}] seed complete in ${durationSeconds.toFixed(1)}s`);
-    return durationSeconds;
+    });
+    console.log(`[${label}] initiatives done (${initiatives.ms.toFixed(1)} ms)`);
+
+    // Phase 5 — Post-seed refresh / settle. Currently nothing runs between
+    // the last INSERT and the read-bench phase, so this is a no-op (0 ms).
+    // Keep the slot wired so we have a visible (none) line in the table —
+    // if we ever add an ANALYZE or a materialised-view refresh, we just
+    // measure it here without changing the breakdown shape.
+    const refreshLabel = "(none)";
+    const refresh = await timePhase(async () => {
+      /* no-op: nothing to settle between seed and read-bench */
+    });
+
+    const totalMs = ddl.ms + roots.ms + folders.ms + initiatives.ms + refresh.ms;
+    console.log(`[${label}] seed complete in ${(totalMs / 1000).toFixed(1)}s`);
+    return {
+      ddlMs: ddl.ms,
+      rootsMs: roots.ms,
+      foldersMs: folders.ms,
+      initiativesMs: initiatives.ms,
+      refreshMs: refresh.ms,
+      refreshLabel,
+      totalMs
+    };
   } finally {
     await client.end();
   }
@@ -359,7 +409,35 @@ type Row = {
   pg: { p50: number; p95: number; p99: number; mean: number };
 };
 
-type SeedTiming = { opendbSeconds: number; pgSeconds: number };
+type SeedTiming = { opendb: SeedBreakdown; pg: SeedBreakdown };
+
+function formatBreakdownBlock(seedTiming: SeedTiming): string {
+  const { opendb, pg } = seedTiming;
+  const fmtMs = (ms: number) => `${ms.toFixed(1)} ms`;
+  const fmtRatio = (oMs: number, pMs: number) => {
+    if (pMs <= 0) return oMs <= 0 ? "n/a" : "∞×";
+    const r = oMs / pMs;
+    return `${r.toFixed(1)}×`;
+  };
+  const rows: Array<[string, number, number]> = [
+    [`DDL`, opendb.ddlMs, pg.ddlMs],
+    [`Roots`, opendb.rootsMs, pg.rootsMs],
+    [`Folders`, opendb.foldersMs, pg.foldersMs],
+    [`Initiatives`, opendb.initiativesMs, pg.initiativesMs],
+    [`Refresh ${opendb.refreshLabel}`, opendb.refreshMs, pg.refreshMs],
+    [`TOTAL`, opendb.totalMs, pg.totalMs]
+  ];
+  const lines: string[] = [];
+  lines.push(`=== SEED BREAKDOWN ===`);
+  const header = `${"Phase".padEnd(20)}${"OpenDB".padEnd(14)}${"PostgreSQL".padEnd(14)}Ratio (OpenDB / PG)`;
+  lines.push(header);
+  for (const [name, oMs, pMs] of rows) {
+    lines.push(
+      `${name.padEnd(20)}${fmtMs(oMs).padEnd(14)}${fmtMs(pMs).padEnd(14)}${fmtRatio(oMs, pMs)}`
+    );
+  }
+  return lines.join("\n");
+}
 
 function renderReport(rows: Row[], seedTiming: SeedTiming): string {
   const dateStamp = localDateStamp();
@@ -385,8 +463,25 @@ function renderReport(rows: Row[], seedTiming: SeedTiming): string {
   lines.push("");
   lines.push("| Engine | Duration |");
   lines.push("|--------|----------|");
-  lines.push(`| opendb-node | ${seedTiming.opendbSeconds.toFixed(1)}s |`);
-  lines.push(`| PostgreSQL 16 | ${seedTiming.pgSeconds.toFixed(1)}s |`);
+  lines.push(`| opendb-node | ${(seedTiming.opendb.totalMs / 1000).toFixed(1)}s |`);
+  lines.push(`| PostgreSQL 16 | ${(seedTiming.pg.totalMs / 1000).toFixed(1)}s |`);
+  lines.push("");
+  lines.push("### Seed breakdown");
+  lines.push("");
+  lines.push("| Phase | OpenDB (ms) | PostgreSQL (ms) | Ratio (OpenDB / PG) |");
+  lines.push("|-------|-------------|------------------|----------------------|");
+  const breakdownRows: Array<[string, number, number]> = [
+    ["DDL", seedTiming.opendb.ddlMs, seedTiming.pg.ddlMs],
+    ["Roots", seedTiming.opendb.rootsMs, seedTiming.pg.rootsMs],
+    ["Folders", seedTiming.opendb.foldersMs, seedTiming.pg.foldersMs],
+    ["Initiatives", seedTiming.opendb.initiativesMs, seedTiming.pg.initiativesMs],
+    [`Refresh ${seedTiming.opendb.refreshLabel}`, seedTiming.opendb.refreshMs, seedTiming.pg.refreshMs],
+    ["TOTAL", seedTiming.opendb.totalMs, seedTiming.pg.totalMs]
+  ];
+  for (const [name, oMs, pMs] of breakdownRows) {
+    const ratio = pMs <= 0 ? (oMs <= 0 ? "n/a" : "∞×") : `${(oMs / pMs).toFixed(1)}×`;
+    lines.push(`| ${name} | ${oMs.toFixed(1)} | ${pMs.toFixed(1)} | ${ratio} |`);
+  }
   lines.push("");
   lines.push("## Latency matrix");
   lines.push("");
@@ -407,7 +502,7 @@ function renderReport(rows: Row[], seedTiming: SeedTiming): string {
     "- `opendb÷PG mean < 1` means opendb is faster on that query; `> 1` means PG is faster."
   );
   lines.push("- opendb-node runs in-memory (the bench data dir is wiped at the end); PG runs with its default storage on disk inside the container. Both are localhost over TCP. This is **not** a fair production comparison — both have the same wire overhead but very different durability stories. Treat the numbers as a *worst case* for opendb (cold cache, no query plan) and a *best case* for PG (warm cache, mature optimizer).");
-  lines.push(`- The dominant bottleneck in this run is ingestion: opendb-node needed ${seedTiming.opendbSeconds.toFixed(1)}s to seed ${FOLDERS} folders and ${FOLDERS * INITIATIVES_PER_FOLDER} initiatives, versus ${seedTiming.pgSeconds.toFixed(1)}s for PostgreSQL 16. Query latency is also orders of magnitude higher on all five probes.`);
+  lines.push(`- The dominant bottleneck in this run is ingestion: opendb-node needed ${(seedTiming.opendb.totalMs / 1000).toFixed(1)}s to seed ${FOLDERS} folders and ${FOLDERS * INITIATIVES_PER_FOLDER} initiatives, versus ${(seedTiming.pg.totalMs / 1000).toFixed(1)}s for PostgreSQL 16. Query latency is also orders of magnitude higher on all five probes.`);
   return lines.join("\n");
 }
 
@@ -424,8 +519,10 @@ async function main(): Promise<void> {
   try {
     const oFactory = makeOpendbFactory(opendb.port);
     const pFactory = makePgFactory(pg.port);
-    const opendbSeedSeconds = await applySchemaAndSeed(oFactory, "opendb");
-    const pgSeedSeconds = await applySchemaAndSeed(pFactory, "pg");
+    const opendbSeed = await applySchemaAndSeed(oFactory, "opendb");
+    const pgSeed = await applySchemaAndSeed(pFactory, "pg");
+    const seedTiming: SeedTiming = { opendb: opendbSeed, pg: pgSeed };
+    console.log("\n" + formatBreakdownBlock(seedTiming) + "\n");
     const rows: Row[] = [];
     for (const query of QUERIES) {
       console.log(`[bench] ${query.id} — ${query.description}`);
@@ -439,7 +536,7 @@ async function main(): Promise<void> {
       });
       console.log(`  opendb mean=${o.mean.toFixed(2)}ms p95=${o.p95.toFixed(2)}ms | pg mean=${p.mean.toFixed(2)}ms p95=${p.p95.toFixed(2)}ms`);
     }
-    const report = renderReport(rows, { opendbSeconds: opendbSeedSeconds, pgSeconds: pgSeedSeconds });
+    const report = renderReport(rows, seedTiming);
     console.log("\n" + report);
     const reportPath = join(repoRoot, "docs", "bench", `sentropic-bench-${localDateStamp()}.md`);
     mkdirSync(dirname(reportPath), { recursive: true });
