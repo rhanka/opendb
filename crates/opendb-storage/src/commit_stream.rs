@@ -37,6 +37,13 @@ pub enum ColumnType {
 pub enum DefaultExpr {
     Const(Value),
     Now,
+    /// Phase A 2026-05-22: auto-generated monotonic BIGINT for tables
+    /// declared without a primary key. The parser injects a synthetic
+    /// `__opendb_rowid` column with this default; the executor populates
+    /// it from a global atomic counter at INSERT time so PG-style
+    /// "heap table without explicit PK" workloads (pgbench_history etc.)
+    /// don't fail the "exactly one primary key column" check.
+    AutoRowId,
 }
 
 fn default_true() -> bool {
@@ -149,6 +156,20 @@ pub enum Mutation {
         table: String,
         key: String,
         assignments: Vec<ColumnValue>,
+    },
+    /// Phase A 2026-05-22: `DROP TABLE` removes the table from the
+    /// projection and the range catalog. `if_exists` is parser-level only
+    /// (the parser elides the statement when the table is missing); the
+    /// mutation itself is unconditional and errors out on missing tables
+    /// so a torn / partially replayed WAL does not silently mask a bug.
+    DropTable {
+        table: String,
+    },
+    /// Phase A 2026-05-22: `TRUNCATE TABLE` drops all rows but keeps the
+    /// schema. Multi-table `TRUNCATE TABLE t1, t2, ..` is exploded into N
+    /// statements by the parser, same shape as DROP TABLE.
+    TruncateTable {
+        table: String,
     },
 }
 

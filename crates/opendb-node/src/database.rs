@@ -842,8 +842,13 @@ mod tests {
             .await
             .expect("open database");
 
+        // Phase A 2026-05-22: CREATE TABLE without an explicit primary
+        // key now auto-injects a synthetic rowid (PG-compat), so we
+        // trigger an InvalidInput here via duplicate column names — a
+        // path that still goes through the same "validate before follower
+        // leader check" code we want to exercise.
         let result = database
-            .execute(parse("CREATE TABLE accounts (id INT)").expect("parse"))
+            .execute(parse("CREATE TABLE accounts (id INT, id TEXT)").expect("parse"))
             .await;
 
         assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));

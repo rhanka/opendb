@@ -201,6 +201,17 @@ impl RowProjection {
                 } => {
                     self.apply_update_row(table, key, assignments)?;
                 }
+                Mutation::DropTable { table } => {
+                    if self.tables.remove(table).is_none() {
+                        return Err(OpenDbError::NotFound(format!("table not found: {table}")));
+                    }
+                }
+                Mutation::TruncateTable { table } => {
+                    let table_state = self.tables.get_mut(table).ok_or_else(|| {
+                        OpenDbError::NotFound(format!("table not found: {table}"))
+                    })?;
+                    table_state.rows.clear();
+                }
             }
         }
         Ok(())
@@ -670,6 +681,10 @@ impl RowProjection {
 
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(name)
+    }
+
+    pub fn has_table(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
     }
 }
 

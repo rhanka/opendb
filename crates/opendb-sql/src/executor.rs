@@ -306,6 +306,46 @@ impl SqlEngine {
                 assignments,
                 returning,
             } => self.prepare_update_where(table, predicate, assignments, returning),
+            Statement::DropTable { table, if_exists } => {
+                // Phase A 2026-05-22: pgbench -i starts with DROP TABLE IF
+                // EXISTS pgbench_accounts, pgbench_branches, ... ; we honor
+                // it by emitting a single DropTable mutation per name. The
+                // multi-table comma list is split into N statements by the
+                // parser (DoBlock), so this prepare path only ever sees
+                // one table at a time.
+                if !self.projection.has_table(&table) {
+                    if if_exists {
+                        // No-op: return a Read with the command tag so the
+                        // execute path never writes an empty record to the
+                        // WAL (which would fail the "at least one mutation"
+                        // validation in root_range).
+                        return Ok(PreparedQuery::Read {
+                            result: QueryResult::Command {
+                                tag: "DROP TABLE".to_owned(),
+                            },
+                            route: RouteIntent::Root,
+                        });
+                    }
+                    return Err(OpenDbError::NotFound(format!("table not found: {table}")));
+                }
+                self.prepare_write_with_returning(
+                    vec![Mutation::DropTable { table }],
+                    "DROP TABLE",
+                    RouteIntent::Root,
+                    None,
+                )
+            }
+            Statement::TruncateTable { table } => {
+                if !self.projection.has_table(&table) {
+                    return Err(OpenDbError::NotFound(format!("table not found: {table}")));
+                }
+                self.prepare_write_with_returning(
+                    vec![Mutation::TruncateTable { table }],
+                    "TRUNCATE TABLE",
+                    RouteIntent::Root,
+                    None,
+                )
+            }
         }
     }
 
@@ -2137,6 +2177,26 @@ fn wall_clock_microseconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Phase A 2026-05-22: monotonic counter for synthetic primary keys on
+/// CREATE TABLE statements that declare no explicit PRIMARY KEY. The
+/// counter is seeded from wall-clock microseconds on first use so two
+/// processes that share a WAL file path (e.g. test + bench) don't
+/// collide on the first few records.
+fn next_auto_rowid() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static AUTO_ROWID: AtomicI64 = AtomicI64::new(0);
+    let mut current = AUTO_ROWID.load(Ordering::Relaxed);
+    if current == 0 {
+        let seeded = wall_clock_microseconds();
+        AUTO_ROWID
+            .compare_exchange(0, seeded, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
+        current = AUTO_ROWID.load(Ordering::Relaxed);
+    }
+    AUTO_ROWID.fetch_add(1, Ordering::Relaxed);
+    current
+}
+
 fn default_value_for_column(
     table: &str,
     column: &ColumnDefinition,
@@ -2167,6 +2227,15 @@ fn default_value_for_column(
                 )));
             }
             Ok(Value::Timestamp(now_microseconds))
+        }
+        Some(DefaultExpr::AutoRowId) => {
+            if !matches!(column.data_type, ColumnType::Int64) {
+                return Err(OpenDbError::InvalidInput(format!(
+                    "DEFAULT auto rowid requires INT64 column on {}",
+                    column.name
+                )));
+            }
+            Ok(Value::Int64(next_auto_rowid()))
         }
         None => {
             if column.nullable {
@@ -2917,14 +2986,30 @@ mod tests {
     }
 
     #[test]
-    fn create_table_requires_explicit_primary_key() {
+    fn create_table_without_explicit_primary_key_auto_injects_rowid() {
+        // Phase A 2026-05-22: PG accepts CREATE TABLE without PRIMARY KEY
+        // (heap tables with internal ctid). The parser injects a synthetic
+        // `__opendb_rowid BIGINT NOT NULL PRIMARY KEY DEFAULT auto` column
+        // so the projection layer's "exactly one primary key" invariant
+        // still holds, and INSERTs that omit the column get a monotonic
+        // counter value from `next_auto_rowid()`.
         let mut engine = SqlEngine::default();
+        engine
+            .execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"))
+            .expect("create");
+        let table = engine.projection.table("accounts").expect("table created");
+        assert_eq!(
+            table.columns.last().expect("last col").name,
+            "__opendb_rowid"
+        );
+        assert!(table.columns.last().expect("last col").primary_key);
 
-        let result =
-            engine.execute(parse("CREATE TABLE accounts (id INT, name TEXT)").expect("parse"));
-
-        assert!(matches!(result, Err(OpenDbError::InvalidInput(_))));
-        assert_eq!(engine.commits().len(), 0);
+        // INSERT without specifying the synthetic column succeeds; the
+        // default populates __opendb_rowid.
+        engine
+            .execute(parse("INSERT INTO accounts (id, name) VALUES (1, 'Ada')").expect("parse"))
+            .expect("insert");
+        assert_eq!(engine.commits().len(), 2);
     }
 
     #[test]

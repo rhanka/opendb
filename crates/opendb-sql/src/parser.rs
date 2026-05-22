@@ -77,8 +77,170 @@ pub fn parse(sql: &str) -> OpenDbResult<Statement> {
         parse_update(normalized)
     } else if upper.starts_with("DO ") || upper.starts_with("DO$") {
         parse_do_block(normalized)
+    } else if upper.starts_with("DROP TABLE ") || upper == "DROP TABLE" {
+        parse_drop_table(normalized)
+    } else if upper.starts_with("TRUNCATE ") || upper == "TRUNCATE" {
+        parse_truncate_table(normalized)
+    } else if upper == "VACUUM" || upper.starts_with("VACUUM ") || upper.starts_with("ANALYZE") {
+        // Phase A 2026-05-22: pgbench -i calls `vacuum analyze pgbench_*`
+        // and PG clients commonly issue ANALYZE. opendb does not maintain
+        // planner stats yet — accept as a no-op so the bench bootstrap
+        // doesn't crash. Wrap in an empty DoBlock so the rest of the
+        // pipeline gets a valid Statement.
+        Ok(Statement::DoBlock {
+            inner: Vec::new(),
+            swallow_duplicate: true,
+        })
     } else {
         Err(OpenDbError::Sql(format!("unsupported SQL: {normalized}")))
+    }
+}
+
+/// Phase A 2026-05-22: `DROP TABLE [IF EXISTS] name[, name, ...]`.
+///
+/// Multi-table comma list expands to a DoBlock of N DropTable statements,
+/// same shape parser.rs uses for multi-row INSERT VALUES. The `IF EXISTS`
+/// modifier is preserved on each inner statement so the executor can elide
+/// missing tables individually.
+fn parse_drop_table(input: &str) -> OpenDbResult<Statement> {
+    let upper = input.to_ascii_uppercase();
+    let prefix_len = if let Some(idx) = upper.find("DROP TABLE") {
+        idx + "DROP TABLE".len()
+    } else {
+        return Err(OpenDbError::Sql(format!(
+            "DROP TABLE expected at start of statement: {input}"
+        )));
+    };
+    let rest = input[prefix_len..].trim_start();
+    let upper_rest = rest.to_ascii_uppercase();
+    let (if_exists, body) = if let Some(stripped) = upper_rest.strip_prefix("IF EXISTS ") {
+        let consumed = upper_rest.len() - stripped.len();
+        (true, rest[consumed..].trim_start())
+    } else if upper_rest == "IF EXISTS" {
+        return Err(OpenDbError::Sql(format!(
+            "DROP TABLE IF EXISTS missing table name: {input}"
+        )));
+    } else {
+        (false, rest)
+    };
+    let body = body
+        .trim_end_matches(';')
+        .trim_end_matches(|c: char| c.is_whitespace());
+    // Trim trailing CASCADE / RESTRICT — PG-specific, no FK enforcement
+    // story for opendb yet, so we accept both modifiers as a no-op.
+    let body = strip_trailing_drop_modifier(body, "CASCADE");
+    let body = strip_trailing_drop_modifier(body, "RESTRICT");
+    if body.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "DROP TABLE missing table name(s): {input}"
+        )));
+    }
+    let names: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "DROP TABLE missing table name(s): {input}"
+        )));
+    }
+    let inner: Vec<Statement> = names
+        .into_iter()
+        .map(|name| Statement::DropTable {
+            table: unquote_drop_identifier(name).to_owned(),
+            if_exists,
+        })
+        .collect();
+    if inner.len() == 1 {
+        Ok(inner.into_iter().next().unwrap())
+    } else {
+        Ok(Statement::DoBlock {
+            inner,
+            swallow_duplicate: false,
+        })
+    }
+}
+
+/// Phase A 2026-05-22: `TRUNCATE [TABLE] [ONLY] name[, name, ...]
+/// [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
+/// Multi-table comma list expands to a DoBlock of N TruncateTable
+/// statements. The `RESTART IDENTITY`/`CONTINUE IDENTITY` and
+/// `CASCADE`/`RESTRICT` modifiers are accepted as no-ops; opendb has no
+/// sequences and no FK action semantics yet.
+fn parse_truncate_table(input: &str) -> OpenDbResult<Statement> {
+    let upper = input.to_ascii_uppercase();
+    let prefix_len = "TRUNCATE".len();
+    let after_truncate = input[prefix_len..].trim_start();
+    let upper_after = upper[prefix_len..].trim_start().to_ascii_uppercase();
+    let body = if let Some(stripped) = upper_after.strip_prefix("TABLE ") {
+        let consumed = upper_after.len() - stripped.len();
+        after_truncate[consumed..].trim_start()
+    } else {
+        after_truncate
+    };
+    // Optional ONLY keyword (PG flag for inheritance — ignored).
+    let body_upper = body.to_ascii_uppercase();
+    let body = if let Some(stripped) = body_upper.strip_prefix("ONLY ") {
+        let consumed = body_upper.len() - stripped.len();
+        body[consumed..].trim_start()
+    } else {
+        body
+    };
+    let body = body
+        .trim_end_matches(';')
+        .trim_end_matches(|c: char| c.is_whitespace());
+    let body = strip_trailing_drop_modifier(body, "CASCADE");
+    let body = strip_trailing_drop_modifier(body, "RESTRICT");
+    let body = strip_trailing_drop_modifier(body, "CONTINUE IDENTITY");
+    let body = strip_trailing_drop_modifier(body, "RESTART IDENTITY");
+    if body.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "TRUNCATE missing table name(s): {input}"
+        )));
+    }
+    let names: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(OpenDbError::Sql(format!(
+            "TRUNCATE missing table name(s): {input}"
+        )));
+    }
+    let inner: Vec<Statement> = names
+        .into_iter()
+        .map(|name| Statement::TruncateTable {
+            table: unquote_drop_identifier(name).to_owned(),
+        })
+        .collect();
+    if inner.len() == 1 {
+        Ok(inner.into_iter().next().unwrap())
+    } else {
+        Ok(Statement::DoBlock {
+            inner,
+            swallow_duplicate: false,
+        })
+    }
+}
+
+fn strip_trailing_drop_modifier<'a>(input: &'a str, keyword: &str) -> &'a str {
+    let upper = input.to_ascii_uppercase();
+    if upper.ends_with(keyword) {
+        let cut = input.len() - keyword.len();
+        input[..cut].trim_end()
+    } else {
+        input
+    }
+}
+
+fn unquote_drop_identifier(name: &str) -> &str {
+    let trimmed = name.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
     }
 }
 
@@ -809,16 +971,19 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
     let open = rest
         .find('(')
         .ok_or_else(|| OpenDbError::Sql("missing column list".to_owned()))?;
-    let close = rest
-        .rfind(')')
-        .ok_or_else(|| OpenDbError::Sql("missing closing paren".to_owned()))?;
+    // Phase A 2026-05-22: scan balanced parens to find the matching close
+    // for the column list. `rfind(')')` mis-binds for statements with
+    // post-table modifiers like `WITH (fillfactor=100)` (pgbench-style) or
+    // `INHERITS (parent)`.
+    let close = find_matching_close_paren(rest, open)?;
     if open >= close {
         return Err(OpenDbError::Sql("malformed column list".to_owned()));
     }
-    if !rest[close + 1..].trim().is_empty() {
-        return Err(OpenDbError::Sql(
-            "trailing input after CREATE TABLE".to_owned(),
-        ));
+    let trailing = rest[close + 1..].trim();
+    if !trailing.is_empty() && !is_create_table_trailing_modifier(trailing) {
+        return Err(OpenDbError::Sql(format!(
+            "trailing input after CREATE TABLE: {trailing}"
+        )));
     }
     let table = unquote_identifier(rest[..open].trim());
     // Sprint 18.A.1.3: column list may contain table-level CONSTRAINT clauses
@@ -836,6 +1001,21 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
             "CREATE TABLE requires table and columns".to_owned(),
         ));
     }
+    // Phase A 2026-05-22: PG accepts CREATE TABLE without an explicit
+    // PRIMARY KEY (heap tables with internal ctid). opendb requires
+    // exactly one PK column, so when the parser sees no PK declared we
+    // inject a synthetic `__opendb_rowid BIGINT NOT NULL PRIMARY KEY
+    // DEFAULT <auto>` at the end of the column list. The executor
+    // materializes the default from a monotonic atomic counter on
+    // INSERT. SELECT * stays unaffected because the column name is
+    // unambiguously internal; clients that don't reference it never see
+    // it.
+    let has_explicit_pk = columns.iter().any(|c| c.primary_key);
+    if !has_explicit_pk {
+        let synthetic = ColumnDefinition::primary_key("__opendb_rowid", ColumnType::Int64)
+            .with_default(DefaultExpr::AutoRowId);
+        columns.push(synthetic);
+    }
     let inner = Statement::CreateTable { table, columns };
     if swallow_duplicate {
         Ok(Statement::DoBlock {
@@ -845,6 +1025,54 @@ fn parse_create_table(sql: &str) -> OpenDbResult<Statement> {
     } else {
         Ok(inner)
     }
+}
+
+/// Phase A 2026-05-22: walk balanced parens starting at the byte index of
+/// an opening `(` and return the byte index of its matching `)`. Used so
+/// `CREATE TABLE t (col1 int(4), col2 text) WITH (fillfactor=100)` matches
+/// the column list close, not the trailing `WITH (...)` close.
+fn find_matching_close_paren(input: &str, open_index: usize) -> OpenDbResult<usize> {
+    let bytes = input.as_bytes();
+    if bytes.get(open_index) != Some(&b'(') {
+        return Err(OpenDbError::Sql("expected '(' at position".to_owned()));
+    }
+    let mut depth: usize = 0;
+    let mut i = open_index;
+    let mut in_single_quote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            in_single_quote = !in_single_quote;
+        } else if !in_single_quote {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    Err(OpenDbError::Sql(
+        "missing closing paren for column list".to_owned(),
+    ))
+}
+
+/// Phase A 2026-05-22: accept post-column-list modifiers that opendb does
+/// not yet enforce but are common in PG-flavored DDL — `WITH (...)`,
+/// `WITHOUT OIDS`, `INHERITS (...)`, `TABLESPACE ...`. Treated as no-ops
+/// so pgbench / pg_dump-style CREATE TABLE statements land.
+fn is_create_table_trailing_modifier(trailing: &str) -> bool {
+    let upper = trailing.to_ascii_uppercase();
+    upper.starts_with("WITH ")
+        || upper.starts_with("WITH(")
+        || upper == "WITHOUT OIDS"
+        || upper.starts_with("WITHOUT OIDS")
+        || upper.starts_with("INHERITS ")
+        || upper.starts_with("INHERITS(")
+        || upper.starts_with("TABLESPACE ")
 }
 
 /// Sprint 18.A.1.2: peel an optional `IF NOT EXISTS` (case-insensitive) off
@@ -1063,12 +1291,26 @@ fn parse_column_type_tokens(tokens: &[String]) -> OpenDbResult<(ColumnType, usiz
     if tokens.is_empty() {
         return Err(OpenDbError::Sql("column type is required".to_owned()));
     }
-    let first = tokens[0].to_ascii_uppercase();
-    match first.as_str() {
-        "INT" | "INTEGER" | "INT64" | "BIGINT" => Ok((ColumnType::Int64, 1)),
-        "TEXT" => Ok((ColumnType::Text, 1)),
+    // Phase A 2026-05-22: strip a trailing `(N)` or `(N, M)` from the head
+    // token so `char(22)`, `varchar(255)`, `numeric(10,2)`, `decimal(8,2)`
+    // resolve to their base type. The length / precision parameters are
+    // dropped — opendb stores TEXT untruncated and NUMERIC as Float64.
+    // Keeping the dropped-parameters behavior matches what pgbench / Drizzle
+    // expect at the protocol level (the column reads back as text / number)
+    // even though we don't enforce the constraint.
+    let head_token = tokens[0].as_str();
+    let head_root_end = head_token.find('(').unwrap_or(head_token.len());
+    let head_root = head_token[..head_root_end].to_ascii_uppercase();
+    match head_root.as_str() {
+        "INT" | "INTEGER" | "INT64" | "BIGINT" | "INT2" | "INT4" | "INT8" | "SMALLINT"
+        | "SERIAL" | "BIGSERIAL" => Ok((ColumnType::Int64, 1)),
+        "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "BPCHAR" | "STRING" => {
+            Ok((ColumnType::Text, 1))
+        }
         "BOOL" | "BOOLEAN" => Ok((ColumnType::Bool, 1)),
-        "FLOAT8" | "FLOAT64" => Ok((ColumnType::Float64, 1)),
+        "FLOAT8" | "FLOAT64" | "FLOAT4" | "REAL" | "NUMERIC" | "DECIMAL" => {
+            Ok((ColumnType::Float64, 1))
+        }
         "DOUBLE" => {
             if tokens.len() >= 2 && tokens[1].eq_ignore_ascii_case("PRECISION") {
                 Ok((ColumnType::Float64, 2))
@@ -1079,7 +1321,10 @@ fn parse_column_type_tokens(tokens: &[String]) -> OpenDbResult<(ColumnType, usiz
                 )))
             }
         }
-        "TIMESTAMP" => Ok((ColumnType::Timestamp, 1)),
+        "CHARACTER" if tokens.len() >= 2 && tokens[1].eq_ignore_ascii_case("VARYING") => {
+            Ok((ColumnType::Text, 2))
+        }
+        "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" | "TIME" => Ok((ColumnType::Timestamp, 1)),
         "JSON" | "JSONB" => Ok((ColumnType::Json, 1)),
         _ => Err(OpenDbError::Sql(format!(
             "unsupported column type: {}",
@@ -1089,11 +1334,31 @@ fn parse_column_type_tokens(tokens: &[String]) -> OpenDbResult<(ColumnType, usiz
 }
 
 fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
-    let values_marker = " VALUES ";
+    // Phase A 2026-05-22: accept ` VALUES ` (canonical), ` VALUES(` (no
+    // space before paren, pgbench style), and ` VALUES\n` (newline-after,
+    // pg_dump style). We find ` VALUES` and verify the next char is
+    // whitespace or `(`. After the keyword, advance past any whitespace
+    // before parsing the tuple list.
     let upper = sql.to_ascii_uppercase();
-    let values_pos = upper
-        .find(values_marker)
+    let bytes = upper.as_bytes();
+    let mut values_pos: Option<usize> = None;
+    let mut search_from = 0usize;
+    while let Some(rel) = upper[search_from..].find(" VALUES") {
+        let pos = search_from + rel;
+        let after = pos + " VALUES".len();
+        let next = bytes.get(after).copied();
+        if next.is_none()
+            || next == Some(b'(')
+            || matches!(next, Some(c) if c.is_ascii_whitespace())
+        {
+            values_pos = Some(pos);
+            break;
+        }
+        search_from = pos + 1;
+    }
+    let values_pos = values_pos
         .ok_or_else(|| OpenDbError::Sql("INSERT requires VALUES".to_owned()))?;
+    let values_marker_len = " VALUES".len();
     let header = strip_keyword_prefix(&sql[..values_pos], "INSERT INTO ")
         .ok_or_else(|| OpenDbError::Sql("invalid INSERT".to_owned()))?
         .trim();
@@ -1138,7 +1403,8 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
     if table.is_empty() {
         return Err(OpenDbError::Sql("INSERT requires table".to_owned()));
     }
-    let values_part = sql[values_pos + values_marker.len()..].trim();
+    let values_part = sql[values_pos + values_marker_len..].trim_start();
+    let values_part = values_part.trim();
     // Sprint 16.A: peel an optional `RETURNING ...` suffix off the end first
     // so the rest of the parser keeps its strict "trailing input is an error"
     // contract.
@@ -2464,7 +2730,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_drop_table_single() {
+        assert_eq!(
+            parse("DROP TABLE foo").expect("drop"),
+            Statement::DropTable {
+                table: "foo".to_owned(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            parse("DROP TABLE IF EXISTS foo;").expect("drop if exists"),
+            Statement::DropTable {
+                table: "foo".to_owned(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_drop_table_multi_explodes_to_do_block() {
+        let parsed = parse("DROP TABLE IF EXISTS a, b, c").expect("drop multi");
+        match parsed {
+            Statement::DoBlock {
+                inner,
+                swallow_duplicate,
+            } => {
+                assert!(!swallow_duplicate);
+                assert_eq!(inner.len(), 3);
+                assert_eq!(
+                    inner[0],
+                    Statement::DropTable {
+                        table: "a".to_owned(),
+                        if_exists: true,
+                    }
+                );
+                assert_eq!(
+                    inner[2],
+                    Statement::DropTable {
+                        table: "c".to_owned(),
+                        if_exists: true,
+                    }
+                );
+            }
+            other => panic!("expected DoBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_table_trailing_cascade_restrict_as_noop() {
+        for sql in [
+            "DROP TABLE IF EXISTS pgbench_accounts CASCADE",
+            "DROP TABLE pgbench_accounts RESTRICT;",
+        ] {
+            let parsed = parse(sql).unwrap_or_else(|e| panic!("parse {sql}: {e}"));
+            match parsed {
+                Statement::DropTable { table, .. } => {
+                    assert_eq!(table, "pgbench_accounts");
+                }
+                other => panic!("expected DropTable for {sql}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_vacuum_and_analyze_as_no_op_do_block() {
+        for sql in ["VACUUM", "VACUUM ANALYZE pgbench_accounts", "ANALYZE"] {
+            let parsed = parse(sql).unwrap_or_else(|e| panic!("parse {sql}: {e}"));
+            assert!(
+                matches!(
+                    &parsed,
+                    Statement::DoBlock { inner, .. } if inner.is_empty()
+                ),
+                "{sql} should parse to empty DoBlock, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_create_insert_and_select_subset() {
+        // Phase A 2026-05-22: CREATE TABLE without explicit PK auto-injects
+        // `__opendb_rowid BIGINT PRIMARY KEY DEFAULT auto` at the end.
         assert_eq!(
             parse("CREATE TABLE accounts (id INT, name TEXT);").expect("create"),
             Statement::CreateTable {
@@ -2472,6 +2817,8 @@ mod tests {
                 columns: vec![
                     ColumnDefinition::new("id", ColumnType::Int64),
                     ColumnDefinition::new("name", ColumnType::Text),
+                    ColumnDefinition::primary_key("__opendb_rowid", ColumnType::Int64)
+                        .with_default(DefaultExpr::AutoRowId),
                 ],
             }
         );
@@ -2499,6 +2846,8 @@ mod tests {
                 columns: vec![
                     ColumnDefinition::new("id", ColumnType::Int64),
                     ColumnDefinition::new("name", ColumnType::Text),
+                    ColumnDefinition::primary_key("__opendb_rowid", ColumnType::Int64)
+                        .with_default(DefaultExpr::AutoRowId),
                 ],
             }
         );

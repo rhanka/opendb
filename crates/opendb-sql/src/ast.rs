@@ -164,6 +164,19 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// `DROP TABLE [IF EXISTS] <table>` (single table). Multi-table
+    /// `DROP TABLE [IF EXISTS] t1, t2, ..` is exploded by the parser into
+    /// a DoBlock of N DropTable statements (same shape as multi-row INSERT
+    /// VALUES) so the executor only has to handle the single-table case.
+    DropTable {
+        table: String,
+        if_exists: bool,
+    },
+    /// Phase A 2026-05-22: `TRUNCATE [TABLE] <table>` (single table).
+    /// Multi-table list is exploded into a DoBlock by the parser.
+    TruncateTable {
+        table: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
