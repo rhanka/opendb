@@ -1,5 +1,13 @@
 use crate::raft::{RootRangeRaftHarness, RootRangeResponse};
+use opendb_common::perf_timing::PerfCounter;
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
+
+static RR_APPLY_COMMITTED: PerfCounter = PerfCounter::new("root_range.apply_committed");
+static RR_SEMANTIC_APPEND_LOCK_ACQUIRE: PerfCounter =
+    PerfCounter::new("root_range.semantic_append_lock.acquire");
+static RR_VALIDATE_SEMANTIC: PerfCounter = PerfCounter::new("root_range.validate_semantic_append");
+static RR_COMMIT_SEMANTIC_SNAPSHOT: PerfCounter =
+    PerfCounter::new("root_range.commit_semantic_append_snapshot");
 use opendb_storage::{
     archive_manifest::ArchiveManifest,
     commit_stream::{CommitRecord, Mutation},
@@ -249,12 +257,24 @@ impl RootRange {
     /// Milestone 1 only wires this apply-side path. Callers must not use it as
     /// a proposal path; use `submit` for the reserved OpenRaft-facing API.
     pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
+        let _outer_span = opendb_common::perf_timing::Span::start(&RR_APPLY_COMMITTED);
         self.validate_apply_record(record)?;
-        let _guard = self.semantic_append_lock.lock().await;
-        let semantic_snapshot = self.validate_semantic_append(record).await?;
+        let _guard = {
+            let _lock_span =
+                opendb_common::perf_timing::Span::start(&RR_SEMANTIC_APPEND_LOCK_ACQUIRE);
+            self.semantic_append_lock.lock().await
+        };
+        let semantic_snapshot = {
+            let _validate_span = opendb_common::perf_timing::Span::start(&RR_VALIDATE_SEMANTIC);
+            self.validate_semantic_append(record).await?
+        };
         let wal_len = self.wal.append_with_len(record).await?;
-        self.commit_semantic_append_snapshot(semantic_snapshot, wal_len)
-            .await;
+        {
+            let _commit_span =
+                opendb_common::perf_timing::Span::start(&RR_COMMIT_SEMANTIC_SNAPSHOT);
+            self.commit_semantic_append_snapshot(semantic_snapshot, wal_len)
+                .await;
+        }
         Ok(())
     }
 

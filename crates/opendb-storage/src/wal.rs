@@ -1,12 +1,22 @@
 use crate::commit_stream::CommitRecord;
+use opendb_common::perf_timing::{PerfCounter, Span, dump_perf_counters_to_stderr, perf_enabled};
 use opendb_common::{OpenDbError, OpenDbResult};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+
+static WAL_APPEND_OUTER: PerfCounter = PerfCounter::new("wal.append_with_len");
+static WAL_OPEN: PerfCounter = PerfCounter::new("wal.open+seek+set_len");
+static WAL_WRITE: PerfCounter = PerfCounter::new("wal.write_all");
+static WAL_SYNC: PerfCounter = PerfCounter::new("wal.sync_data");
+static WAL_PREFIX_SCAN: PerfCounter = PerfCounter::new("wal.durable_prefix_len_cold");
+static WAL_ENCODE: PerfCounter = PerfCounter::new("wal.encode_frame_serde_json");
+static WAL_APPEND_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const WAL_MAGIC: &[u8; 4] = b"ODW1";
 const WAL_FRAME_VERSION: u16 = 1;
@@ -37,6 +47,7 @@ impl Wal {
     }
 
     pub async fn append_with_len(&self, record: &CommitRecord) -> OpenDbResult<u64> {
+        let _outer_span = Span::start(&WAL_APPEND_OUTER);
         let _guard = self.append_lock.lock().await;
         let parent = containing_dir(&self.path);
 
@@ -53,11 +64,13 @@ impl Wal {
         let append_offset = match *cached {
             Some(len) => len,
             None => {
+                let _scan_span = Span::start(&WAL_PREFIX_SCAN);
                 let len = durable_prefix_len(&self.path).await?;
                 *cached = Some(len);
                 len
             }
         };
+        let open_span = Span::start(&WAL_OPEN);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -65,7 +78,10 @@ impl Wal {
             .open(&self.path)
             .await
             .map_err(|error| storage_error(&self.path, "open wal for append", error))?;
-        let frame = encode_frame(record)?;
+        let frame = {
+            let _encode_span = Span::start(&WAL_ENCODE);
+            encode_frame(record)?
+        };
 
         file.set_len(append_offset)
             .await
@@ -73,12 +89,19 @@ impl Wal {
         file.seek(std::io::SeekFrom::Start(append_offset))
             .await
             .map_err(|error| storage_error(&self.path, "seek wal for append", error))?;
-        file.write_all(&frame)
-            .await
-            .map_err(|error| storage_error(&self.path, "write wal frame", error))?;
-        file.sync_data()
-            .await
-            .map_err(|error| storage_error(&self.path, "sync wal file data", error))?;
+        drop(open_span);
+        {
+            let _write_span = Span::start(&WAL_WRITE);
+            file.write_all(&frame)
+                .await
+                .map_err(|error| storage_error(&self.path, "write wal frame", error))?;
+        }
+        {
+            let _sync_span = Span::start(&WAL_SYNC);
+            file.sync_data()
+                .await
+                .map_err(|error| storage_error(&self.path, "sync wal file data", error))?;
+        }
 
         if !existed_before {
             sync_directory(&self.path, parent).await?;
@@ -86,6 +109,14 @@ impl Wal {
 
         let new_len = append_offset + frame.len() as u64;
         *cached = Some(new_len);
+
+        if perf_enabled() {
+            let count = WAL_APPEND_DUMP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_multiple_of(100) {
+                dump_perf_counters_to_stderr();
+            }
+        }
+
         Ok(new_len)
     }
 
