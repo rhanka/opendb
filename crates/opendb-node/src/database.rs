@@ -202,6 +202,50 @@ impl Database {
             swallow_duplicate,
         } = statement
         {
+            // Sprint 21 (group-commit fast path): when the DoBlock is a
+            // multi-row INSERT VALUES exploded by parser.rs into N
+            // Statement::Insert (shape produced at parser.rs:1163-1178) and
+            // we're in autocommit, batch all rows into a single WAL fsync.
+            // This matches PG's multi-row INSERT atomicity (all rows or
+            // none) and removes the per-row fsync/lock/validate cost that
+            // the 2026-05-21 timing breakdown showed dominating the seed.
+            let try_batch_fast_path = !swallow_duplicate
+                && self.transaction.is_none()
+                && inner.len() >= 2
+                && inner.iter().all(|s| matches!(s, Statement::Insert { .. }));
+            if try_batch_fast_path {
+                self.ensure_leader_for_client_query().await?;
+                let mut records: Vec<CommitRecord> = Vec::with_capacity(inner.len());
+                for inner_statement in inner {
+                    match self.engine.prepare(inner_statement)? {
+                        PreparedQuery::Write {
+                            mut record, route, ..
+                        } => {
+                            record.range_id = self.resolve_route(&route)?;
+                            // Apply to engine first so the next prepare in
+                            // the batch sees prior rows (intra-batch FK
+                            // semantics match the per-row path). If
+                            // submit_batch fails afterwards, the next
+                            // execute()'s refresh_engine_from_wal restores
+                            // engine state from the durable truth.
+                            self.engine.apply_committed(record.clone())?;
+                            records.push(record);
+                        }
+                        PreparedQuery::Read { .. } => {
+                            unreachable!("Statement::Insert always plans to PreparedQuery::Write")
+                        }
+                    }
+                }
+                let commands: Vec<RootRangeCommand> = records
+                    .into_iter()
+                    .map(|record| RootRangeCommand { record })
+                    .collect();
+                self.root_range.submit_batch(commands).await?;
+                self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
+                return Ok(QueryResult::Command {
+                    tag: "DO".to_owned(),
+                });
+            }
             for inner_statement in inner {
                 match Box::pin(self.execute_with_refresh(inner_statement, false)).await {
                     Ok(_) => {}

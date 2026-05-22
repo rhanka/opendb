@@ -286,6 +286,40 @@ impl RootRange {
         self.apply_committed(record).await
     }
 
+    /// Atomically apply N committed records with a single WAL fsync and a
+    /// single semantic snapshot commit. Used by `submit_batch` on the local
+    /// (standalone / leader) path so multi-row INSERTs durably commit as a
+    /// group rather than one fsync per row.
+    pub async fn apply_committed_batch(&self, records: &[CommitRecord]) -> OpenDbResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let _outer_span = opendb_common::perf_timing::Span::start(&RR_APPLY_COMMITTED);
+        for record in records {
+            self.validate_apply_record(record)?;
+        }
+        let _guard = {
+            let _lock_span =
+                opendb_common::perf_timing::Span::start(&RR_SEMANTIC_APPEND_LOCK_ACQUIRE);
+            self.semantic_append_lock.lock().await
+        };
+        let mut snapshot = self.semantic_snapshot_for_append().await?;
+        {
+            let _validate_span = opendb_common::perf_timing::Span::start(&RR_VALIDATE_SEMANTIC);
+            for record in records {
+                self.apply_record_to_semantic_snapshot(&mut snapshot, record)?;
+            }
+        }
+        let wal_len = self.wal.append_many_with_len(records).await?;
+        {
+            let _commit_span =
+                opendb_common::perf_timing::Span::start(&RR_COMMIT_SEMANTIC_SNAPSHOT);
+            self.commit_semantic_append_snapshot(snapshot, wal_len)
+                .await;
+        }
+        Ok(())
+    }
+
     /// Submits a root-range command through the consensus boundary.
     ///
     /// Raft-backed ranges propose through OpenRaft `client_write`. Local
@@ -309,6 +343,39 @@ impl RootRange {
             RootRangeProposalPath::Local(authority) => match authority {
                 RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => {
                     self.apply_committed(&command.record).await
+                }
+                RootRangeAuthority::Follower {
+                    leader_id,
+                    leader_addr,
+                } => Err(OpenDbError::NotLeader {
+                    leader_id: *leader_id,
+                    leader_addr: leader_addr.clone(),
+                }),
+            },
+        }
+    }
+
+    /// Submit N commands as a group. On the local (standalone / leader) path
+    /// this dispatches to `apply_committed_batch`, durably committing all
+    /// records with one fsync. The OpenRaft path falls back to per-record
+    /// `submit` because the current raft client API takes one command at a
+    /// time; callers that care about raft can iterate themselves.
+    pub async fn submit_batch(&self, commands: Vec<RootRangeCommand>) -> OpenDbResult<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        match &self.proposal_path {
+            RootRangeProposalPath::OpenRaft(_) => {
+                for command in commands {
+                    self.submit(command).await?;
+                }
+                Ok(())
+            }
+            RootRangeProposalPath::Local(authority) => match authority {
+                RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => {
+                    let records: Vec<CommitRecord> =
+                        commands.into_iter().map(|c| c.record).collect();
+                    self.apply_committed_batch(&records).await
                 }
                 RootRangeAuthority::Follower {
                     leader_id,
@@ -422,8 +489,21 @@ impl RootRange {
         &self,
         record: &CommitRecord,
     ) -> OpenDbResult<SemanticAppendSnapshot> {
-        validate_metadata_record_range(record).map_err(sequence_validation_error_for_append)?;
         let mut snapshot = self.semantic_snapshot_for_append().await?;
+        self.apply_record_to_semantic_snapshot(&mut snapshot, record)?;
+        Ok(snapshot)
+    }
+
+    /// Validate and apply one record against an already-fetched semantic
+    /// snapshot, mutating it in place. Factored out of `validate_semantic_append`
+    /// so the batch path (`apply_committed_batch`) can thread one snapshot
+    /// through N records without re-fetching the cache per record.
+    fn apply_record_to_semantic_snapshot(
+        &self,
+        snapshot: &mut SemanticAppendSnapshot,
+        record: &CommitRecord,
+    ) -> OpenDbResult<()> {
+        validate_metadata_record_range(record).map_err(sequence_validation_error_for_append)?;
         if snapshot.records.is_empty() && !record.is_root_bootstrap() {
             return Err(OpenDbError::InvalidInput(
                 "root descriptor bootstrap must be committed before user records".to_string(),
@@ -437,7 +517,7 @@ impl RootRange {
         validate_record_route_with_catalog(&snapshot.range_catalog, record)
             .map_err(sequence_validation_error_for_append)?;
         snapshot.records.push(record.clone());
-        Ok(snapshot)
+        Ok(())
     }
 
     fn validate_replayed_record(&self, index: usize, record: &CommitRecord) -> OpenDbResult<()> {

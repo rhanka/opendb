@@ -47,6 +47,20 @@ impl Wal {
     }
 
     pub async fn append_with_len(&self, record: &CommitRecord) -> OpenDbResult<u64> {
+        self.append_many_with_len(std::slice::from_ref(record))
+            .await
+    }
+
+    /// Atomically append all `records` to the WAL with a single fsync.
+    ///
+    /// Group-commit primitive: callers that have N records to durably append
+    /// (typically a multi-row INSERT statement exploded into N CommitRecords)
+    /// should use this rather than calling `append_with_len` N times. On
+    /// success returns the WAL byte length after the batch. On error any
+    /// partially-written tail is left in place but does not corrupt the
+    /// prefix: the next caller's `set_len(durable_len)` truncates it before
+    /// writing.
+    pub async fn append_many_with_len(&self, records: &[CommitRecord]) -> OpenDbResult<u64> {
         let _outer_span = Span::start(&WAL_APPEND_OUTER);
         let _guard = self.append_lock.lock().await;
         let parent = containing_dir(&self.path);
@@ -70,6 +84,11 @@ impl Wal {
                 len
             }
         };
+
+        if records.is_empty() {
+            return Ok(append_offset);
+        }
+
         let open_span = Span::start(&WAL_OPEN);
         let mut file = OpenOptions::new()
             .create(true)
@@ -78,10 +97,15 @@ impl Wal {
             .open(&self.path)
             .await
             .map_err(|error| storage_error(&self.path, "open wal for append", error))?;
-        let frame = {
+
+        let mut buffer = Vec::new();
+        {
             let _encode_span = Span::start(&WAL_ENCODE);
-            encode_frame(record)?
-        };
+            for record in records {
+                let frame = encode_frame(record)?;
+                buffer.extend_from_slice(&frame);
+            }
+        }
 
         file.set_len(append_offset)
             .await
@@ -92,7 +116,7 @@ impl Wal {
         drop(open_span);
         {
             let _write_span = Span::start(&WAL_WRITE);
-            file.write_all(&frame)
+            file.write_all(&buffer)
                 .await
                 .map_err(|error| storage_error(&self.path, "write wal frame", error))?;
         }
@@ -107,12 +131,13 @@ impl Wal {
             sync_directory(&self.path, parent).await?;
         }
 
-        let new_len = append_offset + frame.len() as u64;
+        let new_len = append_offset + buffer.len() as u64;
         *cached = Some(new_len);
 
         if perf_enabled() {
-            let count = WAL_APPEND_DUMP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count.is_multiple_of(100) {
+            let before = WAL_APPEND_DUMP_COUNT.fetch_add(records.len() as u64, Ordering::Relaxed);
+            let after = before + records.len() as u64;
+            if before / 100 < after / 100 {
                 dump_perf_counters_to_stderr();
             }
         }
@@ -928,6 +953,89 @@ mod tests {
         assert_eq!(
             wal_b.read_all().await.expect("read after fresh wal append"),
             vec![first, second]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_many_appends_records_in_order_with_single_call() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let records: Vec<CommitRecord> = (0..8)
+            .map(|i| insert_record(i + 1, 100 + i as u64, &format!("{i}"), &format!("name{i}")))
+            .collect();
+
+        let expected_len: u64 = records
+            .iter()
+            .map(|r| encode_frame(r).expect("encode").len() as u64)
+            .sum();
+
+        let returned = wal
+            .append_many_with_len(&records)
+            .await
+            .expect("batch append");
+        assert_eq!(returned, expected_len);
+        {
+            let cached = wal.durable_len.lock().await;
+            assert_eq!(*cached, Some(expected_len));
+        }
+        assert_eq!(
+            wal.read_all().await.expect("read after batch append"),
+            records
+        );
+    }
+
+    #[tokio::test]
+    async fn append_many_empty_slice_returns_current_durable_len() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let pre = insert_record(1, 10, "1", "Ada");
+        let pre_len = wal.append_with_len(&pre).await.expect("append pre");
+
+        let returned = wal
+            .append_many_with_len(&[])
+            .await
+            .expect("empty batch is a no-op");
+        assert_eq!(returned, pre_len);
+        assert_eq!(
+            wal.read_all().await.expect("read after empty batch"),
+            vec![pre]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_many_chains_with_prior_single_appends() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let wal_path = temp_dir.path().join("root-range.wal");
+        let wal = Wal::new(&wal_path);
+        let first = insert_record(1, 10, "1", "Ada");
+        let batch: Vec<CommitRecord> = (0..5)
+            .map(|i| {
+                insert_record(
+                    10 + i + 1,
+                    200 + i as u64,
+                    &format!("{}", 10 + i + 1),
+                    &format!("batch{i}"),
+                )
+            })
+            .collect();
+        let trailing = insert_record(99, 999, "99", "Trailing");
+
+        wal.append(&first).await.expect("append first");
+        wal.append_many_with_len(&batch)
+            .await
+            .expect("append batch");
+        wal.append(&trailing).await.expect("append trailing");
+
+        let mut expected = vec![first];
+        expected.extend(batch);
+        expected.push(trailing);
+        assert_eq!(
+            wal.read_all()
+                .await
+                .expect("read after mixed single+batch appends"),
+            expected
         );
     }
 
