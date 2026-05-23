@@ -23,7 +23,8 @@
     "poc:sentropic:migrate": "tsx tools/sentropic-poc/migrate-poc.ts",
     "poc:sentropic:seed": "tsx tools/sentropic-poc/seed-poc.ts",
     "poc:sentropic:http": "tsx tools/sentropic-poc/http-poc.ts",
-    "poc:sentropic:bench": "tsx tools/sentropic-poc/bench-poc.ts"
+    "poc:sentropic:bench": "tsx tools/sentropic-poc/bench-poc.ts",
+    "poc:sentropic:bench-concurrent": "tsx tools/sentropic-poc/bench-concurrent.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

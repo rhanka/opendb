@@ -155,6 +155,10 @@ poc-image: poc-musl ## Sprint 19.C.2: docker build static-musl alpine image (ope
 poc-bench: ## Sprint 20: side-by-side latency bench opendb-node vs postgres:16-alpine
 	cd $(WORKTREE) && $(NPM) run poc:sentropic:bench
 
+.PHONY: poc-bench-concurrent
+poc-bench-concurrent: ## Phase B prep: multi-client concurrent INSERT+SELECT bench opendb vs PG
+	cd $(WORKTREE) && $(NPM) run poc:sentropic:bench-concurrent
+
 .PHONY: poc-musl
 poc-musl: ## Sprint 19.C.1: cargo build --release --target x86_64-unknown-linux-musl (no docker)
 	cd $(WORKTREE) && CC=musl-gcc $(CARGO) build --release --target x86_64-unknown-linux-musl -p opendb-node
