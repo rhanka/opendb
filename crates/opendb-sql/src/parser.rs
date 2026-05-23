@@ -1356,8 +1356,8 @@ fn parse_insert(sql: &str) -> OpenDbResult<Statement> {
         }
         search_from = pos + 1;
     }
-    let values_pos = values_pos
-        .ok_or_else(|| OpenDbError::Sql("INSERT requires VALUES".to_owned()))?;
+    let values_pos =
+        values_pos.ok_or_else(|| OpenDbError::Sql("INSERT requires VALUES".to_owned()))?;
     let values_marker_len = " VALUES".len();
     let header = strip_keyword_prefix(&sql[..values_pos], "INSERT INTO ")
         .ok_or_else(|| OpenDbError::Sql("invalid INSERT".to_owned()))?
