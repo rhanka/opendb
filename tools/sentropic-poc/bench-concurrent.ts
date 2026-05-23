@@ -19,7 +19,7 @@
 //   OPENDB_NODE_BIN       override the binary path
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, createWriteStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import net from "node:net";
 import { dirname, join } from "node:path";
 import type { Readable } from "node:stream";
@@ -98,7 +98,7 @@ async function waitForListener(host: string, port: number, timeoutMs: number): P
   throw new Error(`listener ${host}:${port} did not come up`);
 }
 
-async function spawnOpenDbNode(): Promise<{ port: number; cleanup: () => Promise<void> }> {
+async function spawnOpenDbNode(): Promise<{ port: number; cleanup: () => Promise<void>; perfLogPath: string | null }> {
   console.log(`[opendb] using binary ${nodeBin}`);
   const pgwirePort = await reserveFreePort();
   const healthPort = await reserveFreePort();
@@ -107,6 +107,8 @@ async function spawnOpenDbNode(): Promise<{ port: number; cleanup: () => Promise
   const tmpDir = join(repoRoot, ".worktrees", ".tmp-claude");
   mkdirSync(tmpDir, { recursive: true });
   const dataDir = mkdtempSync(join(tmpDir, "bench-concurrent-"));
+  const perfEnabled = process.env.OPENDB_PERF_TIMING != null && process.env.OPENDB_PERF_TIMING !== "";
+  const perfLogPath = perfEnabled ? join(dataDir, "perf-timing.log") : null;
   const child: ChildProcessByStdio<null, Readable, Readable> = spawn(
     nodeBin,
     ["--node-id", "1", "--data-dir", dataDir,
@@ -116,15 +118,49 @@ async function spawnOpenDbNode(): Promise<{ port: number; cleanup: () => Promise
     { cwd: repoRoot, env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "warn" },
       stdio: ["ignore", "pipe", "pipe"] }
   );
-  child.stderr.on("data", () => {});
+  if (perfLogPath) {
+    const stream = createWriteStream(perfLogPath, { flags: "a" });
+    child.stderr.on("data", (chunk: Buffer | string) => { stream.write(chunk); });
+    child.on("exit", () => stream.end());
+  } else {
+    child.stderr.on("data", () => {});
+  }
   child.stdout.on("data", () => {});
   await waitForListener("127.0.0.1", pgwirePort, 20_000);
   console.log(`[opendb] pgwire on 127.0.0.1:${pgwirePort}`);
-  return { port: pgwirePort, cleanup: async () => {
+  return { port: pgwirePort, perfLogPath, cleanup: async () => {
     child.kill("SIGTERM"); await delay(300);
     if (child.exitCode === null) child.kill("SIGKILL");
-    rmSync(dataDir, { recursive: true, force: true });
+    if (!perfLogPath) {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   }};
+}
+
+type PerfRow = { span: string; totalMs: number; calls: number; meanUs: number };
+
+function parsePerfTimingLog(path: string): PerfRow[] {
+  let raw: string;
+  try { raw = readFileSync(path, "utf8"); } catch { return []; }
+  const lines = raw.split(/\n/).filter((l) => l.startsWith("OPENDB_PERF "));
+  if (lines.length === 0) return [];
+  const seen = new Map<string, PerfRow>();
+  for (const l of lines) {
+    const m = l.match(/^OPENDB_PERF span=(\S+) total_ms=([0-9.]+) calls=(\d+) mean_us=([0-9.]+)/);
+    if (!m || m[1] == null || m[2] == null || m[3] == null || m[4] == null) continue;
+    seen.set(m[1], { span: m[1], totalMs: parseFloat(m[2]), calls: parseInt(m[3], 10), meanUs: parseFloat(m[4]) });
+  }
+  return Array.from(seen.values()).sort((a, b) => b.totalMs - a.totalMs);
+}
+
+function formatPerfTimingBlock(rows: PerfRow[]): string {
+  const lines: string[] = [];
+  lines.push("| Span | total_ms | calls | mean_us |");
+  lines.push("|------|----------|-------|---------|");
+  for (const r of rows) {
+    lines.push(`| ${r.span} | ${r.totalMs.toFixed(2)} | ${r.calls} | ${r.meanUs.toFixed(2)} |`);
+  }
+  return lines.join("\n");
 }
 
 async function spawnPostgres(): Promise<{ port: number; cleanup: () => Promise<void> }> {
@@ -340,9 +376,22 @@ async function main(): Promise<void> {
     const { writeFileSync } = await import("node:fs");
     writeFileSync(reportPath, report + "\n", "utf8");
     console.log(`\n[ok] wrote ${reportPath}`);
+    if (opendbNode.perfLogPath) {
+      console.log(`[opendb] perf timing log saved at ${opendbNode.perfLogPath}`);
+    }
   } finally {
     await opendbNode.cleanup();
     if (pgNode) await pgNode.cleanup();
+    if (opendbNode.perfLogPath) {
+      const rows = parsePerfTimingLog(opendbNode.perfLogPath);
+      if (rows.length > 0) {
+        const block = formatPerfTimingBlock(rows);
+        console.log("\n" + block);
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const reportPath = join(repoRoot, "docs", "bench", `bench-concurrent-${dateStamp}.md`);
+        appendFileSync(reportPath, "\n\n## Per-span timing (`OPENDB_PERF_TIMING=1`)\n\n" + block + "\n", "utf8");
+      }
+    }
   }
 }
 
