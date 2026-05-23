@@ -1,4 +1,4 @@
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum OpenDbError {
     #[error("invalid input: {0}")]
     InvalidInput(String),

@@ -14,6 +14,7 @@ use opendb_storage::{
     range_catalog::RangeCatalog,
     row_projection::RowProjection,
     wal::Wal,
+    wal_writer::WalWriter,
 };
 use openraft::BasicNode;
 use std::collections::BTreeMap;
@@ -85,6 +86,18 @@ impl fmt::Debug for RootRangeProposalPath {
 pub struct RootRange {
     range_id: RangeId,
     wal: Wal,
+    /// Phase E.1 (2026-05-23) — every WAL append now funnels through a
+    /// single dedicated writer task. With one writer the per-record
+    /// fsync stays serialized (the writer task picks records one at a
+    /// time off its queue), but when N concurrent callers enqueue while
+    /// the writer is mid-fsync, the writer drains them all into the
+    /// next round and fsyncs once. Today the surrounding
+    /// `semantic_append_lock` still serializes the entire
+    /// `validate + append + commit` triple, so cross-client coalescing
+    /// is gated by phase E.2 (move validate into the writer task).
+    /// Even without that, the primitive isolates I/O timing from the
+    /// hot path and is a working building block.
+    wal_writer: WalWriter,
     proposal_path: RootRangeProposalPath,
     semantic_append_lock: Arc<Mutex<()>>,
     semantic_append_cache: Arc<Mutex<SemanticAppendCache>>,
@@ -124,9 +137,12 @@ impl RootRange {
     ) -> Self {
         bootstrap_replica_node_ids.sort_unstable();
         bootstrap_replica_node_ids.dedup();
+        let wal = Wal::new(data_dir.as_ref().join("root-range").join("commit.wal"));
+        let wal_writer = WalWriter::spawn(wal.clone());
         Self {
             range_id: RangeId::ROOT,
-            wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
+            wal,
+            wal_writer,
             proposal_path: RootRangeProposalPath::Local(authority),
             semantic_append_lock: Arc::new(Mutex::new(())),
             semantic_append_cache: Arc::new(Mutex::new(SemanticAppendCache::default())),
@@ -158,9 +174,12 @@ impl RootRange {
         }
         let bootstrap_replica_node_ids = members.keys().copied().collect::<Vec<_>>();
         let raft = Arc::new(RootRangeRaftHarness::new(node_id, data_dir.as_ref(), members).await?);
+        let wal = Wal::new(data_dir.as_ref().join("root-range").join("commit.wal"));
+        let wal_writer = WalWriter::spawn(wal.clone());
         let root_range = Self {
             range_id: RangeId::ROOT,
-            wal: Wal::new(data_dir.as_ref().join("root-range").join("commit.wal")),
+            wal,
+            wal_writer,
             proposal_path: RootRangeProposalPath::OpenRaft(Arc::clone(&raft)),
             semantic_append_lock: Arc::new(Mutex::new(())),
             semantic_append_cache: Arc::new(Mutex::new(SemanticAppendCache::default())),
@@ -271,7 +290,7 @@ impl RootRange {
             let _validate_span = opendb_common::perf_timing::Span::start(&RR_VALIDATE_SEMANTIC);
             self.validate_semantic_append(record).await?
         };
-        let wal_len = self.wal.append_with_len(record).await?;
+        let wal_len = self.wal_writer.append_with_len(record.clone()).await?;
         {
             let _commit_span =
                 opendb_common::perf_timing::Span::start(&RR_COMMIT_SEMANTIC_SNAPSHOT);
@@ -313,7 +332,10 @@ impl RootRange {
                 self.apply_record_to_semantic_snapshot(&mut snapshot, record)?;
             }
         }
-        let wal_len = self.wal.append_many_with_len(records).await?;
+        let wal_len = self
+            .wal_writer
+            .append_many_with_len(records.to_vec())
+            .await?;
         {
             let _commit_span =
                 opendb_common::perf_timing::Span::start(&RR_COMMIT_SEMANTIC_SNAPSHOT);
