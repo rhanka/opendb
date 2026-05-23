@@ -256,7 +256,10 @@ impl RootRange {
     ///
     /// Milestone 1 only wires this apply-side path. Callers must not use it as
     /// a proposal path; use `submit` for the reserved OpenRaft-facing API.
-    pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
+    /// Apply one committed record locally. Returns the new WAL byte length
+    /// so the caller can update its read-refresh skip cache without a
+    /// follow-up `fs::metadata` syscall (Phase B.1 of the perf roadmap).
+    pub async fn apply_committed(&self, record: &CommitRecord) -> OpenDbResult<u64> {
         let _outer_span = opendb_common::perf_timing::Span::start(&RR_APPLY_COMMITTED);
         self.validate_apply_record(record)?;
         let _guard = {
@@ -275,7 +278,7 @@ impl RootRange {
             self.commit_semantic_append_snapshot(semantic_snapshot, wal_len)
                 .await;
         }
-        Ok(())
+        Ok(wal_len)
     }
 
     /// Compatibility wrapper for existing plan-era callers.
@@ -283,16 +286,16 @@ impl RootRange {
     /// This still performs apply-side validation and persistence only. It does
     /// not submit a proposal to consensus.
     pub async fn append_committed(&self, record: &CommitRecord) -> OpenDbResult<()> {
-        self.apply_committed(record).await
+        self.apply_committed(record).await.map(|_| ())
     }
 
     /// Atomically apply N committed records with a single WAL fsync and a
     /// single semantic snapshot commit. Used by `submit_batch` on the local
     /// (standalone / leader) path so multi-row INSERTs durably commit as a
-    /// group rather than one fsync per row.
-    pub async fn apply_committed_batch(&self, records: &[CommitRecord]) -> OpenDbResult<()> {
+    /// group rather than one fsync per row. Returns the new WAL byte length.
+    pub async fn apply_committed_batch(&self, records: &[CommitRecord]) -> OpenDbResult<u64> {
         if records.is_empty() {
-            return Ok(());
+            return self.wal.byte_len().await;
         }
         let _outer_span = opendb_common::perf_timing::Span::start(&RR_APPLY_COMMITTED);
         for record in records {
@@ -317,7 +320,7 @@ impl RootRange {
             self.commit_semantic_append_snapshot(snapshot, wal_len)
                 .await;
         }
-        Ok(())
+        Ok(wal_len)
     }
 
     /// Submits a root-range command through the consensus boundary.
@@ -325,7 +328,11 @@ impl RootRange {
     /// Raft-backed ranges propose through OpenRaft `client_write`. Local
     /// standalone/leader modes are kept for single-process tests and bootstrap
     /// milestones; followers reject before touching the local WAL.
-    pub async fn submit(&self, command: RootRangeCommand) -> OpenDbResult<()> {
+    /// Submit one command. Returns the new WAL byte length after the
+    /// record durably lands (Phase B.1: lets the caller skip a follow-up
+    /// `wal_byte_len()` round-trip). On the OpenRaft path the returned
+    /// length is read from the local WAL after the apply settles.
+    pub async fn submit(&self, command: RootRangeCommand) -> OpenDbResult<u64> {
         self.validate_apply_record(&command.record)?;
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(raft) => {
@@ -333,7 +340,7 @@ impl RootRange {
                 let _semantic_snapshot = self.validate_semantic_append(&command.record).await?;
                 let response = raft.submit(command).await?;
                 if response == RootRangeResponse::Applied {
-                    Ok(())
+                    self.wal.byte_len().await
                 } else {
                     Err(OpenDbError::Storage(format!(
                         "root range raft returned unexpected write response: {response:?}"
@@ -360,16 +367,17 @@ impl RootRange {
     /// records with one fsync. The OpenRaft path falls back to per-record
     /// `submit` because the current raft client API takes one command at a
     /// time; callers that care about raft can iterate themselves.
-    pub async fn submit_batch(&self, commands: Vec<RootRangeCommand>) -> OpenDbResult<()> {
+    pub async fn submit_batch(&self, commands: Vec<RootRangeCommand>) -> OpenDbResult<u64> {
         if commands.is_empty() {
-            return Ok(());
+            return self.wal.byte_len().await;
         }
         match &self.proposal_path {
             RootRangeProposalPath::OpenRaft(_) => {
+                let mut last_len = 0u64;
                 for command in commands {
-                    self.submit(command).await?;
+                    last_len = self.submit(command).await?;
                 }
-                Ok(())
+                Ok(last_len)
             }
             RootRangeProposalPath::Local(authority) => match authority {
                 RootRangeAuthority::Standalone | RootRangeAuthority::Leader { .. } => {

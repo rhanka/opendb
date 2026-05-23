@@ -240,8 +240,7 @@ impl Database {
                     .into_iter()
                     .map(|record| RootRangeCommand { record })
                     .collect();
-                self.root_range.submit_batch(commands).await?;
-                self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
+                self.last_replayed_wal_len = self.root_range.submit_batch(commands).await?;
                 return Ok(QueryResult::Command {
                     tag: "DO".to_owned(),
                 });
@@ -290,12 +289,12 @@ impl Database {
                     self.engine.apply_committed(record.clone())?;
                     buffer.pending_records.push(record);
                 } else {
-                    self.root_range
+                    self.last_replayed_wal_len = self
+                        .root_range
                         .submit(RootRangeCommand {
                             record: record.clone(),
                         })
                         .await?;
-                    self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
                     self.engine.apply_committed(record)?;
                 }
                 if let Some(rows) = returning_result {
@@ -335,21 +334,25 @@ impl Database {
                 tag: "COMMIT".to_owned(),
             });
         };
+        let mut latest_wal_len = self.last_replayed_wal_len;
         for record in &buffer.pending_records {
-            if let Err(error) = self
+            match self
                 .root_range
                 .submit(RootRangeCommand {
                     record: record.clone(),
                 })
                 .await
             {
-                // Restore the snapshot so the engine doesn't keep the
-                // half-committed state in memory.
-                self.engine = buffer.engine_snapshot;
-                return Err(error);
+                Ok(new_len) => latest_wal_len = new_len,
+                Err(error) => {
+                    // Restore the snapshot so the engine doesn't keep the
+                    // half-committed state in memory.
+                    self.engine = buffer.engine_snapshot;
+                    return Err(error);
+                }
             }
         }
-        self.last_replayed_wal_len = self.root_range.wal_byte_len().await?;
+        self.last_replayed_wal_len = latest_wal_len;
         Ok(QueryResult::Command {
             tag: "COMMIT".to_owned(),
         })
