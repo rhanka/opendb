@@ -1,4 +1,5 @@
 use opendb_common::{OpenDbError, OpenDbResult, RangeId};
+use opendb_consensus::commit_worker::CommitWorker;
 use opendb_consensus::root_range::{RootRange, RootRangeCommand, RootRangePeerServer};
 use opendb_sql::{
     ast::{QueryResult, Statement},
@@ -42,7 +43,13 @@ pub struct RangeMergeProposalResult {
 
 #[derive(Debug)]
 pub struct Database {
-    root_range: RootRange,
+    root_range: Arc<RootRange>,
+    /// Phase E.2 (2026-05-24) — funnel all autocommit / batch writes
+    /// through a single tokio task that drains the queue, validates,
+    /// and coalesces fsync across concurrent clients. Falls back to
+    /// `root_range.apply_committed*` directly only for the raft path
+    /// (which has its own consensus serialization).
+    commit_worker: CommitWorker,
     engine: SqlEngine,
     range_catalog: RangeCatalog,
     last_replayed_wal_len: u64,
@@ -115,7 +122,7 @@ impl RangeCatalogStatusSnapshot {
 }
 
 impl Database {
-    pub async fn open_with_root_range(root_range: RootRange) -> OpenDbResult<Self> {
+    pub async fn open_with_root_range(root_range: Arc<RootRange>) -> OpenDbResult<Self> {
         match root_range.ensure_bootstrapped().await {
             Ok(()) => {}
             Err(OpenDbError::NotLeader { .. }) => {}
@@ -125,9 +132,11 @@ impl Database {
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
+        let commit_worker = CommitWorker::spawn(Arc::clone(&root_range));
 
         Ok(Self {
             root_range,
+            commit_worker,
             engine,
             range_catalog,
             last_replayed_wal_len,
@@ -140,7 +149,7 @@ impl Database {
     }
 
     pub async fn open_with_root_range_peer_server(
-        root_range: RootRange,
+        root_range: Arc<RootRange>,
         peer_server: Arc<RootRangePeerServer>,
     ) -> OpenDbResult<Self> {
         match root_range.ensure_bootstrapped().await {
@@ -152,9 +161,11 @@ impl Database {
         let recovery_status = DatabaseRecoveryStatus::from_replayed_records(&records);
         let range_catalog = RangeCatalog::rebuild(&records)?;
         let engine = SqlEngine::from_commits(records)?;
+        let commit_worker = CommitWorker::spawn(Arc::clone(&root_range));
 
         Ok(Self {
             root_range,
+            commit_worker,
             engine,
             range_catalog,
             last_replayed_wal_len,
@@ -236,11 +247,12 @@ impl Database {
                         }
                     }
                 }
-                let commands: Vec<RootRangeCommand> = records
-                    .into_iter()
-                    .map(|record| RootRangeCommand { record })
-                    .collect();
-                self.last_replayed_wal_len = self.root_range.submit_batch(commands).await?;
+                // Phase E.2 (2026-05-24): route the local-path batch
+                // through the commit worker so this DoBlock's records
+                // can coalesce with whatever other autocommit clients
+                // pushed in parallel — the worker drains its queue and
+                // fsyncs once per round across all senders.
+                self.last_replayed_wal_len = self.commit_worker.commit(records).await?;
                 return Ok(QueryResult::Command {
                     tag: "DO".to_owned(),
                 });
@@ -289,12 +301,11 @@ impl Database {
                     self.engine.apply_committed(record.clone())?;
                     buffer.pending_records.push(record);
                 } else {
-                    self.last_replayed_wal_len = self
-                        .root_range
-                        .submit(RootRangeCommand {
-                            record: record.clone(),
-                        })
-                        .await?;
+                    // Phase E.2 (2026-05-24): autocommit single-row
+                    // writes go through the commit worker so they can
+                    // batch with concurrent clients into one fsync.
+                    self.last_replayed_wal_len =
+                        self.commit_worker.commit(vec![record.clone()]).await?;
                     self.engine.apply_committed(record)?;
                 }
                 if let Some(rows) = returning_result {
@@ -334,25 +345,25 @@ impl Database {
                 tag: "COMMIT".to_owned(),
             });
         };
-        let mut latest_wal_len = self.last_replayed_wal_len;
-        for record in &buffer.pending_records {
-            match self
-                .root_range
-                .submit(RootRangeCommand {
-                    record: record.clone(),
-                })
-                .await
-            {
-                Ok(new_len) => latest_wal_len = new_len,
-                Err(error) => {
-                    // Restore the snapshot so the engine doesn't keep the
-                    // half-committed state in memory.
-                    self.engine = buffer.engine_snapshot;
-                    return Err(error);
-                }
+        // Phase E.2 (2026-05-24): submit the whole txn buffer as ONE
+        // commit_worker request — it's already atomic from the client's
+        // POV and the worker batches it with whatever other autocommit
+        // clients pushed in parallel.
+        match self
+            .commit_worker
+            .commit(buffer.pending_records.clone())
+            .await
+        {
+            Ok(new_len) => {
+                self.last_replayed_wal_len = new_len;
+            }
+            Err(error) => {
+                // Restore the snapshot so the engine doesn't keep the
+                // half-committed state in memory.
+                self.engine = buffer.engine_snapshot;
+                return Err(error);
             }
         }
-        self.last_replayed_wal_len = latest_wal_len;
         Ok(QueryResult::Command {
             tag: "COMMIT".to_owned(),
         })

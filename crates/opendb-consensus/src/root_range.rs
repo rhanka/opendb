@@ -85,7 +85,7 @@ impl fmt::Debug for RootRangeProposalPath {
 #[derive(Clone, Debug)]
 pub struct RootRange {
     range_id: RangeId,
-    wal: Wal,
+    pub(crate) wal: Wal,
     /// Phase E.1 (2026-05-23) — every WAL append now funnels through a
     /// single dedicated writer task. With one writer the per-record
     /// fsync stays serialized (the writer task picks records one at a
@@ -97,23 +97,23 @@ pub struct RootRange {
     /// is gated by phase E.2 (move validate into the writer task).
     /// Even without that, the primitive isolates I/O timing from the
     /// hot path and is a working building block.
-    wal_writer: WalWriter,
+    pub(crate) wal_writer: WalWriter,
     proposal_path: RootRangeProposalPath,
     semantic_append_lock: Arc<Mutex<()>>,
-    semantic_append_cache: Arc<Mutex<SemanticAppendCache>>,
+    pub(crate) semantic_append_cache: Arc<Mutex<SemanticAppendCache>>,
     openraft_submit_lock: Arc<Mutex<()>>,
-    bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
+    pub(crate) bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
     #[cfg(test)]
     semantic_validation_rebuild_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct SemanticAppendCache {
+pub(crate) struct SemanticAppendCache {
     snapshot: Option<SemanticAppendSnapshot>,
 }
 
 #[derive(Clone, Debug)]
-struct SemanticAppendSnapshot {
+pub(crate) struct SemanticAppendSnapshot {
     wal_len: u64,
     records: Vec<CommitRecord>,
     projection: RowProjection,
@@ -122,11 +122,14 @@ struct SemanticAppendSnapshot {
 }
 
 impl RootRange {
-    pub fn new(data_dir: impl AsRef<Path>) -> Self {
+    pub fn new(data_dir: impl AsRef<Path>) -> Arc<Self> {
         Self::new_with_authority(data_dir, RootRangeAuthority::Standalone)
     }
 
-    pub fn new_with_authority(data_dir: impl AsRef<Path>, authority: RootRangeAuthority) -> Self {
+    pub fn new_with_authority(
+        data_dir: impl AsRef<Path>,
+        authority: RootRangeAuthority,
+    ) -> Arc<Self> {
         Self::new_with_authority_and_bootstrap_replicas(data_dir, authority, vec![0])
     }
 
@@ -134,12 +137,12 @@ impl RootRange {
         data_dir: impl AsRef<Path>,
         authority: RootRangeAuthority,
         mut bootstrap_replica_node_ids: Vec<OpenDbRaftNodeId>,
-    ) -> Self {
+    ) -> Arc<Self> {
         bootstrap_replica_node_ids.sort_unstable();
         bootstrap_replica_node_ids.dedup();
         let wal = Wal::new(data_dir.as_ref().join("root-range").join("commit.wal"));
         let wal_writer = WalWriter::spawn(wal.clone());
-        Self {
+        Arc::new(Self {
             range_id: RangeId::ROOT,
             wal,
             wal_writer,
@@ -150,14 +153,14 @@ impl RootRange {
             bootstrap_replica_node_ids,
             #[cfg(test)]
             semantic_validation_rebuild_count: Arc::new(AtomicUsize::new(0)),
-        }
+        })
     }
 
     pub async fn new_raft_backed(
         data_dir: impl AsRef<Path>,
         node_id: OpenDbRaftNodeId,
         peers: Vec<RootRangePeer>,
-    ) -> OpenDbResult<(Self, RootRangePeerServer)> {
+    ) -> OpenDbResult<(Arc<Self>, RootRangePeerServer)> {
         let members = peers
             .into_iter()
             .map(|peer| (peer.node_id, BasicNode::new(peer.addr)))
@@ -176,7 +179,7 @@ impl RootRange {
         let raft = Arc::new(RootRangeRaftHarness::new(node_id, data_dir.as_ref(), members).await?);
         let wal = Wal::new(data_dir.as_ref().join("root-range").join("commit.wal"));
         let wal_writer = WalWriter::spawn(wal.clone());
-        let root_range = Self {
+        let root_range = Arc::new(Self {
             range_id: RangeId::ROOT,
             wal,
             wal_writer,
@@ -187,7 +190,7 @@ impl RootRange {
             bootstrap_replica_node_ids,
             #[cfg(test)]
             semantic_validation_rebuild_count: Arc::new(AtomicUsize::new(0)),
-        };
+        });
 
         Ok((root_range, RootRangePeerServer { raft }))
     }
@@ -474,7 +477,7 @@ impl RootRange {
             .load(Ordering::SeqCst)
     }
 
-    fn validate_apply_record(&self, record: &CommitRecord) -> OpenDbResult<()> {
+    pub(crate) fn validate_apply_record(&self, record: &CommitRecord) -> OpenDbResult<()> {
         if record.version != CommitRecord::VERSION {
             return Err(OpenDbError::InvalidInput(format!(
                 "root range requires commit record version {}, got {}",
@@ -485,7 +488,9 @@ impl RootRange {
         Ok(())
     }
 
-    async fn semantic_snapshot_for_append(&self) -> OpenDbResult<SemanticAppendSnapshot> {
+    pub(crate) async fn semantic_snapshot_for_append(
+        &self,
+    ) -> OpenDbResult<SemanticAppendSnapshot> {
         let wal_len = self.wal.byte_len().await?;
         {
             let cache = self.semantic_append_cache.lock().await;
@@ -505,7 +510,7 @@ impl RootRange {
         Ok(snapshot)
     }
 
-    async fn commit_semantic_append_snapshot(
+    pub(crate) async fn commit_semantic_append_snapshot(
         &self,
         mut snapshot: SemanticAppendSnapshot,
         wal_len: u64,
@@ -528,7 +533,7 @@ impl RootRange {
     /// snapshot, mutating it in place. Factored out of `validate_semantic_append`
     /// so the batch path (`apply_committed_batch`) can thread one snapshot
     /// through N records without re-fetching the cache per record.
-    fn apply_record_to_semantic_snapshot(
+    pub(crate) fn apply_record_to_semantic_snapshot(
         &self,
         snapshot: &mut SemanticAppendSnapshot,
         record: &CommitRecord,

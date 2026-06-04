@@ -161,7 +161,7 @@ async fn maintain_recovery_status(
 
 async fn open_root_range(
     config: &NodeConfig,
-) -> anyhow::Result<(RootRange, Option<RootRangePeerServer>)> {
+) -> anyhow::Result<(Arc<RootRange>, Option<RootRangePeerServer>)> {
     if config.uses_openraft() {
         config
             .validate_openraft_runtime()
@@ -200,7 +200,7 @@ async fn maintain_root_range_readiness(
 }
 
 async fn open_database(
-    root_range: RootRange,
+    root_range: Arc<RootRange>,
     peer_server: Option<Arc<RootRangePeerServer>>,
     config: &NodeConfig,
 ) -> anyhow::Result<Database> {

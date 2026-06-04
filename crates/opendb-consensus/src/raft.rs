@@ -266,7 +266,7 @@ struct RootRangeRaftStore {
 
 #[derive(Debug)]
 struct RootRangeRaftStoreState {
-    root_range: RootRange,
+    root_range: Arc<RootRange>,
     state_path: PathBuf,
     logs: BTreeMap<u64, Entry<RootRangeTypeConfig>>,
     vote: Option<Vote<OpenDbRaftNodeId>>,
@@ -292,7 +292,7 @@ struct PersistedRootRangeRaftStoreState {
 }
 
 impl RootRangeRaftStore {
-    async fn open(root_range: RootRange, data_dir: &Path) -> OpenDbResult<Self> {
+    async fn open(root_range: Arc<RootRange>, data_dir: &Path) -> OpenDbResult<Self> {
         let state = RootRangeRaftStoreState::load(
             root_range,
             data_dir.join("root-range").join(RAFT_STORE_FILE),
@@ -305,7 +305,7 @@ impl RootRangeRaftStore {
 }
 
 impl RootRangeRaftStoreState {
-    async fn load(root_range: RootRange, state_path: PathBuf) -> OpenDbResult<Self> {
+    async fn load(root_range: Arc<RootRange>, state_path: PathBuf) -> OpenDbResult<Self> {
         let persisted = match fs::read(&state_path).await {
             Ok(bytes) => Some(
                 serde_json::from_slice::<PersistedRootRangeRaftStoreState>(&bytes).map_err(
@@ -343,7 +343,7 @@ impl RootRangeRaftStoreState {
     }
 
     async fn from_persisted(
-        root_range: RootRange,
+        root_range: Arc<RootRange>,
         state_path: PathBuf,
         persisted: PersistedRootRangeRaftStoreState,
     ) -> OpenDbResult<Self> {
@@ -369,7 +369,7 @@ impl RootRangeRaftStoreState {
         })
     }
 
-    fn new_empty(root_range: RootRange, state_path: PathBuf) -> Self {
+    fn new_empty(root_range: Arc<RootRange>, state_path: PathBuf) -> Self {
         Self {
             root_range,
             state_path,
