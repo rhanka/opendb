@@ -57,14 +57,15 @@ ready to code). Effort estimates from the consensus voters.
 | WP1 | Phase A — pgbench surface            | 8/10 = **80 %**  | 9/10 (with A.11 COPY) | +2 wk (A.11) | DECIDED |
 | WP2 | Phase B — drop pgwire Mutex          | 2/5 = **40 %**   | 3/5 (B.4 spec'd) | +4 wk (B.4 → B.3 → B.2) | UNBLOCKING-E.2 |
 | WP3 | Phase C — MVCC per-row versions      | 0/7 = **0 %**    | 7/7 (full spec) | 3 wk + vacuum | READY |
-| WP4 | Phase D — secondary B-tree + hash    | 0/5 = **0 %**    | 5/5 (specced at WP level) | 2-3 wk | READY |
-| WP5 | Phase E — WAL writer + group commit  | 2/5 = **40 %**   | 3/5 (E.3 spec'd) | +1 wk (E.3) + E.4 | DECIDED |
-| WP6 | Phase F-I — OLAP track               | 0/6 = **0 %**    | 6/6 (F.1 spec'd; F.2/G/H/I outlined) | 14-20 wk | DECIDED |
+| WP4 | Phase D — secondary B-tree + hash    | 0/5 = **0 %**    | 5/5 (full spec ratified) | 2-3 wk | READY |
+| WP5 | Phase E — WAL writer + group commit  | 2/5 = **40 %**   | 4/5 (E.3 + E.4 spec'd) | +1 wk (E.3) +3-4 d (E.4) | DECIDED |
+| WP6 | Phase F-I — OLAP track               | 0/6 = **0 %**    | 6/6 (F.1, F.2, G, H, I all spec'd) | 14-20 wk | DECIDED |
 | WP7 | Track B (foundation perf wins)       | 6/6 = **100 %**  | 6/6      | 0 | DONE ✅ |
 
-**Aggregate**: 18/44 items code-shipped = **41 %**. After Phase B and
-Phase A.11 land, the spec'd-but-unshipped buffer collapses into
-end-to-end demos for both acceptance bars.
+**Aggregate**: 18/44 items code-shipped = **41 %**. **100 % of the
+plan is now specified** (every TO-DO has a ratified design doc).
+After Phase B and Phase A.11 land, the spec'd-but-unshipped buffer
+collapses into end-to-end demos for both acceptance bars.
 
 ## Ratified architectural decisions (5/5 consensus)
 
@@ -78,6 +79,17 @@ and ratified by the user. Implementation must follow the spec.
 | 3 | F.1 Projection trait | **Option P** — static trait + `enum ProjectionRef` dispatch, per-table opt-in via `CREATE TABLE WITH (engine='columnar')` | 4-6 wk | `docs/roadmap/projection-trait-2026.md` |
 | 4 | B sequencing | **B.4 first** → B.3 → B.2 (B.4 is the only step that unblocks the already-built but currently-invisible Phase E.2 coalescing) | 4 wk | `docs/roadmap/phase-b-sequencing-2026.md` |
 | 5 | A cliffs | **Option α** — ship COPY FROM STDIN, defer INSERT-FROM-SELECT (pending explicit user ratification) | 2 wk | `docs/roadmap/phase-a-cliffs-2026.md` |
+| 6 | H codec stack | **Option A** — LZ4 + ZSTD with probe-based auto-selection; specialty codecs (Delta/T64/...) deferred to H.2 | 3 wk | `docs/roadmap/phase-h-compression-2026.md` |
+
+## Additional ratified specs (no consensus needed — uncontested DB patterns)
+
+| Phase | Decision | Effort | Design doc |
+|-------|----------|-------:|------------|
+| D indexes | B-tree + hash secondary indexes via `Index` trait; deterministic prefix-match planner (no cost-based optimizer yet) | 2-3 wk | `docs/roadmap/phase-d-indexes-2026.md` |
+| E.4 commit_delay | ~50 µs micro-delay in wal_writer (Nagle-for-fsync); `OPENDB_WAL_COMMIT_DELAY_MICROS` env override | 3-4 d | `docs/roadmap/wal-commit-delay-2026.md` |
+| F.2 columnar materialization | Per-column `Vec<T>` + null bitmap; automatic Dict encoding for low-cardinality text (≤ 32K uniques) with on-the-fly promotion | 5-7 wk | `docs/roadmap/phase-f2-columnar-materialization-2026.md` |
+| G vectorized exec | 2048-row Chunk + ChunkOperator trait + typed SIMD-friendly kernels; rely on rustc auto-vectorization (no manual intrinsics in MVP) | 5-7 wk | `docs/roadmap/phase-g-vectorized-exec-2026.md` |
+| I parallel scan | Morsel-driven (Leis et al. 2014); `max_threads = num_cpus`; two-level GROUP BY hash with per-worker partial + merge | 4-6 wk | `docs/roadmap/phase-i-parallel-scan-2026.md` |
 
 Recap doc with open ops items: `docs/roadmap/decisions-for-user-2026-06-11.md`.
 
