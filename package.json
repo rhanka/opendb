@@ -37,7 +37,7 @@
     "yaml": "^2.0.0"
   },
   "dependencies": {
-    "@hono/node-server": "^2.0.2",
+    "@hono/node-server": "^2.0.10",
     "hono": "^4.12.25"
   }
 }
